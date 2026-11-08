@@ -1,0 +1,19 @@
+# 빌드 산출물
+/target/
+*.exe
+*.pdb
+
+# 개인 데이터: 설정(인덱싱 폴더 경로), 인덱스 DB(파일 경로·스니펫·썸네일)
+/data/
+
+# 테스트 샘플은 testdata/make-testdata.ps1로 다시 만들 수 있음
+/testdata/samples/
+/testdata/gui-data/
+/testdata/gridtest/
+
+# 편집기/OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,0 +1,42 @@
+[package]
+name = "gemma-search"
+version = "0.1.0"
+edition = "2021"
+description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
+license = "MIT"
+repository = "https://github.com/kimbad1992/gemma-desktop-search"
+
+[dependencies]
+eframe = "0.37"
+rusqlite = { version = "0.41", features = ["bundled"] }
+ureq = { version = "3", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+walkdir = "2"
+rayon = "1"
+crossbeam-channel = "0.5"
+chardetng = "1"
+encoding_rs = "0.8"
+pdf-extract = "0.12"
+zip = "9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
+base64 = "0.23"
+rfd = "0.18"
+anyhow = "1"
+parking_lot = "0.13"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+# 디버그 빌드에서도 이미지 디코딩/벡터 연산이 쓸 만한 속도로 돌도록 의존성은 최적화
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+# catch_unwind(PDF 추출 보호)가 동작하려면 unwind 유지 — panic = "abort" 금지
+panic = "unwind"
