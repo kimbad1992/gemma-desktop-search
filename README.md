@@ -24,7 +24,9 @@ EmbeddingGemma 2와 llama.cpp로 만든 Windows용 **로컬 의미 검색기**(R
 
 ## 실행
 
-빌드한 `gemma-search.exe`를 실행합니다. 빌드 방법은 아래 [빌드](#빌드)에 있습니다.
+[Releases](https://github.com/kimbad1992/gemma-desktop-search/releases)에서 zip을 받아 원하는 폴더에 풀고 `gemma-search.exe`를 실행합니다. 직접 빌드하는 방법은 아래 [빌드](#빌드)에 있습니다.
+
+- exe는 코드 서명이 되어 있지 않습니다. 처음 실행할 때 Windows SmartScreen이 "PC 보호" 경고를 띄우면 **추가 정보 → 실행**을 누르세요.
 
 - 설정·인덱스는 exe 옆의 `data\` 폴더에 저장됩니다 (`config.toml`, `index.db`).
 - `cargo run`이나 `target\release\gemma-search.exe`로 실행하면 프로젝트 루트의 `data\`를 씁니다.

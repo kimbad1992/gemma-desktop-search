@@ -1,5 +1,6 @@
 # 빌드 산출물
 /target/
+/dist/
 *.exe
 *.pdb
 
