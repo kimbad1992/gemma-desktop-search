@@ -56,6 +56,22 @@ pub fn from_bytes(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// 절반 정밀도(FP16) 저장. 정규화된 벡터(성분 -1~1)는 상대 오차 약 0.05%로,
+/// 코사인 점수 변화가 0.0005 미만이다.
+pub fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(v.len() * 2);
+    for x in v {
+        b.extend_from_slice(&half::f16::from_f32(*x).to_le_bytes());
+    }
+    b
+}
+
+pub fn from_f16_bytes(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +92,31 @@ mod tests {
     fn bytes_roundtrip() {
         let v = vec![0.5f32, -1.25, 3.0e-7, f32::MAX];
         assert_eq!(from_bytes(&to_bytes(&v)), v);
+    }
+
+    #[test]
+    fn f16_storage_keeps_scores() {
+        // 실제 임베딩처럼 정규화된 768차원 벡터 여러 개로 점수 오차 확인
+        let mk = |seed: u32| {
+            let mut s = seed;
+            let mut v: Vec<f32> = (0..768)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((s >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+                })
+                .collect();
+            normalize(&mut v);
+            v
+        };
+        let q = mk(1);
+        let mut max_err = 0f32;
+        for seed in 2..200 {
+            let d = mk(seed);
+            let d16 = from_f16_bytes(&to_f16_bytes(&d));
+            assert_eq!(to_f16_bytes(&d).len(), 768 * 2);
+            max_err = max_err.max((dot(&q, &d) - dot(&q, &d16)).abs());
+        }
+        assert!(max_err < 5e-4, "FP16 점수 오차 {max_err}");
     }
 
     #[test]

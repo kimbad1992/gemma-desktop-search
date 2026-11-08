@@ -33,6 +33,23 @@ pub struct Notice {
     pub at: Instant,
 }
 
+/// 검색 폴더 목록의 한 줄 (지금 대상 폴더 + 예전에 인덱싱한 폴더)
+#[derive(Clone, Debug)]
+pub struct FolderStat {
+    pub path: String,
+    pub key: String,
+    pub files: u64,
+    /// 지금 설정의 인덱싱 대상인지 (false = 예전에 인덱싱하고 대상에서 뺀 폴더)
+    pub current: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FolderStats {
+    pub list: Vec<FolderStat>,
+    /// 목록의 어느 폴더에도 속하지 않는 인덱스 파일 수
+    pub other: u64,
+}
+
 pub struct GemmaApp {
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
@@ -42,8 +59,15 @@ pub struct GemmaApp {
     pub indexer: Indexer,
     pub store: Arc<RwLock<VectorStore>>,
     pub store_loading: Arc<AtomicBool>,
+    /// 저장소 적재 단계 표시 ("FP16 변환 중… 1,000/42,028" 등)
+    pub store_status: Arc<Mutex<String>>,
     pub db: Arc<Mutex<Db>>,
     pub db_stats: Arc<Mutex<DbStats>>,
+    pub folders: Arc<Mutex<FolderStats>>,
+    /// 통계 스레드가 '현재 대상 폴더'를 알 수 있도록 공유
+    cfg_roots_shared: Arc<Mutex<Vec<String>>>,
+    /// 백그라운드 작업이 남기는 알림
+    bg_notice: Arc<Mutex<Option<(String, bool)>>>,
     pub tab: Tab,
 
     // 검색
@@ -53,6 +77,8 @@ pub struct GemmaApp {
     pub search_rx: Option<Receiver<Outcome>>,
     pub search_started: Option<Instant>,
     pub outcome: Option<Outcome>,
+    /// 폴더 선택을 바꾸면 같은 질의로 다시 검색
+    pub last_query: Option<QueryKind>,
     /// None = 전체 요약, Some = 해당 섹션 전체 보기
     pub result_view: Option<crate::search::store::Section>,
     pub thumbs: HashMap<i64, Option<egui::TextureHandle>>,
@@ -99,8 +125,12 @@ impl GemmaApp {
             exclude_text: cfg.exclude_dirs.join("\n"),
             store: Arc::new(RwLock::new(VectorStore::new(cfg.search_dim))),
             store_loading: Arc::new(AtomicBool::new(false)),
+            store_status: Arc::new(Mutex::new(String::new())),
             db: Arc::new(Mutex::new(db)),
             db_stats: Arc::new(Mutex::new(DbStats::default())),
+            folders: Arc::new(Mutex::new(FolderStats::default())),
+            cfg_roots_shared: Arc::new(Mutex::new(cfg.roots.clone())),
+            bg_notice: Arc::new(Mutex::new(None)),
             saved_cfg: cfg.clone(),
             cfg,
             data_dir,
@@ -114,6 +144,7 @@ impl GemmaApp {
             search_rx: None,
             search_started: None,
             outcome: None,
+            last_query: None,
             result_view: None,
             thumbs: HashMap::new(),
             focus_search: true,
@@ -179,12 +210,48 @@ impl GemmaApp {
         }
     }
 
-    /// 최소 일치도만 바로 저장 (설정 탭의 다른 미저장 변경은 그대로 둠)
-    pub fn persist_min_score(&mut self) {
+    /// 검색 화면 설정(최소 일치도, 폴더 선택)만 바로 저장 (설정 탭의 다른 미저장 변경은 그대로 둠)
+    pub fn persist_search_prefs(&mut self) {
         let mut s = self.saved_cfg.clone();
         s.min_score = self.cfg.min_score;
+        s.search_excluded_folders = self.cfg.search_excluded_folders.clone();
         if s.save(&self.data_dir).is_ok() {
             self.saved_cfg = s;
+        }
+    }
+
+    pub fn persist_min_score(&mut self) {
+        self.persist_search_prefs();
+    }
+
+    /// 지금 폴더 선택으로 만든 필터 (전부 선택이면 None)
+    pub fn folder_filter(&self) -> Option<crate::search::store::FolderFilter> {
+        use crate::search::store::OTHER_FOLDER_KEY;
+        let excluded = &self.cfg.search_excluded_folders;
+        if excluded.is_empty() {
+            return None;
+        }
+        let folders = self.folders.lock().clone();
+        let known: Vec<String> = folders.list.iter().map(|f| f.key.clone()).collect();
+        let relevant = known.iter().any(|k| excluded.contains(k))
+            || (folders.other > 0 && excluded.iter().any(|k| k == OTHER_FOLDER_KEY));
+        if !relevant {
+            return None;
+        }
+        Some(crate::search::store::FolderFilter {
+            selected: known.iter().filter(|k| !excluded.contains(k)).cloned().collect(),
+            include_other: !excluded.iter().any(|k| k == OTHER_FOLDER_KEY),
+            known,
+        })
+    }
+
+    /// 폴더 선택이 바뀌면 저장하고, 결과가 있으면 같은 질의로 다시 검색
+    pub fn on_folder_selection_changed(&mut self) {
+        self.persist_search_prefs();
+        if self.outcome.is_some() {
+            if let Some(q) = self.last_query.clone() {
+                self.start_search(q);
+            }
         }
     }
 
@@ -223,11 +290,38 @@ impl GemmaApp {
         self.store_loading.store(true, Ordering::SeqCst);
         let store = self.store.clone();
         let flag = self.store_loading.clone();
+        let status = self.store_status.clone();
+        let notice = self.bg_notice.clone();
         let db_path = self.db_path.clone();
         let dim = self.cfg.search_dim;
         std::thread::spawn(move || {
             let mut st = VectorStore::new(dim);
-            if let Ok(db) = Db::open(&db_path) {
+            if let Ok(mut db) = Db::open(&db_path) {
+                // 예전(f32) 인덱스는 처음 한 번 FP16으로 변환 + DB 압축
+                if !db.is_f16() {
+                    let size_of = || {
+                        let s = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+                        s(&db_path) + s(&db_path.with_extension("db-wal"))
+                    };
+                    let before = size_of();
+                    let st2 = status.clone();
+                    let r = db.migrate_to_f16(|stage, done, total| {
+                        *st2.lock() = format!("{stage} 중… {}/{}", fmt_num(done), fmt_num(total));
+                    });
+                    let after = size_of();
+                    *notice.lock() = Some(match r {
+                        Ok(()) => (
+                            format!(
+                                "인덱스를 FP16으로 변환했습니다: {:.0}MB → {:.0}MB",
+                                before as f64 / 1048576.0,
+                                after as f64 / 1048576.0
+                            ),
+                            false,
+                        ),
+                        Err(e) => (format!("FP16 변환 실패 (다음 실행 때 이어서 시도): {e}"), true),
+                    });
+                }
+                *status.lock() = "인덱스 불러오는 중…".into();
                 let _ = db.for_each_vector(|r| {
                     if !st.files.contains_key(&r.file_id) {
                         st.set_file(r.file_id, FileInfo::new(r.path, r.kind));
@@ -245,18 +339,68 @@ impl GemmaApp {
             }
             st.loaded = true;
             *store.write() = st;
+            status.lock().clear();
             flag.store(false, Ordering::SeqCst);
         });
     }
 
+    /// DB 통계와 폴더별 파일 수를 2초마다 갱신
     fn spawn_stats_thread(&self) {
+        use crate::search::store::folder_key;
         let stats = self.db_stats.clone();
+        let folders = self.folders.clone();
+        let cfg_roots = self.cfg_roots_shared.clone();
+        let store = self.store.clone();
+        let loading = self.store_loading.clone();
         let path = self.db_path.clone();
         std::thread::spawn(move || {
             let Ok(db) = Db::open(&path) else { return };
             loop {
                 if let Ok(s) = db.stats() {
                     *stats.lock() = s;
+                }
+                if !loading.load(Ordering::SeqCst) {
+                    // 목록 = 지금 대상 폴더 + 예전에 인덱싱한 폴더 (키 기준 중복 제거)
+                    let current: Vec<String> = cfg_roots.lock().clone();
+                    let mut paths: Vec<String> = Vec::new();
+                    for p in current.iter().cloned().chain(db.roots().unwrap_or_default()) {
+                        if !p.trim().is_empty() && !paths.iter().any(|q| folder_key(q) == folder_key(&p)) {
+                            paths.push(p);
+                        }
+                    }
+                    let keys: Vec<String> = paths.iter().map(|p| folder_key(p)).collect();
+                    let mut counts = vec![0u64; keys.len()];
+                    let mut other = 0u64;
+                    {
+                        let st = store.read();
+                        for info in st.files.values() {
+                            let mut any = false;
+                            for (i, k) in keys.iter().enumerate() {
+                                if info.path_lower.starts_with(k.as_str()) {
+                                    counts[i] += 1;
+                                    any = true;
+                                }
+                            }
+                            if !any {
+                                other += 1;
+                            }
+                        }
+                    }
+                    let current_keys: Vec<String> = current.iter().map(|p| folder_key(p)).collect();
+                    let mut list: Vec<FolderStat> = paths
+                        .into_iter()
+                        .zip(keys)
+                        .zip(counts)
+                        .map(|((path, key), files)| FolderStat {
+                            current: current_keys.contains(&key),
+                            path,
+                            key,
+                            files,
+                        })
+                        .collect();
+                    // 지금 대상 폴더 먼저, 그다음 예전 폴더
+                    list.sort_by(|a, b| b.current.cmp(&a.current).then(a.path.cmp(&b.path)));
+                    *folders.lock() = FolderStats { list, other };
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -331,7 +475,9 @@ impl GemmaApp {
                 .split_whitespace()
                 .map(|s| s.to_lowercase())
                 .collect(),
+            folders: self.folder_filter(),
         };
+        self.last_query = Some(q.clone());
         let (tx, rx) = crossbeam_channel::bounded(1);
         let port = self.server.port();
         let store = self.store.clone();
@@ -370,6 +516,19 @@ impl GemmaApp {
     // ── 매 프레임 ──
     fn poll(&mut self, ctx: &egui::Context) {
         self.run_auto_actions();
+        if let Some((m, err)) = self.bg_notice.lock().take() {
+            self.notice = Some(Notice {
+                text: m,
+                error: err,
+                at: Instant::now(),
+            });
+        }
+        {
+            let mut shared = self.cfg_roots_shared.lock();
+            if *shared != self.cfg.roots {
+                *shared = self.cfg.roots.clone();
+            }
+        }
         if let Some(rx) = &self.search_rx {
             if let Ok(o) = rx.try_recv() {
                 if let Some(e) = &o.error {
@@ -522,7 +681,8 @@ impl GemmaApp {
             };
             if loading {
                 ui.spinner();
-                ui.label("인덱스 불러오는 중…");
+                let s = self.store_status.lock().clone();
+                ui.label(if s.is_empty() { "인덱스 불러오는 중…".to_string() } else { s });
             } else {
                 ui.label(format!(
                     "인덱스 파일 {}개 · 벡터 {}개",

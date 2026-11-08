@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "gemma-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1585,6 +1585,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "encoding_rs",
+ "half",
  "image",
  "parking_lot 0.13.0",
  "pdf-extract",

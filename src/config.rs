@@ -52,6 +52,8 @@ pub struct Config {
     pub top_k: usize,
     /// 이 점수 미만 결과는 화면에서 숨김 (0 = 끔)
     pub min_score: f32,
+    /// 검색에서 뺀 폴더 키 (새 폴더는 기본 포함되도록 '제외 목록'으로 저장)
+    pub search_excluded_folders: Vec<String>,
 }
 
 impl Default for Config {
@@ -114,6 +116,7 @@ impl Default for Config {
             search_dim: 768,
             top_k: 100,
             min_score: 0.0,
+            search_excluded_folders: Vec::new(),
         }
     }
 }

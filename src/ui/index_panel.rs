@@ -201,14 +201,44 @@ impl GemmaApp {
         let mem = self.store.read().memory_mb();
         ui.label(
             RichText::new(format!(
-                "전체 인덱스: 파일 {}개 · 벡터 {}개 · 오류 {}개 · 검색용 메모리 {:.1}MB",
+                "전체 인덱스: 파일 {}개 · 벡터 {}개 · 오류 {}개 · DB {:.1}MB (벡터 {}) · 검색용 메모리 {:.1}MB",
                 fmt_num(stats.files),
                 fmt_num(stats.chunks),
                 fmt_num(stats.errors),
+                stats.file_bytes as f64 / 1048576.0,
+                if stats.f16 { "FP16" } else { "FP32" },
                 mem
             ))
             .weak(),
         );
+
+        // ── 폴더별 ──
+        let folders = self.folders.lock().clone();
+        if !folders.list.is_empty() {
+            ui.add_space(4.0);
+            egui::CollapsingHeader::new(format!("폴더별 인덱스 ({}개 폴더)", folders.list.len()))
+                .default_open(folders.list.len() > 1)
+                .show(ui, |ui| {
+                    egui::Grid::new("folders").num_columns(3).spacing([22.0, 4.0]).striped(true).show(ui, |ui| {
+                        for f in &folders.list {
+                            ui.label(&f.path);
+                            ui.label(format!("{}개", fmt_num(f.files)));
+                            if f.current {
+                                ui.colored_label(widgets::GREEN, "인덱싱 대상");
+                            } else {
+                                ui.colored_label(widgets::GRAY, "예전 대상 (결과 유지)");
+                            }
+                            ui.end_row();
+                        }
+                        if folders.other > 0 {
+                            ui.label(RichText::new("기타 위치").italics());
+                            ui.label(format!("{}개", fmt_num(folders.other)));
+                            ui.colored_label(widgets::GRAY, "폴더 기록 이전 항목");
+                            ui.end_row();
+                        }
+                    });
+                });
+        }
 
         // ── 오류 목록 ──
         if !p.error_list.is_empty() {

@@ -208,6 +208,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         }
     }
     db.meta_set("model_signature", &sig)?;
+    db.register_roots(&p.cfg.roots)?;
     let file_map = Arc::new(db.load_file_map()?);
 
     let ffmpeg = p.cfg.ffmpeg();

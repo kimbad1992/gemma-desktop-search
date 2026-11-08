@@ -105,6 +105,9 @@ impl GemmaApp {
             }
         });
 
+        // ── 검색 폴더 선택 ──
+        self.folder_row(ui);
+
         // ── 상태 줄 ──
         ui.add_space(4.0);
         let server_ready = self.server.state().is_ready();
@@ -115,7 +118,8 @@ impl GemmaApp {
         ui.horizontal_wrapped(|ui| {
             if self.store_loading.load(Ordering::SeqCst) {
                 ui.spinner();
-                ui.label("인덱스를 불러오는 중…");
+                let s = self.store_status.lock().clone();
+                ui.label(if s.is_empty() { "인덱스를 불러오는 중…".to_string() } else { s });
             } else if !server_ready {
                 widgets::badge(ui, widgets::ORANGE, "서버가 준비되지 않았습니다", false, false);
                 if !self.server.state().is_running() && ui.button("서버 시작").clicked() {
@@ -261,6 +265,74 @@ impl GemmaApp {
             }
         });
         self.outcome = Some(outcome);
+    }
+
+    /// 인덱스에 들어 있는 폴더(지금 대상 + 예전에 인덱싱한 폴더)를 골라 그 안에서만 검색
+    fn folder_row(&mut self, ui: &mut egui::Ui) {
+        use crate::search::store::OTHER_FOLDER_KEY;
+        let folders = self.folders.lock().clone();
+        if folders.list.is_empty() && folders.other == 0 {
+            return;
+        }
+        let mut changed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("폴더:").weak());
+            let excluded = &mut self.cfg.search_excluded_folders;
+            let all = folders.list.iter().all(|f| !excluded.contains(&f.key))
+                && (folders.other == 0 || !excluded.iter().any(|k| k == OTHER_FOLDER_KEY));
+            if ui
+                .selectable_label(all, "전체")
+                .on_hover_text(if all { "눌러서 모두 해제" } else { "눌러서 모두 선택" })
+                .clicked()
+            {
+                excluded.clear();
+                if all {
+                    excluded.extend(folders.list.iter().map(|f| f.key.clone()));
+                    if folders.other > 0 {
+                        excluded.push(OTHER_FOLDER_KEY.to_string());
+                    }
+                }
+                changed = true;
+            }
+            for f in &folders.list {
+                let mut on = !excluded.contains(&f.key);
+                let mut text = RichText::new(format!("{} ({})", short_path(&f.path), fmt_num(f.files)));
+                if !f.current {
+                    text = text.italics();
+                }
+                let hover = if f.current {
+                    format!("{}\n지금 인덱싱 대상 폴더", f.path)
+                } else {
+                    format!("{}\n예전에 인덱싱한 폴더 (지금은 대상에서 빠짐, 결과는 남아 있음)", f.path)
+                };
+                if ui.checkbox(&mut on, text).on_hover_text(hover).changed() {
+                    if on {
+                        excluded.retain(|k| k != &f.key);
+                    } else {
+                        excluded.push(f.key.clone());
+                    }
+                    changed = true;
+                }
+            }
+            if folders.other > 0 {
+                let mut on = !excluded.iter().any(|k| k == OTHER_FOLDER_KEY);
+                if ui
+                    .checkbox(&mut on, RichText::new(format!("기타 위치 ({})", fmt_num(folders.other))).italics())
+                    .on_hover_text("위 폴더 어디에도 속하지 않는 인덱스 파일 (폴더 기록 기능 이전에 인덱싱한 파일 등)")
+                    .changed()
+                {
+                    if on {
+                        excluded.retain(|k| k != OTHER_FOLDER_KEY);
+                    } else {
+                        excluded.push(OTHER_FOLDER_KEY.to_string());
+                    }
+                    changed = true;
+                }
+            }
+        });
+        if changed {
+            self.on_folder_selection_changed();
+        }
     }
 
     fn render_hits(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sec: Section, hits: &[HitView]) {
@@ -413,6 +485,20 @@ impl GemmaApp {
             crate::util::open_path(&hv.hit.path);
         }
         ui.add_space(2.0);
+    }
+}
+
+/// 긴 경로는 앞부분을 줄여서 표시 (`…\사진\2024`)
+fn short_path(p: &str) -> String {
+    let p = p.trim_end_matches('\\');
+    if p.chars().count() <= 32 {
+        return p.to_string();
+    }
+    let parts: Vec<&str> = p.split('\\').filter(|s| !s.is_empty()).collect();
+    match parts.len() {
+        0 => p.to_string(),
+        1 => crate::util::truncate_chars(p, 32),
+        n => format!("…\\{}\\{}", parts[n - 2], parts[n - 1]),
     }
 }
 

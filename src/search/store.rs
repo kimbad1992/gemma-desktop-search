@@ -83,11 +83,43 @@ pub struct Hit {
     pub kind: Kind,
 }
 
+/// 폴더 비교용 키: 소문자 + 끝에 '\' 하나 (예: `c:\`, `\\nas\share\photos\`)
+pub fn folder_key(path: &str) -> String {
+    let mut k = path.trim().trim_end_matches(['\\', '/']).to_lowercase().replace('/', "\\");
+    k.push('\\');
+    k
+}
+
+/// 어느 검색 폴더에도 속하지 않는 파일을 가리키는 특수 키
+pub const OTHER_FOLDER_KEY: &str = "<기타>";
+
+/// 검색 대상 폴더 선택
+#[derive(Clone, Debug)]
+pub struct FolderFilter {
+    /// 검색에 포함할 폴더 키들
+    pub selected: Vec<String>,
+    /// 목록에 있는 모든 폴더 키 ("기타" 판정용)
+    pub known: Vec<String>,
+    /// 목록의 어느 폴더에도 속하지 않는 파일 포함 여부
+    pub include_other: bool,
+}
+
+impl FolderFilter {
+    pub fn passes(&self, path_lower: &str) -> bool {
+        if self.selected.iter().any(|k| path_lower.starts_with(k.as_str())) {
+            return true;
+        }
+        self.include_other && !self.known.iter().any(|k| path_lower.starts_with(k.as_str()))
+    }
+}
+
 #[derive(Clone)]
 pub struct Filter {
     pub sections: [bool; 5],
     /// 소문자 경로에 포함돼야 하는 문자열 (공백으로 여러 개 = AND)
     pub path_terms: Vec<String>,
+    /// None = 모든 폴더
+    pub folders: Option<FolderFilter>,
 }
 
 impl Default for Filter {
@@ -95,6 +127,7 @@ impl Default for Filter {
         Self {
             sections: [true; 5],
             path_terms: Vec::new(),
+            folders: None,
         }
     }
 }
@@ -227,9 +260,14 @@ impl VectorStore {
             if !filter.sections[sec as usize] {
                 continue;
             }
-            if !filter.path_terms.is_empty() {
+            if !filter.path_terms.is_empty() || filter.folders.is_some() {
                 let pass = *pass_cache.entry(e.file_id).or_insert_with(|| {
                     filter.path_terms.iter().all(|t| info.path_lower.contains(t.as_str()))
+                        && filter
+                            .folders
+                            .as_ref()
+                            .map(|f| f.passes(&info.path_lower))
+                            .unwrap_or(true)
                 });
                 if !pass {
                     continue;
@@ -321,6 +359,44 @@ mod tests {
         assert_eq!(res[Section::Docs as usize].1[0].chunk_id, 30);
         s.remove_file(2);
         assert_eq!(s.live_chunks(), 1);
+    }
+
+    #[test]
+    fn folder_filter_selects_roots_and_other() {
+        assert_eq!(folder_key(r"C:\Users\Me\Photos\"), r"c:\users\me\photos\");
+        assert_eq!(folder_key(r"C:\"), r"c:\");
+        assert_eq!(folder_key(r"\\NAS\Share"), r"\\nas\share\");
+
+        let mut s = VectorStore::new(8);
+        s.loaded = true;
+        let files = [
+            (1, r"D:\Photos\a.jpg"),
+            (2, r"\\NAS\Share\b.jpg"),
+            (3, r"E:\Misc\c.jpg"),
+            (4, r"D:\PhotosOld\d.jpg"), // 'D:\Photos'와 접두사만 같은 다른 폴더
+        ];
+        for (id, p) in files {
+            s.replace_file(
+                id,
+                FileInfo::new(p.into(), Kind::Image),
+                vec![(Entry { chunk_id: id * 10, file_id: id, modality: Modality::Image, locator: 0 }, unit(8, 1))],
+            );
+        }
+        let known = vec![folder_key(r"D:\Photos"), folder_key(r"\\NAS\Share")];
+        let run = |selected: Vec<String>, include_other: bool| {
+            let f = Filter {
+                folders: Some(FolderFilter { selected, known: known.clone(), include_other }),
+                ..Default::default()
+            };
+            let mut ids: Vec<i64> =
+                s.search(&unit(8, 1), &f, 10)[Section::Images as usize].1.iter().map(|h| h.file_id).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(run(vec![folder_key(r"D:\Photos")], false), vec![1]);
+        assert_eq!(run(vec![folder_key(r"\\NAS\Share")], true), vec![2, 3, 4]);
+        assert_eq!(run(vec![], true), vec![3, 4]);
+        assert!(run(vec![], false).is_empty());
     }
 
     #[test]

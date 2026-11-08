@@ -1,6 +1,6 @@
 [package]
 name = "gemma-search"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
@@ -25,6 +25,7 @@ base64 = "0.23"
 rfd = "0.18"
 anyhow = "1"
 parking_lot = "0.13"
+half = "2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
