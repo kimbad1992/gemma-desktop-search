@@ -63,6 +63,8 @@ pub enum Modality {
     Text = 1,
     Image = 2,
     Audio = 3,
+    /// 영상 구간을 영상 그대로 임베딩 (모델 카드 방식)
+    Video = 4,
 }
 
 impl Modality {
@@ -71,6 +73,7 @@ impl Modality {
             1 => Modality::Text,
             2 => Modality::Image,
             3 => Modality::Audio,
+            4 => Modality::Video,
             _ => Modality::Name,
         }
     }

@@ -19,6 +19,8 @@ pub enum EmbedInput {
     Image(Vec<u8>),
     /// 16kHz mono 16-bit WAV 바이트
     Audio(Vec<u8>),
+    /// 영상 구간 (mp4 바이트). 서버가 ffmpeg로 디코딩해 1fps로 샘플링하고 한 벡터로 임베딩
+    Video(Vec<u8>),
 }
 
 impl EmbedInput {
@@ -36,6 +38,12 @@ impl EmbedInput {
                 "content": [{
                     "type": "input_audio",
                     "input_audio": { "data": b64(wav), "format": "wav" }
+                }]
+            }),
+            EmbedInput::Video(mp4) => json!({
+                "content": [{
+                    "type": "input_video",
+                    "input_video": { "data": format!("data:video/mp4;base64,{}", b64(mp4)) }
                 }]
             }),
         }

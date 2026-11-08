@@ -194,7 +194,20 @@ struct WorkerCtx {
     prog: Arc<Mutex<Progress>>,
     ctl: Arc<Control>,
     fatal: Arc<Mutex<Option<String>>>,
+    /// 지금 처리 중인 파일들 (서버 충돌 시 의심 파일로 기록)
+    inflight: Mutex<HashSet<String>>,
+    /// 첫 치명적 오류 시점의 처리 중 파일 목록
+    crash_inflight: Mutex<Option<Vec<String>>>,
+    /// 이전 충돌 의심 횟수
+    suspects: HashMap<String, i64>,
+    /// 서버가 영상 입력(input_video)을 받는지 — 아니면 프레임 이미지 방식으로 대체
+    video_native: bool,
+    /// 예전(프레임) 방식으로 인덱싱된 영상을 새 방식으로 다시 처리
+    reindex_video: bool,
 }
+
+/// 영상 인덱싱 방식 버전 (2 = 구간을 영상 그대로 임베딩)
+const VIDEO_INDEX_VERSION: &str = "2";
 
 fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -> Result<Outcome> {
     let mut db = Db::open(&p.db_path)?;
@@ -210,6 +223,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     db.meta_set("model_signature", &sig)?;
     db.register_roots(&p.cfg.roots)?;
     let file_map = Arc::new(db.load_file_map()?);
+    let suspects = db.crash_suspects().unwrap_or_default();
 
     let ffmpeg = p.cfg.ffmpeg();
     let ffprobe = p.cfg.ffprobe();
@@ -221,10 +235,36 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     enabled[Kind::Video.idx()] = p.cfg.index_video && p.caps.image.usable() && media_ok;
     enabled[Kind::Audio.idx()] = p.cfg.index_audio && p.caps.audio.usable() && media_ok;
 
+    // 서버가 영상 입력을 받는지 2초짜리 시험 영상으로 한 번 확인
+    let client = EmbedClient::new(p.port);
+    let video_native = if enabled[Kind::Video.idx()] {
+        match media::test_clip(ffmpeg.as_deref().unwrap()) {
+            Ok(clip) => match client.embed(&[EmbedInput::Video(clip)]) {
+                Ok(_) => true,
+                Err(EmbedError::Transport(m)) => bail!("서버 연결이 끊겼습니다: {m}"),
+                Err(e) => {
+                    prog.lock().add_warning(
+                        "영상 입력 확인",
+                        format!("서버가 영상 입력을 받지 않아 프레임 이미지 방식으로 대체합니다: {e}"),
+                    );
+                    false
+                }
+            },
+            Err(e) => {
+                prog.lock().add_warning("영상 입력 확인", format!("시험 영상 생성 실패, 프레임 방식 사용: {e}"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let reindex_video = video_native
+        && db.meta_get("video_index_version").as_deref() != Some(VIDEO_INDEX_VERSION);
+
     let ctx = Arc::new(WorkerCtx {
         cfg: p.cfg.clone(),
         caps: p.caps.clone(),
-        client: EmbedClient::new(p.port),
+        client,
         file_map: file_map.clone(),
         enabled,
         full_rebuild: p.full_rebuild,
@@ -234,6 +274,11 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         prog: prog.clone(),
         ctl: ctl.clone(),
         fatal: Arc::new(Mutex::new(None)),
+        inflight: Mutex::new(HashSet::new()),
+        crash_inflight: Mutex::new(None),
+        suspects,
+        video_native,
+        reindex_video,
     });
 
     let (job_tx, job_rx) = bounded::<FileJob>(512);
@@ -275,6 +320,9 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     let walk = walker.join().map_err(|_| anyhow!("탐색 스레드 오류"))?;
 
     if let Some(msg) = ctx.fatal.lock().take() {
+        if let Some(list) = ctx.crash_inflight.lock().take() {
+            let _ = db.add_crash_suspects(&list);
+        }
         bail!("{msg}");
     }
     if ctl.stopped() {
@@ -310,6 +358,9 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
             }
         }
         prog.lock().removed = stale.len() as u64;
+    }
+    if ctx.video_native && walk.complete {
+        db.meta_set("video_index_version", VIDEO_INDEX_VERSION)?;
     }
     Ok(Outcome::Completed)
 }
@@ -465,12 +516,20 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
         if !ctx.ctl.checkpoint() {
             break;
         }
-        if !ctx.full_rebuild {
+        let force_video = ctx.reindex_video && job.kind == Kind::Video;
+        if !ctx.full_rebuild && !force_video {
             if let Some(row) = ctx.file_map.get(&job.path) {
                 if row.size == job.size && row.mtime == job.mtime {
                     let up_to_date = match row.status {
                         db::ST_OK => true,
-                        // 오류 파일은 다시 시도 (보통 몇 개뿐이고, 일시적 문제였을 수 있음)
+                        // 서버를 반복해서 죽인 파일은 다시 시도하지 않음
+                        db::ST_ERROR
+                            if ctx.suspects.get(&job.path).copied().unwrap_or(0)
+                                >= db::CRASH_SUSPECT_LIMIT =>
+                        {
+                            true
+                        }
+                        // 그 밖의 오류 파일은 다시 시도 (보통 몇 개뿐이고, 일시적 문제였을 수 있음)
                         db::ST_ERROR => false,
                         // 예전엔 이름만 넣었는데 이제 내용 인덱싱이 가능해졌으면 다시 처리
                         db::ST_NAME_ONLY => !ctx.enabled[job.kind.idx()],
@@ -487,7 +546,15 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
             }
         }
         ctx.prog.lock().current = job.path.clone();
-        match process_file(&ctx, &job) {
+        ctx.inflight.lock().insert(job.path.clone());
+        let result = process_file(&ctx, &job);
+        if let Err(WorkErr::Fatal(_)) = &result {
+            // 서버가 죽은 시점에 처리 중이던 파일들을 의심 파일로 남긴다 (자기 자신 포함)
+            let snapshot: Vec<String> = ctx.inflight.lock().iter().cloned().collect();
+            ctx.crash_inflight.lock().get_or_insert(snapshot);
+        }
+        ctx.inflight.lock().remove(&job.path);
+        match result {
             Ok(rec) => {
                 if tx.send(rec).is_err() {
                     break;
@@ -495,7 +562,7 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
             }
             Err(WorkErr::Stopped) => break,
             Err(WorkErr::Fatal(msg)) => {
-                *ctx.fatal.lock() = Some(msg);
+                ctx.fatal.lock().get_or_insert(msg);
                 ctx.ctl.set(STOP);
                 break;
             }
@@ -548,8 +615,14 @@ fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
     }];
     let mut status = db::ST_OK;
     let mut error: Option<String> = None;
+    let crash_count = ctx.suspects.get(&job.path).copied().unwrap_or(0);
 
-    if ctx.enabled[job.kind.idx()] {
+    if crash_count >= db::CRASH_SUSPECT_LIMIT {
+        status = db::ST_ERROR;
+        error = Some(format!(
+            "이 파일을 처리하던 중 llama-server가 {crash_count}번 충돌해 내용 인덱싱을 건너뜀 (이름만)"
+        ));
+    } else if ctx.enabled[job.kind.idx()] {
         match extract_content(ctx, job, path, &file_name) {
             Ok(Content::Pieces(v)) if !v.is_empty() => pieces.extend(v),
             Ok(Content::Pieces(_)) => {
@@ -667,7 +740,38 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
             let (ff, fp) = (ctx.ffmpeg.as_deref().unwrap(), ctx.ffprobe.as_deref().unwrap());
             let info = media::probe(fp, path)?;
             let mut pieces = Vec::new();
-            if info.has_video {
+            if info.has_video && ctx.video_native {
+                // 모델 카드 방식: 구간을 영상 그대로 넣어 구간마다 하나의 벡터 (서버가 1fps로 샘플링)
+                let seg = cfg.video_window_secs() as f64;
+                let mut last_err = None;
+                for (start, len) in media::segments(info.duration, seg, cfg.video_max_segments) {
+                    if !ctx.ctl.checkpoint() {
+                        bail!("중지됨");
+                    }
+                    match media::video_segment(ff, path, start, len) {
+                        Ok(mp4) => {
+                            let thumb = media::frame_at(ff, path, start + len / 2.0)
+                                .ok()
+                                .and_then(|j| thumb_from_jpeg(&j));
+                            let (s_ms, e_ms) = ((start * 1000.0) as i64, ((start + len) * 1000.0) as i64);
+                            pieces.push(Piece {
+                                modality: Modality::Video,
+                                locator: s_ms,
+                                snippet: format!("{}–{} 구간", fmt_ts(s_ms), fmt_ts(e_ms)),
+                                input: EmbedInput::Video(mp4),
+                                thumb,
+                            });
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if pieces.is_empty() {
+                    if let Some(e) = last_err {
+                        return Err(e);
+                    }
+                }
+            } else if info.has_video {
+                // 대체 방식: 서버가 영상 입력을 받지 못할 때만 프레임을 이미지로
                 let n = if info.duration > 0.0 {
                     cfg.video_frames
                         .max(1)
@@ -682,10 +786,7 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                     }
                     match media::frame_at(ff, path, t) {
                         Ok(jpeg) => {
-                            let thumb = image::load_from_memory(&jpeg)
-                                .ok()
-                                .map(|img| img.thumbnail(extract::image::THUMB_SIDE, extract::image::THUMB_SIDE))
-                                .and_then(|t| extract::image::encode_jpeg(&t, 80).ok());
+                            let thumb = thumb_from_jpeg(&jpeg);
                             let ms = (t * 1000.0) as i64;
                             pieces.push(Piece {
                                 modality: Modality::Image,
@@ -722,6 +823,13 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
         }
         Kind::Other => Ok(Content::NameOnly("미지원 형식 (이름만)".into())),
     }
+}
+
+fn thumb_from_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
+    image::load_from_memory(jpeg)
+        .ok()
+        .map(|img| img.thumbnail(extract::image::THUMB_SIDE, extract::image::THUMB_SIDE))
+        .and_then(|t| extract::image::encode_jpeg(&t, 80).ok())
 }
 
 fn audio_pieces(ctx: &WorkerCtx, ff: &Path, path: &Path, dur: f64) -> Result<Vec<Piece>> {
@@ -814,6 +922,7 @@ fn embed_pieces(ctx: &WorkerCtx, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>
         EmbedInput::Text(_) => 0u8,
         EmbedInput::Image(_) => 1,
         EmbedInput::Audio(_) => 2,
+        EmbedInput::Video(_) => 3,
     };
     let batch_limit = |c: u8| match c {
         0 => 16,

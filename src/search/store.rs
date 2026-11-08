@@ -43,6 +43,7 @@ impl Section {
             Modality::Image => Section::Images,
             Modality::Audio if kind == Kind::Video => Section::Videos,
             Modality::Audio => Section::Audio,
+            Modality::Video => Section::Videos,
         }
     }
 }

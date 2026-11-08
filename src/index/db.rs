@@ -45,7 +45,14 @@ CREATE TABLE IF NOT EXISTS roots(
     first_indexed INTEGER,
     last_indexed INTEGER
 );
+CREATE TABLE IF NOT EXISTS crash_suspects(
+    path TEXT PRIMARY KEY,
+    count INTEGER NOT NULL
+);
 "#;
+
+/// 이 횟수만큼 서버 충돌 때 처리 중이던 파일은 내용 인덱싱을 건너뛴다
+pub const CRASH_SUSPECT_LIMIT: i64 = 2;
 
 /// 벡터 저장 형식 (meta.vec_format). 예전 DB(값 없음 + 청크 있음)는 f32.
 const META_VEC_FORMAT: &str = "vec_format";
@@ -225,6 +232,24 @@ impl Db {
         Ok(())
     }
 
+    /// 서버 충돌 때 처리 중이던 파일 기록 (+1)
+    pub fn add_crash_suspects(&self, paths: &[String]) -> Result<()> {
+        for p in paths {
+            self.conn.execute(
+                "INSERT INTO crash_suspects(path, count) VALUES(?1, 1)
+                 ON CONFLICT(path) DO UPDATE SET count = count + 1",
+                [p],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn crash_suspects(&self) -> Result<HashMap<String, i64>> {
+        let mut st = self.conn.prepare("SELECT path, count FROM crash_suspects")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     pub fn roots(&self) -> Result<Vec<String>> {
         let mut st = self.conn.prepare("SELECT path FROM roots ORDER BY path")?;
         let rows = st.query_map([], |r| r.get::<_, String>(0))?;
@@ -292,6 +317,10 @@ impl Db {
             |r| r.get(0),
         )?;
         tx.execute("DELETE FROM chunks WHERE file_id=?1", [file_id])?;
+        if rec.status != ST_ERROR {
+            // 정상 처리됐으면 충돌 의심 기록 해제
+            tx.execute("DELETE FROM crash_suspects WHERE path=?1", [&rec.path])?;
+        }
         let mut ids = Vec::with_capacity(rec.chunks.len());
         {
             let mut ins = tx.prepare_cached(
@@ -334,8 +363,9 @@ impl Db {
     }
 
     pub fn clear_all(&mut self) -> Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM thumbs; DELETE FROM chunks; DELETE FROM files;")?;
+        self.conn.execute_batch(
+            "DELETE FROM thumbs; DELETE FROM chunks; DELETE FROM files; DELETE FROM crash_suspects;",
+        )?;
         Ok(())
     }
 
@@ -469,6 +499,36 @@ mod tests {
         db.delete_files(&[id1]).unwrap();
         assert_eq!(db.chunk_count().unwrap(), 0, "CASCADE 삭제");
         assert!(db.is_f16(), "새 DB는 FP16");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn crash_suspects_count_and_clear() {
+        let dir = std::env::temp_dir().join(format!("gs-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut db = Db::open(&dir.join("t.db")).unwrap();
+        let a = r"C:\x\a.jpg".to_string();
+        let b = r"C:\x\b.jpg".to_string();
+        db.add_crash_suspects(&[a.clone(), b.clone()]).unwrap();
+        db.add_crash_suspects(&[a.clone()]).unwrap();
+        let s = db.crash_suspects().unwrap();
+        assert_eq!(s[&a], 2);
+        assert_eq!(s[&b], 1);
+        let rec = |path: &str, status| FileRecord {
+            path: path.into(),
+            size: 1,
+            mtime: 1,
+            kind: Kind::Image,
+            status,
+            error: None,
+            chunks: vec![],
+        };
+        db.write_file(&rec(&a, ST_ERROR)).unwrap();
+        db.write_file(&rec(&b, ST_OK)).unwrap();
+        let s = db.crash_suspects().unwrap();
+        assert_eq!(s.get(&a), Some(&2), "오류로 기록되면 의심 기록 유지");
+        assert!(s.get(&b).is_none(), "정상 처리되면 해제");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }

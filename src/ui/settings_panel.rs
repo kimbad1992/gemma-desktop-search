@@ -238,6 +238,25 @@ impl GemmaApp {
                 ui.add(egui::DragValue::new(&mut self.cfg.batch_size).range(256..=32768).speed(64));
                 ui.label("마이크로배치(-ub)");
                 ui.add(egui::DragValue::new(&mut self.cfg.ubatch_size).range(256..=32768).speed(64));
+                ui.separator();
+                ui.label("Flash Attention(-fa)");
+                egui::ComboBox::from_id_salt("fa")
+                    .selected_text(match self.cfg.flash_attn.as_str() {
+                        "on" => "켜기",
+                        "auto" => "자동",
+                        _ => "끄기 (권장)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.cfg.flash_attn, "off".to_string(), "끄기 (권장)");
+                        ui.selectable_value(&mut self.cfg.flash_attn, "auto".to_string(), "자동");
+                        ui.selectable_value(&mut self.cfg.flash_attn, "on".to_string(), "켜기");
+                    })
+                    .response
+                    .on_hover_text(
+                        "Windows + RTX 40 + Gemma 4 계열(mmproj)에서 Flash Attention이 켜져 있으면\n\
+                         'CUDA illegal memory access'로 llama-server가 죽는 문제가 있습니다 (llama.cpp #30436).\n\
+                         속도 차이는 거의 없으니 끄기를 권장합니다.",
+                    );
             });
             let max_in = self.cfg.max_input_tokens();
             if max_in < 600 {
@@ -263,6 +282,13 @@ impl GemmaApp {
                 );
                 ui.checkbox(&mut self.cfg.auto_start_server, "앱 시작 시 서버 자동 실행");
             });
+            ui.checkbox(
+                &mut self.cfg.auto_recover,
+                "인덱싱 중 서버가 비정상 종료되면 자동으로 다시 띄우고 이어서 인덱싱 (최대 5회)",
+            )
+            .on_hover_text(
+                "충돌 때 처리 중이던 파일을 기록해 두고, 같은 파일이 두 번 충돌에 걸리면 그 파일의 내용 인덱싱은 건너뜁니다.\n서버 로그: data\\logs\\llama-server.log",
+            );
         });
     }
 
@@ -354,8 +380,15 @@ impl GemmaApp {
                 ui.add(egui::DragValue::new(&mut self.cfg.max_text_mb).range(1..=1024).suffix("MB"));
             });
             ui.horizontal_wrapped(|ui| {
-                ui.label("영상 프레임");
-                ui.add(egui::DragValue::new(&mut self.cfg.video_frames).range(1..=64).suffix("장"));
+                ui.label("영상 구간");
+                ui.add(egui::DragValue::new(&mut self.cfg.video_segment_secs).range(4..=58).suffix("초"))
+                    .on_hover_text(format!(
+                        "영상을 이 길이로 나눠 구간마다 영상 그대로 임베딩합니다 (1초에 1프레임, 모델 카드 방식).\n\
+                         지금 서버 설정으로 실제 적용되는 길이: {}초 (입력 하나에 들어가는 프레임 수에 맞춰 줄어듦)",
+                        self.cfg.video_window_secs()
+                    ));
+                ui.label("영상당 최대");
+                ui.add(egui::DragValue::new(&mut self.cfg.video_max_segments).range(1..=500).suffix("구간"));
                 ui.label("오디오 구간");
                 ui.add(egui::DragValue::new(&mut self.cfg.audio_segment_secs).range(5..=300).suffix("초"));
                 ui.label("파일당 최대");

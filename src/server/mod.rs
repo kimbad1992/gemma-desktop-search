@@ -76,6 +76,8 @@ pub struct Shared {
 pub struct ServerManager {
     pub shared: Arc<Mutex<Shared>>,
     pub logs: Arc<Mutex<VecDeque<String>>>,
+    /// 서버 로그를 파일로도 남긴다 (충돌 원인 확인용, data\logs\llama-server.log)
+    log_file: Arc<Mutex<Option<std::fs::File>>>,
     child: Arc<Mutex<Option<Child>>>,
 }
 
@@ -94,10 +96,13 @@ impl Default for ServerManager {
                 has_mmproj: false,
             })),
             logs: Arc::new(Mutex::new(VecDeque::new())),
+            log_file: Arc::new(Mutex::new(None)),
             child: Arc::new(Mutex::new(None)),
         }
     }
 }
+
+const MAX_LOG_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
 /// 사용자가 지정한 경로(폴더 또는 exe)에서 실행 파일을 찾는다.
 /// 반환: (exe 경로, `llama.exe serve` 형태인지)
@@ -142,6 +147,12 @@ pub fn build_args(cfg: &Config, serve_mode: bool) -> Vec<String> {
     a.extend(["-m".into(), cfg.model_path.trim().to_string()]);
     if cfg.has_mmproj() {
         a.extend(["--mmproj".into(), cfg.mmproj_path.trim().to_string()]);
+        // 모델 카드 기본값: 영상은 초당 1프레임으로 샘플링 (llama-server 기본은 4)
+        a.extend(["--video-fps".into(), "1".into()]);
+        // 서버가 영상을 직접 디코딩하므로 ffmpeg 위치를 알려준다
+        if let Some(dir) = cfg.ffmpeg().as_deref().and_then(Path::parent) {
+            a.extend(["--video-ffmpeg-dir".into(), dir.display().to_string()]);
+        }
     }
     let s = |v: &dyn ToString| v.to_string();
     a.extend([
@@ -158,6 +169,12 @@ pub fn build_args(cfg: &Config, serve_mode: bool) -> Vec<String> {
         s(&cfg.ubatch_size),
         "-ngl".into(),
         s(&cfg.n_gpu_layers),
+        "-fa".into(),
+        match cfg.flash_attn.trim() {
+            "on" => "on".into(),
+            "auto" => "auto".into(),
+            _ => "off".into(),
+        },
         "--host".into(),
         "127.0.0.1".into(),
         "--port".into(),
@@ -193,7 +210,22 @@ impl ServerManager {
     }
 
     pub fn log(&self, line: impl Into<String>) {
-        push_log(&self.logs, line.into());
+        push_log(&self.logs, &self.log_file, line.into());
+    }
+
+    /// 로그 파일 위치 지정. 20MB를 넘으면 .old.log로 돌린다.
+    pub fn set_log_path(&self, path: &Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_FILE_BYTES {
+            let _ = std::fs::rename(path, path.with_extension("old.log"));
+        }
+        *self.log_file.lock() = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
     }
 
     pub fn start(&self, cfg: &Config) -> Result<()> {
@@ -243,6 +275,7 @@ impl ServerManager {
             .chain(args.iter().map(|a| quote(a)))
             .collect::<Vec<_>>()
             .join(" ");
+        self.log(format!("[앱] ===== 서버 시작 {} =====", crate::util::now_local_string()));
         self.log(format!("[앱] 실행: {command_line}"));
 
         let mut child = cmd
@@ -252,10 +285,10 @@ impl ServerManager {
             self.log("[앱] 경고: Job Object 등록 실패 — 앱이 비정상 종료되면 서버가 남을 수 있습니다");
         }
         if let Some(out) = child.stdout.take() {
-            spawn_log_reader(out, self.logs.clone());
+            spawn_log_reader(out, self.logs.clone(), self.log_file.clone());
         }
         if let Some(err) = child.stderr.take() {
-            spawn_log_reader(err, self.logs.clone());
+            spawn_log_reader(err, self.logs.clone(), self.log_file.clone());
         }
         let pid = child.id();
         *self.child.lock() = Some(child);
@@ -452,7 +485,11 @@ impl ServerManager {
     }
 }
 
-fn push_log(logs: &Mutex<VecDeque<String>>, line: String) {
+fn push_log(logs: &Mutex<VecDeque<String>>, file: &Mutex<Option<std::fs::File>>, line: String) {
+    if let Some(f) = file.lock().as_mut() {
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
     let mut l = logs.lock();
     l.push_back(line);
     while l.len() > MAX_LOG_LINES {
@@ -460,7 +497,11 @@ fn push_log(logs: &Mutex<VecDeque<String>>, line: String) {
     }
 }
 
-fn spawn_log_reader(stream: impl Read + Send + 'static, logs: Arc<Mutex<VecDeque<String>>>) {
+fn spawn_log_reader(
+    stream: impl Read + Send + 'static,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    file: Arc<Mutex<Option<std::fs::File>>>,
+) {
     std::thread::spawn(move || {
         let mut r = BufReader::new(stream);
         let mut buf = Vec::new();
@@ -471,7 +512,7 @@ fn spawn_log_reader(stream: impl Read + Send + 'static, logs: Arc<Mutex<VecDeque
                 Ok(_) => {
                     let line = String::from_utf8_lossy(&buf).trim_end().to_string();
                     if !line.is_empty() {
-                        push_log(&logs, line);
+                        push_log(&logs, &file, line);
                     }
                 }
             }
@@ -536,6 +577,7 @@ mod tests {
         assert!(a.contains(&"--embeddings".to_string()));
         assert!(a.windows(2).any(|w| w[0] == "--pooling" && w[1] == "mean"));
         assert!(a.windows(2).any(|w| w[0] == "--port" && w[1] == "8090"));
+        assert!(a.windows(2).any(|w| w[0] == "-fa" && w[1] == "off"), "FA 기본 off");
         let s = build_args(&cfg, true);
         assert_eq!(s[0], "serve");
     }

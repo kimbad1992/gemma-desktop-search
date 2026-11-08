@@ -105,6 +105,70 @@ pub fn frame_at(ffmpeg: &Path, path: &Path, t: f64) -> Result<Vec<u8>> {
     ffmpeg_stdout(ffmpeg, &args, Duration::from_secs(60))
 }
 
+/// 영상의 start초부터 len초 구간을 작은 mp4로 (1fps, 긴 변 768px, 소리 없음).
+/// 서버가 이 구간을 영상 그대로 받아 한 벡터로 임베딩한다.
+pub fn video_segment(ffmpeg: &Path, path: &Path, start: f64, len: f64) -> Result<Vec<u8>> {
+    let args = vec![
+        "-ss".into(),
+        format!("{start:.3}"),
+        "-t".into(),
+        format!("{len:.3}"),
+        "-i".into(),
+        path.display().to_string(),
+        "-an".into(),
+        "-vf".into(),
+        "fps=1,scale=768:768:force_original_aspect_ratio=decrease:force_divisible_by=2".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "veryfast".into(),
+        "-crf".into(),
+        "26".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        // 파이프로 내보내려면 조각난(fragmented) mp4여야 한다
+        "-movflags".into(),
+        "frag_keyframe+empty_moov".into(),
+        "-f".into(),
+        "mp4".into(),
+        "-".into(),
+    ];
+    ffmpeg_stdout(ffmpeg, &args, Duration::from_secs(180))
+}
+
+/// 서버의 영상 입력 지원 확인용 2초짜리 시험 영상
+pub fn test_clip(ffmpeg: &Path) -> Result<Vec<u8>> {
+    let args: Vec<String> = [
+        "-f", "lavfi", "-i", "testsrc=s=320x240:d=2:r=5", "-vf", "fps=1", "-c:v", "libx264",
+        "-pix_fmt", "yuv420p", "-movflags", "frag_keyframe+empty_moov", "-f", "mp4", "-",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    ffmpeg_stdout(ffmpeg, &args, Duration::from_secs(30))
+}
+
+/// 길이 dur인 영상을 최대 max개의 seg초 구간으로: (시작, 길이) 목록.
+/// 전체를 덮을 수 있으면 이어 붙이고, 너무 길면 고르게 분산한다.
+pub fn segments(dur: f64, seg: f64, max: usize) -> Vec<(f64, f64)> {
+    let seg = seg.max(1.0);
+    if dur <= 0.0 {
+        return vec![(0.0, seg)];
+    }
+    let n = ((dur / seg).ceil() as usize).clamp(1, max.max(1));
+    if dur <= n as f64 * seg {
+        (0..n)
+            .map(|i| {
+                let s = i as f64 * seg;
+                (s, seg.min(dur - s))
+            })
+            .filter(|(_, l)| *l >= 1.0)
+            .collect()
+    } else {
+        (0..n).map(|i| (dur * i as f64 / n as f64, seg)).collect()
+    }
+}
+
 /// HEIC/AVIF 등 image 크레이트가 못 읽는 이미지를 JPEG로
 pub fn image_to_jpeg(ffmpeg: &Path, path: &Path) -> Result<Vec<u8>> {
     let args = vec![
@@ -194,6 +258,20 @@ mod tests {
         assert_eq!(u32::from_le_bytes(w[4..8].try_into().unwrap()), 36 + 3200);
         assert_eq!(u32::from_le_bytes(w[40..44].try_into().unwrap()), 3200);
         assert_eq!(w.len(), 44 + 3200);
+    }
+
+    #[test]
+    fn video_segments_cover_or_spread() {
+        // 70초 영상, 30초 구간 → 0~30, 30~60, 60~70
+        assert_eq!(segments(70.0, 30.0, 20), vec![(0.0, 30.0), (30.0, 30.0), (60.0, 10.0)]);
+        // 짧은 영상 → 전체 한 구간
+        assert_eq!(segments(8.0, 30.0, 20), vec![(0.0, 8.0)]);
+        // 긴 영상(1시간) → 최대 4구간을 고르게
+        let s = segments(3600.0, 30.0, 4);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[1].0, 900.0);
+        // 끝에 1초 미만 자투리는 버림
+        assert_eq!(segments(60.5, 30.0, 20).len(), 2);
     }
 
     #[test]

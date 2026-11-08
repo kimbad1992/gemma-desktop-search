@@ -101,6 +101,17 @@ pub fn reveal_path(path: &str) {
         .spawn();
 }
 
+/// 현재 로컬 시각 "2026-11-08 22:04:43"
+pub fn now_local_string() -> String {
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+    let mut t = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
+    )
+}
+
 /// 1234567 → "1,234,567"
 pub fn fmt_num(n: u64) -> String {
     let s = n.to_string();

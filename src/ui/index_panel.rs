@@ -31,6 +31,7 @@ impl GemmaApp {
                 _ => start.on_hover_text("새 파일과 바뀐 파일만 처리합니다"),
             };
             if start.clicked() {
+                self.recover_attempts = 0;
                 self.start_index(false);
             }
             if ui
@@ -61,6 +62,23 @@ impl GemmaApp {
                 self.indexer.stop();
             }
         });
+
+        if self.recover_attempts > 0 {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                widgets::badge(
+                    ui,
+                    widgets::ORANGE,
+                    &format!(
+                        "서버 자동 복구 {}/{}회 — llama-server가 비정상 종료되어 다시 띄우고 이어서 인덱싱했습니다",
+                        self.recover_attempts,
+                        crate::app::MAX_RECOVER_ATTEMPTS
+                    ),
+                    false,
+                    false,
+                );
+            });
+        }
 
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -287,8 +305,8 @@ fn content_status(
         Kind::Video if !c.index_video => (false, "꺼짐"),
         Kind::Video if !media_ok => (false, "ffmpeg 없음 → 이름만"),
         Kind::Video => match (img, aud) {
-            (Some(true), Some(true)) if c.index_audio => (true, "✔ 프레임 + 오디오"),
-            (Some(true), _) => (true, "✔ 프레임"),
+            (Some(true), Some(true)) if c.index_audio => (true, "✔ 영상 구간 + 오디오"),
+            (Some(true), _) => (true, "✔ 영상 구간"),
             (Some(false), _) => (false, "이미지 진단 실패 → 이름만"),
             _ => (false, "서버 진단 대기"),
         },

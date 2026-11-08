@@ -96,7 +96,14 @@ pub struct GemmaApp {
     // 명령줄 자동 실행 (--index, --query)
     auto_index: bool,
     auto_query: Option<String>,
+
+    /// 이번 인덱싱 작업에서 서버 충돌 후 자동 복구한 횟수
+    pub recover_attempts: u32,
+    pending_recover: Option<Instant>,
 }
+
+/// 한 번의 인덱싱 작업에서 서버 자동 재시작 최대 횟수
+pub const MAX_RECOVER_ATTEMPTS: u32 = 5;
 
 impl GemmaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -155,7 +162,11 @@ impl GemmaApp {
             last_index_state: RunState::Idle,
             auto_index: false,
             auto_query: None,
+            recover_attempts: 0,
+            pending_recover: None,
         };
+        app.server
+            .set_log_path(&app.data_dir.join("logs").join("llama-server.log"));
         if let Some(e) = db_error {
             app.notify(e, true);
         }
@@ -454,6 +465,56 @@ impl GemmaApp {
         }
     }
 
+    /// 인덱싱이 서버 충돌로 끝났으면 서버를 다시 띄우고 변경분 인덱싱으로 이어간다.
+    /// 처리 중이던 파일은 충돌 의심으로 기록되고, 같은 파일이 두 번 걸리면 건너뛴다.
+    fn try_recover_indexing(&mut self) {
+        let msg = self.indexer.progress.lock().message.clone();
+        if self.cfg.auto_recover && msg.contains("서버 연결이 끊겼습니다") {
+            // 서버 감시 스레드가 프로세스 종료를 알아챌 시간을 잠시 준다
+            self.pending_recover = Some(Instant::now());
+        }
+    }
+
+    fn poll_recovery(&mut self) {
+        let Some(since) = self.pending_recover else { return };
+        let state = self.server.state();
+        let server_dead = matches!(
+            state,
+            crate::server::ServerState::Failed(_) | crate::server::ServerState::Stopped
+        );
+        if !server_dead && since.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        self.pending_recover = None;
+        if self.recover_attempts >= MAX_RECOVER_ATTEMPTS {
+            self.notify(
+                format!(
+                    "서버가 {MAX_RECOVER_ATTEMPTS}번 연속 비정상 종료되어 자동 복구를 멈췄습니다. 서버 탭의 로그(data\\logs\\llama-server.log)를 확인하세요."
+                ),
+                true,
+            );
+            return;
+        }
+        self.recover_attempts += 1;
+        let n = self.recover_attempts;
+        if server_dead {
+            self.server.log(format!(
+                "[앱] 인덱싱 중 서버 비정상 종료 → 자동 복구 {n}/{MAX_RECOVER_ATTEMPTS}: 서버 재시작 후 이어서 인덱싱"
+            ));
+            self.notify(
+                format!("서버가 비정상 종료되어 다시 시작하고 이어서 인덱싱합니다 ({n}/{MAX_RECOVER_ATTEMPTS})"),
+                true,
+            );
+            self.start_server();
+        } else {
+            // 서버는 살아 있음 (일시적 연결 끊김) → 인덱싱만 이어서
+            self.server.log(format!(
+                "[앱] 서버 연결이 잠시 끊겼음 → 이어서 인덱싱 ({n}/{MAX_RECOVER_ATTEMPTS})"
+            ));
+        }
+        self.auto_index = true;
+    }
+
     // ── 검색 ──
     pub fn start_search(&mut self, q: QueryKind) {
         if self.search_rx.is_some() {
@@ -515,6 +576,7 @@ impl GemmaApp {
 
     // ── 매 프레임 ──
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_recovery();
         self.run_auto_actions();
         if let Some((m, err)) = self.bg_notice.lock().take() {
             self.notice = Some(Notice {
@@ -575,6 +637,11 @@ impl GemmaApp {
         if state != self.last_index_state {
             if let Some((m, err)) = done_msg {
                 self.notify(m, err);
+            }
+            match state {
+                RunState::Completed | RunState::Stopped => self.recover_attempts = 0,
+                RunState::Failed => self.try_recover_indexing(),
+                _ => {}
             }
             // SQLite가 지운 청크의 rowid를 재사용할 수 있으므로 썸네일 캐시를 비운다
             if matches!(state, RunState::Completed | RunState::Stopped | RunState::Failed) {
@@ -758,6 +825,7 @@ impl GemmaApp {
                 ui.horizontal(|ui| {
                     if ui.button(RichText::new("재구축 시작").color(widgets::RED)).clicked() {
                         self.confirm_rebuild = false;
+                        self.recover_attempts = 0;
                         self.start_index(true);
                     }
                     if ui.button("취소").clicked() {

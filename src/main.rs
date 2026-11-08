@@ -19,6 +19,9 @@ fn main() -> eframe::Result {
     if args.first().map(|a| a == "--headless-test").unwrap_or(false) {
         std::process::exit(headless::run(&args[1..]));
     }
+    if args.first().map(|a| a == "--stress").unwrap_or(false) {
+        std::process::exit(headless::stress(&args[1..]));
+    }
     if args.first().map(|a| a == "--bench").unwrap_or(false) {
         std::process::exit(headless::bench(args.get(1).map(String::as_str).unwrap_or("README.md")));
     }

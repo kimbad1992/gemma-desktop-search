@@ -3,9 +3,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 설정 파일 형식 버전. 기본값을 바꿀 때 예전 기본값 그대로인 설정만 옮긴다.
+pub const CONFIG_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
+    /// 0 = 버전 기록 이전 설정 파일
+    pub config_version: u32,
+
     // ── llama-server ──
     /// llama.cpp 폴더 또는 llama-server.exe / llama.exe 경로
     pub llama_path: String,
@@ -20,8 +26,13 @@ pub struct Config {
     pub parallel: u32,
     pub batch_size: u32,
     pub ubatch_size: u32,
+    /// "off" / "auto" / "on". Windows + RTX 40 + Gemma 4 계열(+mmproj)에서 FA가
+    /// CUDA illegal memory access로 서버를 죽이는 문제(llama.cpp #30436)가 있어 기본 off.
+    pub flash_attn: String,
     pub extra_args: String,
     pub auto_start_server: bool,
+    /// 인덱싱 중 서버가 비정상 종료되면 자동으로 다시 띄우고 이어서 인덱싱
+    pub auto_recover: bool,
 
     // ── 외부 도구 ──
     pub ffmpeg_path: String,
@@ -41,6 +52,11 @@ pub struct Config {
     pub chunk_chars: usize,
     pub chunk_overlap: usize,
     pub max_chunks_per_file: usize,
+    /// 영상을 이 길이(초)의 구간으로 나눠 구간마다 영상 그대로 임베딩 (모델 카드: 1fps, 입력당 최대 약 58프레임)
+    pub video_segment_secs: u32,
+    /// 영상 하나에서 임베딩할 최대 구간 수 (긴 영상은 고르게 분산)
+    pub video_max_segments: usize,
+    /// 서버가 영상 입력을 거부할 때만 쓰는 대체 방식(프레임 이미지)의 프레임 수
     pub video_frames: usize,
     pub audio_segment_secs: u32,
     pub audio_max_segments: usize,
@@ -59,6 +75,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            config_version: CONFIG_VERSION,
             llama_path: r"F:\Tools\llama.cpp-embed".into(),
             model_path: r"F:\Tools\models\embeddinggemma-2\embeddinggemma-2-BF16.gguf".into(),
             mmproj_path: r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-BF16.gguf".into(),
@@ -66,12 +83,15 @@ impl Default for Config {
             port: 8090,
             n_gpu_layers: 99,
             // RTX 4090 실측: np 4/ub 2048 ≈ 56 벡터/초, np 8/ub 8192 ≈ 91 벡터/초, np 16 ≈ 73 (GPU 포화)
-            ctx_size: 16384,
+            // 슬롯당 8192(모델 최대 컨텍스트)가 되도록 65536 — 영상 30초 구간(약 2,600토큰)이 들어가야 함
+            ctx_size: 65536,
             parallel: 8,
             batch_size: 8192,
             ubatch_size: 8192,
+            flash_attn: "off".into(),
             extra_args: String::new(),
             auto_start_server: false,
+            auto_recover: true,
 
             ffmpeg_path: crate::util::find_tool("ffmpeg.exe")
                 .map(|p| p.display().to_string())
@@ -108,6 +128,8 @@ impl Default for Config {
             chunk_chars: 1000,
             chunk_overlap: 150,
             max_chunks_per_file: 200,
+            video_segment_secs: 30,
+            video_max_segments: 20,
             video_frames: 12,
             audio_segment_secs: 30,
             audio_max_segments: 20,
@@ -124,13 +146,34 @@ impl Default for Config {
 impl Config {
     pub fn load(data_dir: &Path) -> Self {
         let path = data_dir.join("config.toml");
-        match std::fs::read_to_string(&path) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("config.toml 파싱 실패, 기본값 사용: {e}");
-                Self::default()
-            }),
-            Err(_) => Self::default(),
+        let mut cfg: Config = match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                // 버전 키가 없는 예전 파일은 0으로 읽어야 이전 기본값을 옮길 수 있다
+                let had_version = s.lines().any(|l| l.trim_start().starts_with("config_version"));
+                let mut c: Config = toml::from_str(&s).unwrap_or_else(|e| {
+                    eprintln!("config.toml 파싱 실패, 기본값 사용: {e}");
+                    Self::default()
+                });
+                if !had_version {
+                    c.config_version = 0;
+                }
+                c
+            }
+            Err(_) => return Self::default(),
+        };
+        cfg.migrate();
+        cfg
+    }
+
+    /// 예전 기본값 그대로인 항목만 새 기본값으로 옮긴다 (사용자가 바꾼 값은 유지)
+    fn migrate(&mut self) {
+        if self.config_version < 2 {
+            // 슬롯당 2048 → 8192: 영상 구간 임베딩에 필요
+            if self.ctx_size == 16384 && self.parallel == 8 {
+                self.ctx_size = 65536;
+            }
         }
+        self.config_version = CONFIG_VERSION;
     }
 
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
@@ -144,6 +187,13 @@ impl Config {
     pub fn max_input_tokens(&self) -> usize {
         let slot = (self.ctx_size / self.parallel.max(1)).max(256);
         (slot.min(self.ubatch_size).min(self.batch_size) as usize).saturating_sub(16)
+    }
+
+    /// 영상 구간 길이(초): 설정값과, 입력 하나(슬롯)에 들어가는 프레임 수 중 작은 쪽.
+    /// 1fps 기준 프레임당 약 85토큰(실측) — 여유 있게 150으로 잡는다.
+    pub fn video_window_secs(&self) -> u32 {
+        let by_ctx = (self.max_input_tokens().saturating_sub(64) / 150) as u32;
+        self.video_segment_secs.clamp(4, 58).min(by_ctx.max(4))
     }
 
     pub fn ffmpeg(&self) -> Option<PathBuf> {
@@ -179,6 +229,24 @@ impl Config {
             sig(&self.mmproj_path),
             crate::embed::prompt::PROMPT_VERSION
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrates_old_default_context_only() {
+        let dir = std::env::temp_dir().join(format!("gs-cfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("config.toml"), "ctx_size = 16384\nparallel = 8\n").unwrap();
+        assert_eq!(Config::load(&dir).ctx_size, 65536, "예전 기본값은 새 기본값으로");
+        std::fs::write(dir.join("config.toml"), "ctx_size = 32768\nparallel = 8\n").unwrap();
+        assert_eq!(Config::load(&dir).ctx_size, 32768, "사용자가 바꾼 값은 유지");
+        std::fs::write(dir.join("config.toml"), "config_version = 2\nctx_size = 16384\nparallel = 8\n").unwrap();
+        assert_eq!(Config::load(&dir).ctx_size, 16384, "이미 새 버전이면 손대지 않음");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

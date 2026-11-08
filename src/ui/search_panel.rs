@@ -529,6 +529,7 @@ fn score_color(s: f32) -> egui::Color32 {
 
 fn locator_label(hv: &HitView) -> Option<String> {
     match (hv.hit.modality, hv.hit.kind) {
+        (Modality::Video, _) => Some(format!("{}~ 구간", fmt_ts(hv.hit.locator))),
         (Modality::Image, Kind::Video) => Some(format!("{} 장면", fmt_ts(hv.hit.locator))),
         (Modality::Audio, _) => Some(format!("{}부터", fmt_ts(hv.hit.locator))),
         (Modality::Text, _) if hv.hit.locator > 0 => Some(format!("{}번째 구간", hv.hit.locator + 1)),

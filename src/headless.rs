@@ -16,6 +16,101 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 서버 안정성 시험: 폴더를 임시 DB에 반복 재구축하면서 서버가 죽는지 본다.
+///   gemma-search.exe --stress <폴더> <초>
+pub fn stress(args: &[String]) -> i32 {
+    let (Some(dir), Some(secs)) = (args.first(), args.get(1).and_then(|s| s.parse::<u64>().ok())) else {
+        eprintln!("사용법: --stress <폴더> <초>");
+        return 2;
+    };
+    let limit = Duration::from_secs(secs);
+    let data_dir = std::env::temp_dir().join(format!("gemma-search-stress-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let mut cfg = Config::load(&crate::config::data_dir());
+    cfg.roots = vec![dir.clone()];
+    let server = ServerManager::default();
+    if let Err(e) = server.start(&cfg) {
+        println!("서버 시작 실패: {e}");
+        return 1;
+    }
+    let cmd = server.shared.lock().command_line.clone();
+    println!("명령줄: {cmd}");
+    let t0 = Instant::now();
+    let caps = loop {
+        if let Some(c) = server.capabilities() {
+            break c;
+        }
+        if t0.elapsed() > Duration::from_secs(120) || matches!(server.state(), crate::server::ServerState::Failed(_)) {
+            println!("서버 준비 실패: {:?}", server.state());
+            return 1;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let store = Arc::new(RwLock::new(VectorStore::new(cfg.search_dim)));
+    store.write().loaded = true;
+    let mut indexer = Indexer::default();
+    let start = Instant::now();
+    let mut total = 0u64;
+    let mut pass = 0;
+    let mut crashed = None;
+    let mut last_report = Instant::now();
+    'outer: while start.elapsed() < limit {
+        pass += 1;
+        indexer
+            .start(IndexParams {
+                cfg: cfg.clone(),
+                caps: caps.clone(),
+                port: cfg.port,
+                db_path: data_dir.join("index.db"),
+                data_dir: data_dir.clone(),
+                store: store.clone(),
+                full_rebuild: true,
+            })
+            .unwrap();
+        while indexer.is_active() {
+            std::thread::sleep(Duration::from_millis(500));
+            if let crate::server::ServerState::Failed(m) = server.state() {
+                crashed = Some(m);
+                indexer.stop();
+            }
+            if last_report.elapsed() > Duration::from_secs(30) {
+                let p = indexer.progress.lock().clone();
+                println!(
+                    "  {:>4}초  {}회차  처리 {}  벡터 {}",
+                    start.elapsed().as_secs(),
+                    pass,
+                    total + p.processed,
+                    p.chunks
+                );
+                last_report = Instant::now();
+            }
+            if start.elapsed() > limit {
+                indexer.stop();
+            }
+        }
+        total += indexer.progress.lock().processed;
+        if crashed.is_some() {
+            break 'outer;
+        }
+    }
+    let elapsed = start.elapsed().as_secs();
+    match &crashed {
+        Some(m) => {
+            println!("결과: 서버 충돌 ({elapsed}초, 처리 {total}개) — {m}");
+            for l in server.logs.lock().iter().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
+                if l.contains(" E ") || l.contains("error") || l.contains("CUDA") || l.contains("[앱]") {
+                    println!("  {l}");
+                }
+            }
+        }
+        None => println!("결과: 충돌 없음 ({elapsed}초, {pass}회차, 처리 {total}개)"),
+    }
+    server.stop();
+    let _ = std::fs::remove_dir_all(&data_dir);
+    if crashed.is_some() { 3 } else { 0 }
+}
+
 /// 이미 떠 있는 서버(설정 포트)에 대해 클라이언트 왕복 시간 측정
 pub fn bench(file: &str) -> i32 {
     use crate::embed::client::{EmbedClient, EmbedInput};
@@ -251,6 +346,7 @@ pub fn run(args: &[String]) -> i32 {
                 .map(|h| {
                     let loc = match (h.hit.modality, h.hit.kind) {
                         (crate::extract::Modality::Image, crate::extract::Kind::Video)
+                        | (crate::extract::Modality::Video, _)
                         | (crate::extract::Modality::Audio, _) => format!("@{}", fmt_ts(h.hit.locator)),
                         _ => String::new(),
                     };
