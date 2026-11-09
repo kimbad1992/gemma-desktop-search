@@ -9,6 +9,7 @@ mod embed;
 mod extract;
 mod headless;
 mod shell;
+mod sysinfo;
 mod update;
 mod index;
 mod open;
@@ -35,6 +36,9 @@ fn main() -> eframe::Result {
             Err(e) => println!("확인 실패: {e}"),
         }
         return Ok(());
+    }
+    if args.first().map(|a| a == "--sysinfo").unwrap_or(false) {
+        std::process::exit(headless::sysinfo());
     }
     if args.first().map(|a| a == "--query-once").unwrap_or(false) {
         std::process::exit(headless::query_once(&args[1..]));

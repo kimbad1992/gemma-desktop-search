@@ -304,6 +304,28 @@ impl GemmaApp {
             ui.checkbox(&mut self.cfg.start_with_windows, "Windows에 로그인하면 트레이로 시작")
                 .on_hover_text("저장하면 바로 적용됩니다. 등록 위치: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
             ui.checkbox(&mut self.cfg.index_on_start, "앱을 켤 때 변경분 인덱싱");
+            ui.checkbox(&mut self.cfg.index_overlay, "인덱싱 중 앱 창을 보고 있지 않으면 화면 오른쪽 아래에 상태 창 띄우기")
+                .on_hover_text("진행률과 GPU·CPU 사용 중임을 보여주고, 일시정지·중지할 수 있습니다");
+            // 오버레이는 항상 위에 떠 있는 창이라 문제를 일으키기 쉽다 → 눈에 띄게 경고
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0, widgets::ORANGE))
+                .fill(widgets::ORANGE.gamma_multiply(0.08))
+                .corner_radius(6)
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("⚠ 주의: 오버레이는 다른 창 위에 항상 떠 있는 작은 창이라 문제를 일으킬 수 있습니다")
+                            .strong()
+                            .color(widgets::ORANGE),
+                    );
+                    for line in [
+                        "전체 화면 게임·영상·발표 중(Windows가 알림을 막는 상태)에는 자동으로 숨기지만, 창 모드 게임 위에는 뜰 수 있습니다.",
+                        "일부 게임의 안티치트, 화면 녹화·방송, 원격 데스크톱 프로그램과 충돌하거나 화면에 같이 찍힐 수 있습니다.",
+                        "문제가 생기면 이 옵션을 끄세요. 꺼도 트레이 아이콘의 초록 점과 툴팁, 인덱스 탭에서 진행 상황을 볼 수 있습니다.",
+                    ] {
+                        ui.label(RichText::new(format!("· {line}")).color(widgets::ORANGE));
+                    }
+                });
             ui.checkbox(&mut self.cfg.server_on_demand, "검색할 때 서버가 꺼져 있으면 자동으로 켜기");
             ui.horizontal(|ui| {
                 ui.label("자동으로 켠 서버를 쓰지 않으면");
@@ -373,9 +395,19 @@ impl GemmaApp {
             });
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
         }
-        ui.label(
-            RichText::new("ffmpeg(영상·오디오·HEIC)는 따로 설치하세요: winget install Gyan.FFmpeg").small().weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ffmpeg(영상·오디오·HEIC)는 따로 설치하세요: winget install Gyan.FFmpeg").small().weak(),
+            );
+            if ui
+                .button("처음 설정 다시 열기")
+                .on_hover_text("사양 확인 → 준비물 받기 → 서버 설정 → 폴더 → 동작 확인")
+                .clicked()
+            {
+                let ctx = ui.ctx().clone();
+                self.open_setup(&ctx);
+            }
+        });
     }
 
     fn tool_settings(&mut self, ui: &mut egui::Ui) {

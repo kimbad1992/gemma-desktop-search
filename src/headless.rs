@@ -260,6 +260,24 @@ pub fn query_once(args: &[String]) -> i32 {
     0
 }
 
+/// 사양 확인과 추천 설정 출력 (첫 실행 마법사와 같은 내용)
+///   gemma-search.exe --sysinfo
+pub fn sysinfo() -> i32 {
+    let cfg = Config::load(&crate::config::data_dir());
+    let t = Instant::now();
+    let info = crate::sysinfo::probe(&crate::config::app_dir(), cfg.ffmpeg().is_some());
+    let plan = crate::sysinfo::recommend(&info);
+    println!("확인 {:.1}초", t.elapsed().as_secs_f32());
+    for g in &info.gpus {
+        println!("  GPU: {} · {}MB · {:?} · 드라이버 {:?}", g.name, g.vram_mb, g.vendor, g.driver);
+    }
+    for (lv, k, v) in &plan.checks {
+        println!("[{lv:?}] {k}: {v}");
+    }
+    println!("추천: {}", plan.summary);
+    0
+}
+
 /// 두 서버(예: BF16과 Q8)의 처리 속도 비교: 같은 입력(텍스트·이미지·영상 구간)을 각각 임베딩해 시간 측정
 ///   gemma-search.exe --bench-compare <포트A> <포트B> <폴더>
 pub fn bench_compare(args: &[String]) -> i32 {

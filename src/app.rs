@@ -118,7 +118,11 @@ pub struct GemmaApp {
     /// 빠른 검색창에서 Enter: 지금 입력에 대한 결과가 오면 선택한 결과를 연다
     pub quick_enter: bool,
     /// 창이 보이는 상태 (트레이로 숨기면 false)
-    window_visible: bool,
+    pub window_visible: bool,
+    /// 창이 숨겨져 있음 (깨우기 스레드가 본다)
+    hidden_flag: Arc<AtomicBool>,
+    /// eframe는 첫 프레임을 그린 뒤 창을 무조건 보이게 한다 → 트레이로 시작할 때 처음 몇 프레임 동안 다시 숨긴다
+    keep_hidden_frames: u8,
     /// 앱 창의 Win32 핸들 (앞으로 가져오기용)
     main_hwnd: usize,
     force_foreground: Option<Instant>,
@@ -138,6 +142,16 @@ pub struct GemmaApp {
     /// 준비물 받기 진행 상태
     pub dl: Arc<Mutex<crate::download::DlState>>,
     pub dl_cancel: Arc<AtomicBool>,
+    /// 인덱싱 오버레이: 이번 인덱싱 동안 숨김 / 직전 상태 / "창 열기" 눌림
+    pub overlay_dismissed: bool,
+    pub overlay_last_state: RunState,
+    pub overlay_tx: crossbeam_channel::Sender<crate::ui::overlay::OverlayAction>,
+    pub overlay_rx: Receiver<crate::ui::overlay::OverlayAction>,
+    /// 전체 화면 상태 확인 결과 (확인 시각, 바쁨)
+    pub overlay_busy_cache: Mutex<(Option<Instant>, bool)>,
+    /// 첫 실행 마법사
+    pub setup_open: bool,
+    pub setup: crate::ui::setup::SetupState,
     update_rx: Option<Receiver<Option<(String, String)>>>,
 
     // 설정 화면 보조
@@ -150,7 +164,7 @@ pub struct GemmaApp {
     last_index_state: RunState,
 
     // 명령줄 자동 실행 (--index, --query)
-    auto_index: bool,
+    pub auto_index: bool,
     auto_query: Option<String>,
 
     /// 이번 인덱싱 작업에서 서버 충돌 후 자동 복구한 횟수
@@ -185,6 +199,7 @@ impl GemmaApp {
         };
 
         let (preview_tx, preview_rx) = crossbeam_channel::unbounded();
+        let (overlay_tx, overlay_rx) = crossbeam_channel::unbounded();
         let mut app = Self {
             exclude_text: cfg.exclude_dirs.join("\n"),
             store: Arc::new(RwLock::new(VectorStore::new(cfg.search_dim))),
@@ -224,6 +239,8 @@ impl GemmaApp {
             leave_quick_after_open: false,
             quick_enter: false,
             window_visible: !std::env::args().any(|a| a == "--background"),
+            keep_hidden_frames: if std::env::args().any(|a| a == "--background") { 4 } else { 0 },
+            hidden_flag: Arc::new(AtomicBool::new(std::env::args().any(|a| a == "--background"))),
             main_hwnd: {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 cc.window_handle()
@@ -245,6 +262,13 @@ impl GemmaApp {
             update_rx: None,
             dl: Arc::new(Mutex::new(Default::default())),
             dl_cancel: Arc::new(AtomicBool::new(false)),
+            setup_open: false,
+            setup: Default::default(),
+            overlay_dismissed: false,
+            overlay_last_state: RunState::Idle,
+            overlay_tx,
+            overlay_rx,
+            overlay_busy_cache: Mutex::new((None, false)),
             new_root: String::new(),
             notice: None,
             confirm_rebuild: false,
@@ -261,6 +285,21 @@ impl GemmaApp {
             app.notify(e, true);
         }
         app.reload_store();
+        // 창이 숨겨져 있으면 eframe이 스스로 다시 그리지 않아 logic(자동 인덱싱·복구·서버 끄기·오버레이)이 멈춘다
+        // → 숨긴 동안 0.5초마다 깨운다
+        {
+            let flag = app.hidden_flag.clone();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::Builder::new()
+                .name("hidden-ticker".into())
+                .spawn(move || loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if flag.load(Ordering::SeqCst) {
+                        ctx.request_repaint();
+                    }
+                })
+                .ok();
+        }
         app.spawn_stats_thread();
         // 트레이·전역 단축키
         match Shell::start(cc.egui_ctx.clone(), app.cfg.global_hotkey) {
@@ -322,9 +361,27 @@ impl GemmaApp {
         } else if app.auto_index || app.auto_query.is_some() {
             app.start_server_auto();
         }
-        if app.cfg.roots.is_empty() {
-            app.tab = Tab::Settings;
-            app.notify("처음 실행: 설정에서 경로를 확인하고 인덱싱할 폴더를 추가하세요.", false);
+        // 첫 실행: 준비물·폴더가 이미 다 있으면(예전 버전에서 쓰던 설정) 마법사 없이 끝난 것으로
+        if !app.cfg.setup_done {
+            let ready = std::path::Path::new(app.cfg.model_path.trim()).is_file()
+                && crate::server::resolve_binary(&app.cfg.llama_path).is_ok()
+                && !app.cfg.roots.is_empty();
+            if ready {
+                app.cfg.setup_done = true;
+                let mut s = app.saved_cfg.clone();
+                s.setup_done = true;
+                if s.save(&app.data_dir).is_ok() {
+                    app.saved_cfg = s;
+                }
+            } else {
+                app.open_setup(&cc.egui_ctx);
+                // 트레이로 시작했어도 마법사는 보여야 한다
+                if !app.window_visible {
+                    cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    app.window_visible = true;
+                    app.hidden_flag.store(false, Ordering::SeqCst);
+                }
+            }
         }
         if let Some(t) = value("--tab") {
             app.tab = match t.as_str() {
@@ -468,17 +525,28 @@ impl GemmaApp {
         self.pending_search.is_some()
     }
 
+    /// 오버레이의 "창 열기"
+    pub fn show_window_from_overlay(&mut self, ctx: &egui::Context) {
+        if self.quick.is_some() {
+            self.leave_quick(ctx, true);
+        } else {
+            self.show_window(ctx);
+        }
+    }
+
     fn show_window(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.window_visible = true;
+        self.hidden_flag.store(false, Ordering::SeqCst);
         self.force_foreground = Some(Instant::now());
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         self.window_visible = false;
+        self.hidden_flag.store(true, Ordering::SeqCst);
     }
 
     /// 빠른 검색창: 창을 테두리 없이 작게, 마우스가 있는 화면 위쪽 가운데에, 항상 위로
@@ -1128,6 +1196,8 @@ impl GemmaApp {
             } else {
                 self.notify(format!("{} 받기 실패: {msg}", pack.label()), true);
             }
+            // 마법사의 "모두 받기": 다음 준비물
+            self.setup_next_download(ctx, ok);
         }
 
         // 트레이·단축키, 기다리던 검색, 유휴 서버, 빠른 검색창
@@ -1382,10 +1452,32 @@ impl GemmaApp {
 }
 
 impl eframe::App for GemmaApp {
+    /// 창이 숨겨져 있어도(트레이) 불린다: 이벤트 처리는 전부 여기서.
+    /// (eframe은 숨긴 창에서 `ui`를 부르지 않고 `logic`만 부른다)
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.keep_hidden_frames > 0 {
+            self.keep_hidden_frames -= 1;
+            if !self.window_visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint();
+            }
+        }
+        self.poll(ctx);
+        self.handle_close(ctx);
+        self.overlay_logic(ctx);
+        // 트레이로 숨겨져 있어도 인덱싱 오버레이는 그려야 한다 → 이번 프레임은 ui를 부르게
+        if !self.window_visible && self.overlay_should_show(ctx) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.poll(&ctx);
-        self.handle_close(&ctx);
+        self.index_overlay(&ctx);
+        // 숨긴 상태에서 오버레이 때문에 불렸으면 본 창은 그리지 않는다
+        if !self.window_visible && self.quick.is_none() {
+            return;
+        }
         if self.quick.is_some() {
             // Esc: 입력칸에 포커스가 있든 없든 바로 닫는다 (입력칸이 Esc를 먹어 포커스만 잃던 문제)
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -1400,6 +1492,10 @@ impl eframe::App for GemmaApp {
                 }
                 return;
             }
+        }
+        if self.setup_open {
+            egui::CentralPanel::default().show(ui, |ui| self.setup_ui(ui));
+            return;
         }
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));

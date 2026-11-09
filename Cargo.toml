@@ -1,6 +1,6 @@
 [package]
 name = "gemma-search"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
@@ -37,6 +37,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",

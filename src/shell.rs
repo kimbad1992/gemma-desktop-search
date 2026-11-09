@@ -364,6 +364,38 @@ pub fn already_running(data_dir: &std::path::Path) -> bool {
     false
 }
 
+/// 지금 알림을 띄우면 안 되는 상황인지: 전체 화면 앱(게임·영상), 발표 모드, 방해 금지 시간.
+/// Windows가 알림 표시 여부를 판단할 때 쓰는 그 값을 그대로 쓴다.
+pub fn user_busy() -> bool {
+    use windows_sys::Win32::UI::Shell::{
+        SHQueryUserNotificationState, QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY, QUNS_PRESENTATION_MODE,
+        QUNS_QUIET_TIME, QUNS_RUNNING_D3D_FULL_SCREEN,
+    };
+    let mut st = QUNS_ACCEPTS_NOTIFICATIONS;
+    if unsafe { SHQueryUserNotificationState(&mut st) } != 0 {
+        return false;
+    }
+    matches!(
+        st,
+        QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE | QUNS_QUIET_TIME
+    )
+}
+
+/// 주 모니터의 작업 영역 (물리 픽셀, 작업 표시줄 제외): (x, y, 너비, 높이)
+pub fn primary_work_area() -> Option<(i32, i32, i32, i32)> {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi) == 0 {
+            return None;
+        }
+        let r = mi.rcWork;
+        Some((r.left, r.top, r.right - r.left, r.bottom - r.top))
+    }
+}
+
 /// 마우스가 있는 모니터의 작업 영역 (물리 픽셀): (x, y, 너비, 높이)
 pub fn cursor_work_area() -> Option<(i32, i32, i32, i32)> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};

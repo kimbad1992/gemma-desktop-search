@@ -90,6 +90,10 @@ pub struct Config {
     pub check_updates: bool,
     /// 마지막 확인 시각 (유닉스 초)
     pub last_update_check: u64,
+    /// 첫 실행 마법사를 마쳤는지
+    pub setup_done: bool,
+    /// 인덱싱 중 앱 창을 보고 있지 않으면 화면 오른쪽 아래에 상태 창
+    pub index_overlay: bool,
 }
 
 impl Default for Config {
@@ -184,6 +188,8 @@ impl Default for Config {
             idle_stop_minutes: 10,
             check_updates: true,
             last_update_check: 0,
+            setup_done: false,
+            index_overlay: true,
         }
     }
 }
