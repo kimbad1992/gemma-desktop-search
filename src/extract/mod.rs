@@ -86,7 +86,7 @@ const TEXT_EXT: &[&str] = &[
     "hpp", "cc", "cxx", "hh", "cs", "swift", "rb", "php", "pl", "lua", "sh", "bash", "zsh", "bat",
     "cmd", "ps1", "psm1", "sql", "r", "m", "mm", "scala", "dart", "vue", "svelte", "tex", "bib",
     "srt", "vtt", "smi", "ass", "properties", "gradle", "cmake", "makefile", "dockerfile", "proto",
-    "graphql", "gql", "nfo", "org", "adoc", "asciidoc", "env", "gitignore", "editorconfig", "reg",
+    "graphql", "gql", "nfo", "org", "adoc", "asciidoc", "gitignore", "editorconfig", "reg",
     "inf", "vb", "vbs", "fs", "fsx", "hs", "elm", "ex", "exs", "erl", "clj", "zig", "nim", "jl",
     "sol", "v", "sv", "vhd", "asm", "s", "glsl", "hlsl", "wgsl", "cu", "tf", "hcl",
 ];
@@ -102,7 +102,32 @@ const AUDIO_EXT: &[&str] = &[
     "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "aiff", "aif",
 ];
 
+/// 키·인증서·비밀번호 파일: 내용은 절대 읽지 않는다 (이름만). 본문이 인덱스 DB에 남으면 안 되므로.
+pub fn is_sensitive(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    const NAMES: &[&str] = &[
+        "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".netrc", "_netrc", ".pgpass", "credentials", ".npmrc",
+        ".pypirc", ".git-credentials", "known_hosts", "authorized_keys",
+    ];
+    const EXTS: &[&str] = &[
+        "pem", "key", "p12", "pfx", "kdbx", "kdb", "keychain", "ppk", "gpg", "pgp", "jks", "keystore", "der", "crt",
+        "cer", "asc", "ovpn",
+    ];
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    NAMES.contains(&name.as_str())
+        || name.starts_with("id_rsa")
+        || name == ".env"
+        || name.starts_with(".env.")
+        || EXTS.contains(&ext.as_str())
+}
+
 pub fn classify(path: &Path) -> Kind {
+    if is_sensitive(path) {
+        return Kind::Other;
+    }
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -142,5 +167,11 @@ mod tests {
         assert_eq!(classify(Path::new("song.flac")), Kind::Audio);
         assert_eq!(classify(Path::new("Makefile")), Kind::Text);
         assert_eq!(classify(Path::new("setup.exe")), Kind::Other);
+        // 키·비밀 파일은 내용을 읽지 않음
+        assert_eq!(classify(Path::new(r"C:\u\.ssh\id_rsa")), Kind::Other);
+        assert_eq!(classify(Path::new(r"C:\proj\.env")), Kind::Other);
+        assert_eq!(classify(Path::new(r"C:\proj\.env.local")), Kind::Other);
+        assert_eq!(classify(Path::new("server.key")), Kind::Other);
+        assert_eq!(classify(Path::new("vault.kdbx")), Kind::Other);
     }
 }

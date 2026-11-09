@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 설정 파일 형식 버전. 기본값을 바꿀 때 예전 기본값 그대로인 설정만 옮긴다.
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -66,19 +66,47 @@ pub struct Config {
     /// 768 / 512 / 256 (Matryoshka). DB에는 항상 원본 768차원을 저장
     pub search_dim: usize,
     pub top_k: usize,
-    /// 이 점수 미만 결과는 화면에서 숨김 (0 = 끔)
-    pub min_score: f32,
+    /// 이 관련도 미만 결과는 화면에서 숨김 (관련도 = 이 검색에서 대부분의 파일보다 표준편차 몇 배만큼 튀는지)
+    pub min_relevance: f32,
     /// 검색에서 뺀 폴더 키 (새 폴더는 기본 포함되도록 '제외 목록'으로 저장)
     pub search_excluded_folders: Vec<String>,
+    /// 어느 앱에서든 Ctrl+Shift+Space로 검색창 띄우기
+    pub global_hotkey: bool,
+
+    // ── 상주 ──
+    /// 창을 닫으면 끝내지 않고 트레이로 (트레이 메뉴의 "종료"로 끝냄)
+    pub close_to_tray: bool,
+    /// 트레이로 숨겼다는 안내를 이미 보여줌
+    pub tray_notice_shown: bool,
+    /// Windows에 로그인하면 트레이로 시작
+    pub start_with_windows: bool,
+    /// 앱을 켤 때 변경분 인덱싱
+    pub index_on_start: bool,
+    /// 검색할 때 서버가 꺼져 있으면 자동으로 켠다
+    pub server_on_demand: bool,
+    /// 앱이 켠 서버를 이 시간(분) 동안 검색·인덱싱이 없으면 끈다 (0 = 끄지 않음). 서버 탭에서 직접 켠 서버는 끄지 않는다.
+    pub idle_stop_minutes: u32,
+    /// 하루 한 번 GitHub에서 새 버전 확인
+    pub check_updates: bool,
+    /// 마지막 확인 시각 (유닉스 초)
+    pub last_update_check: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            llama_path: r"F:\Tools\llama.cpp-embed".into(),
-            model_path: r"F:\Tools\models\embeddinggemma-2\embeddinggemma-2-BF16.gguf".into(),
-            mmproj_path: r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-BF16.gguf".into(),
+            llama_path: default_path(&[app_dir().join("llama.cpp"), PathBuf::from(r"F:\Tools\llama.cpp-embed")]),
+            // ggml-org의 Q8_0 (310MB + 555MB). BF16과 벡터가 사실상 같다 (실측 코사인 0.997 이상)
+            // 포터블: 프로그램 폴더의 models\ 아래 (설정 → 준비물 받기). 없으면 예전 위치.
+            model_path: default_path(&[
+                app_dir().join(r"models\embeddinggemma-2\embeddinggemma-2-Q8_0.gguf"),
+                PathBuf::from(r"F:\Tools\models\embeddinggemma-2\embeddinggemma-2-Q8_0.gguf"),
+            ]),
+            mmproj_path: default_path(&[
+                app_dir().join(r"models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
+                PathBuf::from(r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
+            ]),
             extra_dll_dir: String::new(),
             port: 8090,
             n_gpu_layers: 99,
@@ -114,6 +142,12 @@ impl Default for Config {
                 "$Recycle.Bin",
                 "System Volume Information",
                 "Windows",
+                // 키·인증서가 있는 폴더는 아예 읽지 않는다
+                ".ssh",
+                ".gnupg",
+                ".aws",
+                ".azure",
+                ".kube",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -129,16 +163,27 @@ impl Default for Config {
             chunk_overlap: 150,
             max_chunks_per_file: 200,
             video_segment_secs: 30,
-            video_max_segments: 20,
+            // 긴 영상·오디오도 끝까지 (30초 구간 기준 영상 2시간, 오디오 약 3시간). 더 길면 고르게 분산.
+            video_max_segments: 240,
             video_frames: 12,
             audio_segment_secs: 30,
-            audio_max_segments: 20,
+            audio_max_segments: 400,
             workers: 4,
 
             search_dim: 768,
             top_k: 100,
-            min_score: 0.0,
+            // 실측: 맞는 게 없는 검색의 1위는 4.9~5.5, 맞는 검색은 대체로 6~10
+            min_relevance: 5.5,
             search_excluded_folders: Vec::new(),
+            global_hotkey: true,
+            close_to_tray: true,
+            tray_notice_shown: false,
+            start_with_windows: false,
+            index_on_start: false,
+            server_on_demand: true,
+            idle_stop_minutes: 10,
+            check_updates: true,
+            last_update_check: 0,
         }
     }
 }
@@ -171,6 +216,20 @@ impl Config {
             // 슬롯당 2048 → 8192: 영상 구간 임베딩에 필요
             if self.ctx_size == 16384 && self.parallel == 8 {
                 self.ctx_size = 65536;
+            }
+        }
+        if self.config_version < 3 {
+            // 긴 영상·오디오를 끝까지 읽도록 구간 수 기본값 상향, 키·인증서 폴더 제외 추가
+            if self.video_max_segments == 20 {
+                self.video_max_segments = 240;
+            }
+            if self.audio_max_segments == 20 {
+                self.audio_max_segments = 400;
+            }
+            for d in SENSITIVE_DIRS {
+                if !self.exclude_dirs.iter().any(|x| x.eq_ignore_ascii_case(d)) {
+                    self.exclude_dirs.push(d.to_string());
+                }
             }
         }
         self.config_version = CONFIG_VERSION;
@@ -208,7 +267,22 @@ impl Config {
         !self.mmproj_path.trim().is_empty()
     }
 
-    /// 인덱스에 기록해 두는 모델 구성 서명. 바뀌면 재구축 필요.
+    /// llama.cpp 빌드 서명 (실행 파일 이름:크기). 바뀌면 벡터가 그대로인지 호환성 검사.
+    pub fn server_signature(&self) -> String {
+        match crate::server::resolve_binary(&self.llama_path) {
+            Ok((exe, _)) => {
+                let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+                // llama-server.exe는 작은 실행 파일이고 실제 코드는 DLL에 있다 → ggml/llama DLL 크기도 함께
+                let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+                let size = |n: &str| std::fs::metadata(dir.join(n)).map(|m| m.len()).unwrap_or(0);
+                let exe_size = std::fs::metadata(&exe).map(|m| m.len()).unwrap_or(0);
+                format!("{name}:{exe_size}|llama:{}|cuda:{}", size("llama.dll"), size("ggml-cuda.dll"))
+            }
+            Err(_) => "-".into(),
+        }
+    }
+
+    /// 인덱스에 기록해 두는 모델 구성 서명. 바뀌면 호환성 검사 → 벡터가 달라졌으면 재구축 필요.
     pub fn model_signature(&self) -> String {
         fn sig(p: &str) -> String {
             let p = p.trim();
@@ -232,6 +306,19 @@ impl Config {
     }
 }
 
+/// 후보 중 실제로 있는 첫 경로, 없으면 첫 후보 (프로그램 폴더 기준)
+fn default_path(candidates: &[PathBuf]) -> String {
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .or(candidates.first())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default()
+}
+
+/// 키·인증서가 들어 있는 폴더 (기본 제외)
+const SENSITIVE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube"];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +333,14 @@ mod tests {
         assert_eq!(Config::load(&dir).ctx_size, 32768, "사용자가 바꾼 값은 유지");
         std::fs::write(dir.join("config.toml"), "config_version = 2\nctx_size = 16384\nparallel = 8\n").unwrap();
         assert_eq!(Config::load(&dir).ctx_size, 16384, "이미 새 버전이면 손대지 않음");
+        std::fs::write(
+            dir.join("config.toml"),
+            "config_version = 2\nvideo_max_segments = 20\naudio_max_segments = 50\nexclude_dirs = [\".git\"]\n",
+        )
+        .unwrap();
+        let c = Config::load(&dir);
+        assert_eq!((c.video_max_segments, c.audio_max_segments), (240, 50), "예전 기본값만 상향");
+        assert!(c.exclude_dirs.iter().any(|d| d == ".ssh"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -264,6 +359,11 @@ pub fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("GEMMA_SEARCH_DATA") {
         return PathBuf::from(d);
     }
+    app_dir().join("data")
+}
+
+/// 프로그램 폴더: exe가 있는 폴더 (cargo로 실행 중이면 프로젝트 루트). 포터블 준비물(모델·llama.cpp)도 여기 아래.
+pub fn app_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = exe.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
     let is_target = |d: &Path| {
@@ -279,5 +379,5 @@ pub fn data_dir() -> PathBuf {
             dir = root.to_path_buf();
         }
     }
-    dir.join("data")
+    dir
 }

@@ -94,6 +94,23 @@ pub fn open_path(path: &str) {
     let _ = Command::new("explorer.exe").arg(path).spawn();
 }
 
+/// 파일 자체를 클립보드에 (탐색기·메신저에 붙여넣기). PowerShell의 Set-Clipboard 사용.
+pub fn copy_file_to_clipboard(path: &str) -> Result<()> {
+    let quoted = path.replace('\'', "''");
+    let mut cmd = hidden_command("powershell.exe");
+    cmd.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!("Set-Clipboard -LiteralPath '{quoted}'"),
+    ]);
+    let out = run_capture(cmd, Duration::from_secs(15))?;
+    if !out.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// 탐색기에서 파일 선택한 채로 폴더 열기
 pub fn reveal_path(path: &str) {
     let _ = Command::new("explorer.exe")

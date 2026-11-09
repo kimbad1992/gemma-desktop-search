@@ -49,6 +49,18 @@ CREATE TABLE IF NOT EXISTS crash_suspects(
     path TEXT PRIMARY KEY,
     count INTEGER NOT NULL
 );
+-- 키워드 색인: rowid = chunks.id. 파일 이름 청크는 이름+폴더, 텍스트 청크는 본문.
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(body, tokenize = 'unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS chunks_fts_del AFTER DELETE ON chunks BEGIN
+    DELETE FROM fts WHERE rowid = old.id;
+END;
+-- 허브 보정용 기준 질의 벡터 (version = 질의 묶음 + 모델이 같을 때만 재사용)
+CREATE TABLE IF NOT EXISTS query_bank(
+    version TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    vec BLOB NOT NULL,
+    PRIMARY KEY(version, idx)
+);
 "#;
 
 /// 이 횟수만큼 서버 충돌 때 처리 중이던 파일은 내용 인덱싱을 건너뛴다
@@ -78,6 +90,8 @@ pub struct ChunkRecord {
     pub snippet: String,
     pub vec: Vec<f32>,
     pub thumb: Option<Vec<u8>>,
+    /// 키워드 색인에 넣을 본문 (이름 청크는 이름+폴더, 텍스트 청크는 청크 원문)
+    pub text: Option<String>,
 }
 
 pub struct FileRecord {
@@ -327,6 +341,7 @@ impl Db {
                 "INSERT INTO chunks(file_id,modality,locator,snippet,vec) VALUES(?1,?2,?3,?4,?5)",
             )?;
             let mut th = tx.prepare_cached("INSERT INTO thumbs(chunk_id,jpeg) VALUES(?1,?2)")?;
+            let mut fts = tx.prepare_cached("INSERT INTO fts(rowid, body) VALUES(?1,?2)")?;
             for c in &rec.chunks {
                 ins.execute(params![
                     file_id,
@@ -342,6 +357,9 @@ impl Db {
                 let cid = tx.last_insert_rowid();
                 if let Some(t) = &c.thumb {
                     th.execute(params![cid, t])?;
+                }
+                if let Some(t) = c.text.as_deref().filter(|t| !t.trim().is_empty()) {
+                    fts.execute(params![cid, t])?;
                 }
                 ids.push(cid);
             }
@@ -364,7 +382,7 @@ impl Db {
 
     pub fn clear_all(&mut self) -> Result<()> {
         self.conn.execute_batch(
-            "DELETE FROM thumbs; DELETE FROM chunks; DELETE FROM files; DELETE FROM crash_suspects;",
+            "DELETE FROM fts; DELETE FROM thumbs; DELETE FROM chunks; DELETE FROM files; DELETE FROM crash_suspects;",
         )?;
         Ok(())
     }
@@ -389,6 +407,169 @@ impl Db {
             });
         }
         Ok(())
+    }
+
+    // ── 허브 보정 기준 질의 ──
+
+    pub fn load_bank(&self, version: &str, expected: usize) -> Option<Vec<Vec<f32>>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT vec FROM query_bank WHERE version = ?1 ORDER BY idx")
+            .ok()?;
+        let rows = st
+            .query_map([version], |r| r.get::<_, Vec<u8>>(0))
+            .ok()?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .ok()?;
+        (rows.len() == expected && expected > 0).then(|| rows.iter().map(|b| vecmath::from_bytes(b)).collect())
+    }
+
+    pub fn save_bank(&mut self, version: &str, vectors: &[Vec<f32>]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM query_bank", [])?;
+        {
+            let mut ins = tx.prepare("INSERT INTO query_bank(version, idx, vec) VALUES(?1, ?2, ?3)")?;
+            for (i, v) in vectors.iter().enumerate() {
+                ins.execute(params![version, i as i64, vecmath::to_bytes(v)])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── 키워드 색인 (FTS5) ──
+
+    /// 이 패턴에 맞는 청크가 하나라도 있는지
+    pub fn fts_exists(&self, pattern: &str) -> bool {
+        self.conn
+            .query_row("SELECT 1 FROM fts WHERE fts MATCH ?1 LIMIT 1", [pattern], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// 패턴에 맞는 파일 id
+    pub fn fts_files(&self, pattern: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT DISTINCT c.file_id FROM fts JOIN chunks c ON c.id = fts.rowid WHERE fts MATCH ?1 LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![pattern, limit as i64], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 패턴이 파일 이름 청크(이름+폴더)에 맞는 파일 id
+    pub fn fts_name_files(&self, pattern: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT DISTINCT c.file_id FROM fts JOIN chunks c ON c.id = fts.rowid
+             WHERE fts MATCH ?1 AND c.modality = ?2 LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![pattern, Modality::Name as i64, limit as i64], |r| r.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 청크 하나에서 질의 단어를 강조한 발췌 (단어가 없으면 None)
+    pub fn fts_snippet(&self, chunk_id: i64, expr: &str, tokens: i64) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT snippet(fts, 0, char(1), char(2), '…', ?3) FROM fts WHERE fts MATCH ?1 AND rowid = ?2",
+                params![expr, chunk_id, tokens],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 파일에서 질의 단어가 가장 잘 맞는 텍스트 청크: (청크 id, locator, 강조 발췌)
+    pub fn fts_best_text_chunk(&self, file_id: i64, expr: &str) -> Option<(i64, i64, String)> {
+        self.conn
+            .query_row(
+                "SELECT c.id, c.locator, snippet(fts, 0, char(1), char(2), '…', 24)
+                 FROM fts JOIN chunks c ON c.id = fts.rowid
+                 WHERE fts MATCH ?1 AND c.file_id = ?2 AND c.modality = ?3 ORDER BY bm25(fts) LIMIT 1",
+                params![expr, file_id, Modality::Text as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 청크 원문 전체에서 질의 단어를 강조 (미리보기용). 단어가 없거나 색인에 없으면 None
+    pub fn fts_highlight(&self, chunk_id: i64, expr: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT highlight(fts, 0, char(1), char(2)) FROM fts WHERE fts MATCH ?1 AND rowid = ?2",
+                params![expr, chunk_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 청크 원문 (키워드 색인에 들어 있는 경우)
+    pub fn chunk_text(&self, chunk_id: i64) -> Option<String> {
+        self.conn
+            .query_row("SELECT body FROM fts WHERE rowid = ?1", [chunk_id], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 키워드 색인 이전 인덱스: 파일 이름 청크를 색인에 채운다 (파일을 읽지 않음). 반환: 채운 개수
+    pub fn backfill_name_fts(&mut self) -> Result<u64> {
+        if self.meta_get("fts_names").as_deref() == Some("1") {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut st = tx.prepare(
+                "SELECT c.id, f.path FROM chunks c JOIN files f ON f.id = c.file_id
+                 WHERE c.modality = ?1 AND NOT EXISTS (SELECT 1 FROM fts WHERE fts.rowid = c.id)",
+            )?;
+            let mapped = st.query_map([Modality::Name as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            mapped.collect::<std::result::Result<_, _>>()?
+        };
+        {
+            let mut ins = tx.prepare("INSERT INTO fts(rowid, body) VALUES(?1, ?2)")?;
+            for (id, path) in &rows {
+                ins.execute(params![id, crate::search::keyword::name_body(path)])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO meta(key,value) VALUES('fts_names','1') ON CONFLICT(key) DO UPDATE SET value='1'",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(rows.len() as u64)
+    }
+
+    /// 이 종류의 청크가 하나라도 있는 파일 경로 (예: 이미 새 방식으로 처리된 영상)
+    pub fn paths_with_modality(&self, modality: Modality) -> Result<std::collections::HashSet<String>> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT f.path FROM files f JOIN chunks c ON c.file_id = f.id WHERE c.modality = ?1",
+        )?;
+        let rows = st.query_map([modality as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// 호환성 검사용 무작위 표본: (경로, locator, 저장된 벡터). 정상 처리된 파일만.
+    pub fn sample_chunks(&self, modality: Modality, kind: Kind, limit: usize) -> Result<Vec<(String, i64, Vec<f32>)>> {
+        let mut st = self.conn.prepare(
+            "SELECT f.path, c.locator, c.vec FROM chunks c JOIN files f ON f.id = c.file_id
+             WHERE c.modality = ?1 AND f.kind = ?2 AND f.status = ?3 ORDER BY random() LIMIT ?4",
+        )?;
+        let rows = st.query_map(params![modality as i64, kind as i64, ST_OK, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (p, loc, blob) = row?;
+            out.push((p, loc, self.decode_vec(&blob)));
+        }
+        Ok(out)
     }
 
     pub fn chunk_detail(&self, chunk_id: i64) -> Result<Option<ChunkDetail>> {
@@ -480,6 +661,7 @@ mod tests {
                     snippet: format!("s{i}"),
                     vec: vec![i as f32; 4],
                     thumb: (i == 0).then(|| vec![1, 2, 3]),
+                    text: Some(format!("본문 {i} 계약서에서 INV-2047")),
                 })
                 .collect(),
         };
@@ -496,8 +678,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(n, 2);
+        // 키워드 색인: 조사가 붙은 한글은 접두어로, 번호는 그대로
+        assert!(db.fts_exists("\"계약서\"*"));
+        assert!(db.fts_exists("\"2047\""));
+        assert!(!db.fts_exists("\"계약서\""), "조사가 붙어 한 토큰");
+        assert_eq!(db.fts_files("\"inv\"", 10).unwrap(), vec![id1]);
+        let snip = db.fts_snippet(c2[1], "\"2047\"", 8).unwrap();
+        assert!(snip.contains("\u{1}2047\u{2}"), "{snip:?}");
+        let (cid, loc, _) = db.fts_best_text_chunk(id1, "\"본문\" OR \"1\"").unwrap();
+        assert_eq!((cid, loc), (c2[1], 1));
+        // 교체된 청크의 색인은 트리거로 지워진다
+        assert!(db.chunk_text(c1[2]).is_none(), "3번째 청크는 교체로 사라짐");
         db.delete_files(&[id1]).unwrap();
         assert_eq!(db.chunk_count().unwrap(), 0, "CASCADE 삭제");
+        assert!(!db.fts_exists("\"2047\""), "CASCADE 삭제 시 키워드 색인도 삭제");
         assert!(db.is_f16(), "새 DB는 FP16");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
@@ -568,6 +762,7 @@ mod tests {
                     snippet: String::new(),
                     vec: v.clone(),
                     thumb: None,
+                    text: None,
                 })
                 .collect(),
         };

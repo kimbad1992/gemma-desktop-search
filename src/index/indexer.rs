@@ -3,6 +3,7 @@
 //! 탐색 스레드 ─(FileJob)→ 워커 N개(추출+임베딩) ─(FileRecord)→ 기록(이 스레드: DB + 메모리 저장소)
 //! 일시정지/중지는 모든 단계의 checkpoint에서 반영된다.
 
+use super::compat;
 use super::db::{self, ChunkRecord, Db, FileRecord, FileRow};
 use super::progress::{Progress, RunState};
 use crate::config::Config;
@@ -10,6 +11,7 @@ use crate::embed::client::{EmbedClient, EmbedError, EmbedInput};
 use crate::embed::prompt;
 use crate::embed::selftest::Capabilities;
 use crate::extract::{self, media, Kind, Modality};
+use crate::search::keyword;
 use crate::search::store::{Entry, FileInfo, VectorStore};
 use crate::util::{fmt_ts, truncate_chars};
 use anyhow::{anyhow, bail, Result};
@@ -27,6 +29,10 @@ const RUN: u8 = 0;
 const PAUSE: u8 = 1;
 const STOP: u8 = 2;
 const MB: i64 = 1024 * 1024;
+/// 이보다 작은 이미지(긴 변 기준)는 이름만
+const MIN_IMAGE_SIDE: u32 = 256;
+/// 이보다 짧은 오디오는 이름만 (초)
+const MIN_AUDIO_SECS: f64 = 2.0;
 
 #[derive(Default)]
 pub struct Control {
@@ -204,24 +210,53 @@ struct WorkerCtx {
     video_native: bool,
     /// 예전(프레임) 방식으로 인덱싱된 영상을 새 방식으로 다시 처리
     reindex_video: bool,
+    /// 이미 새 방식(영상 구간 벡터)으로 처리된 영상 — 다시 처리하지 않음
+    video_done: HashSet<String>,
+    /// 텍스트·문서 처리 방식이 바뀜 (키워드 색인 본문 등) → 다시 처리
+    reindex_text: bool,
 }
 
 /// 영상 인덱싱 방식 버전 (2 = 구간을 영상 그대로 임베딩)
 const VIDEO_INDEX_VERSION: &str = "2";
+/// 텍스트·문서 인덱싱 방식 버전 (2 = 본문을 키워드 색인에도 넣음)
+const TEXT_INDEX_VERSION: &str = "2";
 
 fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -> Result<Outcome> {
     let mut db = Db::open(&p.db_path)?;
     let sig = p.cfg.model_signature();
+    let server_sig = p.cfg.server_signature();
     if p.full_rebuild {
         db.clear_all()?;
         p.store.write().clear();
-    } else if let Some(old) = db.meta_get("model_signature") {
-        if old != sig && db.chunk_count()? > 0 {
-            bail!("모델 구성이 기존 인덱스와 다릅니다 (기존: {old}). '전체 재구축'을 실행하세요.");
+    } else {
+        // 모델 파일(BF16 ↔ Q8 등)이나 llama.cpp 빌드가 바뀌었으면 기존 항목 몇 개를 다시 임베딩해 비교한다.
+        // 벡터가 사실상 같으면 인덱스를 그대로 쓰고, 달라졌으면 재구축을 요구한다 (섞이면 검색이 틀어짐).
+        let old_model = db.meta_get("model_signature");
+        let old_server = db.meta_get("server_signature");
+        let model_changed = old_model.as_deref().is_some_and(|o| o != sig);
+        // 서버 서명이 없는 예전 인덱스는 지금 빌드로 만든 것으로 본다
+        let server_changed = old_server.as_deref().is_some_and(|o| o != server_sig);
+        if (model_changed || server_changed) && db.chunk_count()? > 0 {
+            let what = if model_changed { "모델 파일" } else { "llama.cpp 빌드" };
+            prog.lock().current = format!("{what}이 바뀌어 기존 인덱스와 벡터가 같은지 확인하는 중…");
+            let report = compat::check(&db, &p.cfg, &EmbedClient::new(p.port), compat::Budget::quick())?;
+            if !report.compatible() {
+                bail!(
+                    "{what}이 바뀌어 벡터가 기존 인덱스와 다릅니다 ({}). '전체 재구축'을 실행하세요.",
+                    if report.compared() == 0 { "비교할 표본 없음".to_string() } else { report.summary() }
+                );
+            }
+            prog.lock().add_warning(
+                "호환성 확인",
+                format!("{what}이 바뀌었지만 벡터가 같아 기존 인덱스를 그대로 씁니다 — {}", report.summary()),
+            );
         }
     }
     db.meta_set("model_signature", &sig)?;
+    db.meta_set("server_signature", &server_sig)?;
     db.register_roots(&p.cfg.roots)?;
+    // 키워드 색인 이전 인덱스: 파일 이름은 DB만으로 채운다
+    db.backfill_name_fts()?;
     let file_map = Arc::new(db.load_file_map()?);
     let suspects = db.crash_suspects().unwrap_or_default();
 
@@ -260,6 +295,13 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     };
     let reindex_video = video_native
         && db.meta_get("video_index_version").as_deref() != Some(VIDEO_INDEX_VERSION);
+    let video_done = if reindex_video {
+        db.paths_with_modality(Modality::Video).unwrap_or_default()
+    } else {
+        HashSet::new()
+    };
+    let reindex_text = db.meta_get("text_index_version").as_deref() != Some(TEXT_INDEX_VERSION)
+        && db.chunk_count()? > 0;
 
     let ctx = Arc::new(WorkerCtx {
         cfg: p.cfg.clone(),
@@ -279,6 +321,8 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         suspects,
         video_native,
         reindex_video,
+        video_done,
+        reindex_text,
     });
 
     let (job_tx, job_rx) = bounded::<FileJob>(512);
@@ -361,6 +405,9 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     }
     if ctx.video_native && walk.complete {
         db.meta_set("video_index_version", VIDEO_INDEX_VERSION)?;
+    }
+    if walk.complete {
+        db.meta_set("text_index_version", TEXT_INDEX_VERSION)?;
     }
     Ok(Outcome::Completed)
 }
@@ -516,8 +563,9 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
         if !ctx.ctl.checkpoint() {
             break;
         }
-        let force_video = ctx.reindex_video && job.kind == Kind::Video;
-        if !ctx.full_rebuild && !force_video {
+        let force = (ctx.reindex_video && job.kind == Kind::Video && !ctx.video_done.contains(&job.path))
+            || (ctx.reindex_text && matches!(job.kind, Kind::Text | Kind::Doc));
+        if !ctx.full_rebuild && !force {
             if let Some(row) = ctx.file_map.get(&job.path) {
                 if row.size == job.size && row.mtime == job.mtime {
                     let up_to_date = match row.status {
@@ -576,6 +624,8 @@ struct Piece {
     snippet: String,
     input: EmbedInput,
     thumb: Option<Vec<u8>>,
+    /// 키워드 색인 본문
+    text: Option<String>,
 }
 
 enum Content {
@@ -612,6 +662,7 @@ fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
         snippet: String::new(),
         input: EmbedInput::Text(prompt::document(&file_name, &job.path)),
         thumb: None,
+        text: Some(keyword::name_body(&job.path)),
     }];
     let mut status = db::ST_OK;
     let mut error: Option<String> = None;
@@ -702,19 +753,22 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                 .extension()
                 .map(|e| e.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            let text = if ext == "pdf" {
-                match extract::pdf::extract_pdf(path, Duration::from_secs(90)) {
-                    Ok(t) => t,
+            if ext == "pdf" {
+                let pages = match extract::pdf::extract_pdf_pages(path, Duration::from_secs(90)) {
+                    Ok(p) => p,
                     Err(e) if extract::pdf::is_encrypted_error(&e) => {
                         return Ok(Content::NameOnly("암호화된 PDF (텍스트 추출 불가)".into()));
                     }
                     Err(e) => return Err(e),
+                };
+                if pages.iter().all(|p| p.trim().is_empty()) {
+                    return Ok(Content::NameOnly("텍스트 없음 (스캔 문서일 수 있음)".into()));
                 }
-            } else {
-                extract::docx::extract_docx(path)?
-            };
+                return pdf_pieces(ctx, title, &pages);
+            }
+            let text = extract::docx::extract_docx(path)?;
             if text.trim().is_empty() {
-                return Ok(Content::NameOnly("텍스트 없음 (스캔 문서일 수 있음)".into()));
+                return Ok(Content::NameOnly("텍스트 없음".into()));
             }
             text_pieces(ctx, title, &text)
         }
@@ -724,6 +778,10 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
             }
             let img = extract::image::load_image(path, ctx.ffmpeg.as_deref())?;
             let (w, h) = (img.width(), img.height());
+            if w.max(h) < MIN_IMAGE_SIDE {
+                // 아이콘·작은 썸네일은 검색 결과만 어지럽힌다 (DigUp도 256px 미만은 건너뜀)
+                return Ok(Content::NameOnly(format!("작은 이미지 ({w}×{h}, {MIN_IMAGE_SIDE}px 미만)")));
+            }
             let (jpeg, thumb) = extract::image::model_and_thumb(&img)?;
             Ok(Content::Pieces(vec![Piece {
                 modality: Modality::Image,
@@ -731,6 +789,7 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                 snippet: format!("{w}×{h}"),
                 input: EmbedInput::Image(jpeg),
                 thumb: Some(thumb),
+                text: None,
             }]))
         }
         Kind::Video => {
@@ -760,6 +819,7 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                                 snippet: format!("{}–{} 구간", fmt_ts(s_ms), fmt_ts(e_ms)),
                                 input: EmbedInput::Video(mp4),
                                 thumb,
+                                text: None,
                             });
                         }
                         Err(e) => last_err = Some(e),
@@ -794,6 +854,7 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                                 snippet: format!("{} 장면", fmt_ts(ms)),
                                 input: EmbedInput::Image(jpeg),
                                 thumb,
+                                text: None,
                             });
                         }
                         Err(e) => last_err = Some(e),
@@ -805,7 +866,7 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
                     }
                 }
             }
-            if info.has_audio && ctx.enabled[Kind::Audio.idx()] {
+            if info.has_audio && ctx.enabled[Kind::Audio.idx()] && !(info.duration > 0.0 && info.duration < MIN_AUDIO_SECS) {
                 pieces.extend(audio_pieces(ctx, ff, path, info.duration)?);
             }
             Ok(Content::Pieces(pieces))
@@ -818,6 +879,9 @@ fn extract_content(ctx: &WorkerCtx, job: &FileJob, path: &Path, title: &str) -> 
             let info = media::probe(fp, path)?;
             if !info.has_audio {
                 return Ok(Content::NameOnly("오디오 스트림 없음".into()));
+            }
+            if info.duration > 0.0 && info.duration < MIN_AUDIO_SECS {
+                return Ok(Content::NameOnly(format!("짧은 소리 ({:.1}초)", info.duration)));
             }
             Ok(Content::Pieces(audio_pieces(ctx, ff, path, info.duration)?))
         }
@@ -834,18 +898,8 @@ fn thumb_from_jpeg(jpeg: &[u8]) -> Option<Vec<u8>> {
 
 fn audio_pieces(ctx: &WorkerCtx, ff: &Path, path: &Path, dur: f64) -> Result<Vec<Piece>> {
     let seg = ctx.cfg.audio_segment_secs.max(5) as f64;
-    let max = ctx.cfg.audio_max_segments.max(1);
-    let n = if dur > 0.0 {
-        ((dur / seg).ceil() as usize).clamp(1, max)
-    } else {
-        1
-    };
-    // 전체 길이가 n구간보다 길면 고르게 분산
-    let starts: Vec<f64> = if dur > n as f64 * seg {
-        (0..n).map(|i| dur * i as f64 / n as f64).collect()
-    } else {
-        (0..n).map(|i| i as f64 * seg).collect()
-    };
+    // 창을 겹쳐서(30초 창이면 25초마다) 문장이 두 창 사이에서 끊기지 않게
+    let starts = media::audio_windows(dur.max(0.0), seg, seg * 5.0 / 6.0, ctx.cfg.audio_max_segments);
     let mut out = Vec::new();
     let mut last_err = None;
     for s in starts {
@@ -862,6 +916,7 @@ fn audio_pieces(ctx: &WorkerCtx, ff: &Path, path: &Path, dur: f64) -> Result<Vec
                     snippet: format!("{}–{} 구간", fmt_ts(ms), fmt_ts((end * 1000.0) as i64)),
                     input: EmbedInput::Audio(wav),
                     thumb: None,
+                    text: None,
                 });
             }
             Ok(None) => {}
@@ -876,22 +931,71 @@ fn audio_pieces(ctx: &WorkerCtx, ff: &Path, path: &Path, dur: f64) -> Result<Vec
     Ok(out)
 }
 
-fn text_pieces(ctx: &WorkerCtx, title: &str, text: &str) -> Result<Content> {
-    let chunks = extract::text::chunk_text(
-        text,
-        ctx.cfg.chunk_chars,
-        ctx.cfg.chunk_overlap,
-        ctx.cfg.max_chunks_per_file.max(1),
-    );
+/// PDF: 페이지마다 청크를 나눠 locator에 페이지를 담는다 (결과에서 "N페이지", 그 페이지로 열기)
+fn pdf_pieces(ctx: &WorkerCtx, title: &str, pages: &[String]) -> Result<Content> {
+    // 긴 PDF(책·보고서)는 일반 문서보다 청크 한도를 넉넉히
+    let cap = ctx.cfg.max_chunks_per_file.max(1) * 5;
     let mut pieces = Vec::new();
+    'pages: for (i, page) in pages.iter().enumerate() {
+        if page.trim().is_empty() {
+            continue;
+        }
+        let page_no = i as i64 + 1;
+        for (sub, (chunk, input)) in text_chunks(&ctx.cfg, &ctx.client, ctx.max_tokens, title, page)?
+            .into_iter()
+            .enumerate()
+        {
+            if pieces.len() >= cap {
+                break 'pages;
+            }
+            pieces.push(Piece {
+                modality: Modality::Text,
+                locator: page_no * extract::pdf::PAGE_LOCATOR + sub as i64,
+                snippet: truncate_chars(&chunk.replace(['\n', '\t'], " "), 240),
+                input: EmbedInput::Text(input),
+                thumb: None,
+                text: Some(chunk),
+            });
+        }
+    }
+    Ok(Content::Pieces(pieces))
+}
+
+fn text_pieces(ctx: &WorkerCtx, title: &str, text: &str) -> Result<Content> {
+    let pieces = text_chunks(&ctx.cfg, &ctx.client, ctx.max_tokens, title, text)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (chunk, input))| Piece {
+            modality: Modality::Text,
+            locator: idx as i64,
+            snippet: truncate_chars(&chunk.replace(['\n', '\t'], " "), 240),
+            input: EmbedInput::Text(input),
+            thumb: None,
+            text: Some(chunk),
+        })
+        .collect();
+    Ok(Content::Pieces(pieces))
+}
+
+/// 텍스트를 청크로 나누고 모델 입력(접두사 포함)을 만든다. 반환: (청크 원문, 입력) — 순서가 locator.
+/// 인덱서와 호환성 검사(compat)가 같은 입력을 만들도록 한 곳에 둔다.
+pub(crate) fn text_chunks(
+    cfg: &Config,
+    client: &EmbedClient,
+    max_tokens: usize,
+    title: &str,
+    text: &str,
+) -> Result<Vec<(String, String)>> {
+    let chunks = extract::text::chunk_text(text, cfg.chunk_chars, cfg.chunk_overlap, cfg.max_chunks_per_file.max(1));
+    let mut out = Vec::new();
     for chunk in chunks {
         let mut stack = vec![(chunk, 0u8)];
         while let Some((c, depth)) = stack.pop() {
             let input = prompt::document(title, &c);
             // 한글·코드·기호·드문 문자는 글자당 토큰이 2~3개까지 갈 수 있어 실제 토큰 수 확인
-            if c.chars().count() * 3 > ctx.max_tokens && depth < 4 {
-                let n = ctx.client.count_tokens(&input)?;
-                if n > ctx.max_tokens {
+            if c.chars().count() * 3 > max_tokens && depth < 4 {
+                let n = client.count_tokens(&input)?;
+                if n > max_tokens {
                     let (a, b) = extract::text::split_half(&c);
                     stack.push((b, depth + 1));
                     stack.push((a, depth + 1));
@@ -901,17 +1005,10 @@ fn text_pieces(ctx: &WorkerCtx, title: &str, text: &str) -> Result<Content> {
             if c.trim().is_empty() {
                 continue;
             }
-            let idx = pieces.len() as i64;
-            pieces.push(Piece {
-                modality: Modality::Text,
-                locator: idx,
-                snippet: truncate_chars(&c.replace(['\n', '\t'], " "), 240),
-                input: EmbedInput::Text(input),
-                thumb: None,
-            });
+            out.push((c, input));
         }
     }
-    Ok(Content::Pieces(pieces))
+    Ok(out)
 }
 
 /// 같은 종류끼리 묶어 배치 임베딩. 배치가 실패하면 하나씩 다시 시도.
@@ -962,6 +1059,7 @@ fn embed_pieces(ctx: &WorkerCtx, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>
                     snippet: p.snippet,
                     vec,
                     thumb: p.thumb,
+                    text: p.text,
                 }),
                 Err(EmbedError::Transport(m)) => {
                     return Err(WorkErr::Fatal(format!("서버 연결이 끊겼습니다: {m}")))

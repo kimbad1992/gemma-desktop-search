@@ -34,6 +34,8 @@ pub fn stress(args: &[String]) -> i32 {
         println!("서버 시작 실패: {e}");
         return 1;
     }
+    // 설정 포트를 못 써서 다른 포트로 떴을 수 있다
+    cfg.port = server.port();
     let cmd = server.shared.lock().command_line.clone();
     println!("명령줄: {cmd}");
     let t0 = Instant::now();
@@ -111,6 +113,329 @@ pub fn stress(args: &[String]) -> i32 {
     if crashed.is_some() { 3 } else { 0 }
 }
 
+/// 창 없이 변경분 인덱싱 한 번: 서버 시작 → 인덱싱(모델이 바뀌었으면 호환성 검사 포함) → 결과 출력 → 서버 중지
+///   gemma-search.exe --index-once   (데이터 폴더는 GEMMA_SEARCH_DATA로 바꿀 수 있음)
+pub fn index_once() -> i32 {
+    let data_dir = crate::config::data_dir();
+    let mut cfg = Config::load(&data_dir);
+    println!("데이터 폴더: {}", data_dir.display());
+    let server = ServerManager::default();
+    if let Err(e) = server.start(&cfg) {
+        println!("서버 시작 실패: {e}");
+        return 1;
+    }
+    cfg.port = server.port();
+    println!("서버 포트: {}", cfg.port);
+    let t0 = Instant::now();
+    let caps = loop {
+        if let Some(c) = server.capabilities() {
+            break c;
+        }
+        if t0.elapsed() > Duration::from_secs(180) || matches!(server.state(), crate::server::ServerState::Failed(_)) {
+            println!("서버 준비 실패: {:?}", server.state());
+            return 1;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let store = Arc::new(RwLock::new(VectorStore::new(cfg.search_dim)));
+    store.write().loaded = true;
+    let mut indexer = Indexer::default();
+    indexer
+        .start(IndexParams {
+            cfg: cfg.clone(),
+            caps,
+            port: cfg.port,
+            db_path: data_dir.join("index.db"),
+            data_dir: data_dir.clone(),
+            store,
+            full_rebuild: false,
+        })
+        .unwrap();
+    let mut last = Instant::now();
+    while indexer.is_active() {
+        std::thread::sleep(Duration::from_millis(300));
+        if last.elapsed() > Duration::from_secs(20) {
+            let p = indexer.progress.lock().clone();
+            println!(
+                "  {:>5}초  발견 {}  처리 {}  변경없음 {}  오류 {}  | {}",
+                t0.elapsed().as_secs(),
+                p.discovered,
+                p.processed,
+                p.unchanged,
+                p.errors,
+                crate::util::truncate_chars(&p.current, 80)
+            );
+            last = Instant::now();
+        }
+    }
+    let p = indexer.progress.lock().clone();
+    println!(
+        "결과: {} · 발견 {} · 새로 처리 {} · 변경없음 {} · 오류 {} · 경고 {} · {}초",
+        p.state.label(),
+        p.discovered,
+        p.processed - p.unchanged,
+        p.unchanged,
+        p.errors,
+        p.warnings,
+        t0.elapsed().as_secs()
+    );
+    if !p.message.is_empty() {
+        println!("메시지: {}", p.message);
+    }
+    for (path, msg) in p.error_list.iter().take(30) {
+        println!("  - {path}: {msg}");
+    }
+    server.stop();
+    if p.state == RunState::Completed { 0 } else { 1 }
+}
+
+/// 실제 인덱스로 검색만: 섹션별로 화면에 보일 개수와, 그중 최소 일치도 아래인데 검색어 때문에 보이는 개수
+///   gemma-search.exe --query-once <최소일치도> <질의>...
+pub fn query_once(args: &[String]) -> i32 {
+    let Some(min) = args.first().and_then(|s| s.parse::<f32>().ok()) else {
+        eprintln!("사용법: --query-once <최소일치도> <질의>...");
+        return 2;
+    };
+    let data_dir = crate::config::data_dir();
+    let mut cfg = Config::load(&data_dir);
+    let server = ServerManager::default();
+    if let Err(e) = server.start(&cfg) {
+        println!("서버 시작 실패: {e}");
+        return 1;
+    }
+    cfg.port = server.port();
+    let t0 = Instant::now();
+    while server.capabilities().is_none() {
+        if t0.elapsed() > Duration::from_secs(180) {
+            println!("서버 준비 실패");
+            return 1;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let db = Arc::new(Mutex::new(crate::index::db::Db::open(&data_dir.join("index.db")).unwrap()));
+    let mut st = VectorStore::new(cfg.search_dim);
+    st.fill_from_db(&db.lock()).unwrap();
+    st.loaded = true;
+    let store = Arc::new(RwLock::new(st));
+    for q in &args[1..] {
+        // 종류별 평균 점수 (모든 벡터 기준)
+        if let Ok(mut v) = crate::embed::client::EmbedClient::new(cfg.port)
+            .embed(&[crate::embed::client::EmbedInput::Text(crate::embed::prompt::query(q))])
+        {
+            let means = store.read().modality_means(&v.remove(0));
+            let s: Vec<String> = means.iter().map(|(m, mean, n)| format!("{m:?} {mean:.3}({n})")).collect();
+            println!("  평균: {}", s.join(" · "));
+        }
+        let o = query::run(cfg.port, &store, &db, QueryKind::Text(q.clone()), Filter::default(), cfg.top_k, min, cfg.ffmpeg());
+        let mut line = format!("{q:<22} ({:.0}ms) |", o.elapsed.as_secs_f32() * 1000.0);
+        for (sec, hits) in &o.sections {
+            let shown = hits.iter().filter(|h| h.visible(min)).count();
+            let by_kw = hits.iter().filter(|h| h.hit.score < min && h.keyword_match()).count();
+            if shown > 0 {
+                line += &format!(" {} {shown}(검색어로 {by_kw})", sec.label());
+            }
+        }
+        println!("{line}");
+        // 화면의 "전체" 목록과 같은 방식으로 상위 8개
+        let visible: Vec<(crate::search::store::Section, Vec<&query::HitView>)> = o
+            .sections
+            .iter()
+            .map(|(s, h)| (*s, crate::ui::search_panel::passing(h, min)))
+            .filter(|(_, h)| !h.is_empty())
+            .collect();
+        for (i, (sec, h)) in crate::ui::search_panel::unified(&visible, &o.kind_hints).iter().take(8).enumerate() {
+            println!(
+                "    {:>2}. [{}] {} 일치도 {:.3} (의미 {:.3}, 코사인 {:.3}) 단어{:.2}",
+                i + 1,
+                sec.label(),
+                h.file_name,
+                h.hit.score,
+                h.hit.meaning,
+                h.hit.cosine,
+                h.hit.coverage
+            );
+        }
+    }
+    server.stop();
+    0
+}
+
+/// 두 서버(예: BF16과 Q8)의 처리 속도 비교: 같은 입력(텍스트·이미지·영상 구간)을 각각 임베딩해 시간 측정
+///   gemma-search.exe --bench-compare <포트A> <포트B> <폴더>
+pub fn bench_compare(args: &[String]) -> i32 {
+    use crate::embed::client::{EmbedClient, EmbedInput};
+    let (Some(pa), Some(pb), Some(dir)) = (
+        args.first().and_then(|s| s.parse::<u16>().ok()),
+        args.get(1).and_then(|s| s.parse::<u16>().ok()),
+        args.get(2),
+    ) else {
+        eprintln!("사용법: --bench-compare <포트A> <포트B> <폴더>");
+        return 2;
+    };
+    let cfg = Config::load(&crate::config::data_dir());
+    let ff = cfg.ffmpeg();
+    let (mut images, mut videos) = (Vec::new(), Vec::new());
+    for e in walkdir::WalkDir::new(dir).into_iter().flatten().filter(|e| e.file_type().is_file()) {
+        match crate::extract::classify(e.path()) {
+            crate::extract::Kind::Image if images.len() < 32 => {
+                if let Ok(img) = crate::extract::image::load_image(e.path(), ff.as_deref()) {
+                    if let Ok((j, _)) = crate::extract::image::model_and_thumb(&img) {
+                        images.push(EmbedInput::Image(j));
+                    }
+                }
+            }
+            crate::extract::Kind::Video if videos.len() < 4 => {
+                if let Some(f) = ff.as_deref() {
+                    if let Ok(mp4) = crate::extract::media::video_segment(f, e.path(), 0.0, 30.0) {
+                        videos.push(EmbedInput::Video(mp4));
+                    }
+                }
+            }
+            _ => {}
+        }
+        if images.len() >= 32 && videos.len() >= 4 {
+            break;
+        }
+    }
+    let readme = std::fs::read_to_string("README.md").unwrap_or_default();
+    let texts: Vec<EmbedInput> = crate::extract::text::chunk_text(&readme, 1000, 150, 64)
+        .into_iter()
+        .map(|c| EmbedInput::Text(crate::embed::prompt::document("bench", &c)))
+        .collect();
+    println!("입력: 텍스트 {}개, 이미지 {}개, 영상 30초 구간 {}개", texts.len(), images.len(), videos.len());
+    for (label, port) in [("A", pa), ("B", pb)] {
+        let c = EmbedClient::new(port);
+        // 한 번 데워 둔다
+        let _ = c.embed(&texts[..1.min(texts.len())]);
+        let t = Instant::now();
+        for b in texts.chunks(16) {
+            c.embed(b).expect("텍스트");
+        }
+        let tt = t.elapsed();
+        let t = Instant::now();
+        for i in &images {
+            c.embed(std::slice::from_ref(i)).expect("이미지");
+        }
+        let ti = t.elapsed();
+        let t = Instant::now();
+        for v in &videos {
+            c.embed(std::slice::from_ref(v)).expect("영상");
+        }
+        let tv = t.elapsed();
+        let per = |d: Duration, n: usize| d.as_secs_f64() * 1000.0 / n.max(1) as f64;
+        println!(
+            "{label} (포트 {port}): 텍스트 {:.1}ms/개 · 이미지 {:.1}ms/장 · 영상 구간 {:.0}ms/개",
+            per(tt, texts.len()),
+            per(ti, images.len()),
+            per(tv, videos.len())
+        );
+    }
+    0
+}
+
+/// 호환성 검사: 인덱스 표본을 지정한 포트의 서버로 다시 임베딩해 저장된 벡터와 비교
+///   gemma-search.exe --compat <포트> [이름 텍스트 이미지 영상 오디오 표본 수]
+pub fn compat(args: &[String]) -> i32 {
+    use crate::embed::client::EmbedClient;
+    use crate::index::compat::{check, Budget};
+    let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
+        eprintln!("사용법: --compat <포트> [이름 텍스트 이미지 영상 오디오]");
+        return 2;
+    };
+    let n = |i: usize, d: usize| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let d = Budget::default();
+    let budget = Budget {
+        names: n(1, d.names),
+        text: n(2, d.text),
+        images: n(3, d.images),
+        video: n(4, d.video),
+        audio: n(5, d.audio),
+    };
+    let dir = crate::config::data_dir();
+    let cfg = Config::load(&dir);
+    let db = match crate::index::db::Db::open(&dir.join("index.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            println!("DB 열기 실패: {e}");
+            return 1;
+        }
+    };
+    match check(&db, &cfg, &EmbedClient::new(port), budget) {
+        Ok(r) => {
+            for s in &r.stats {
+                println!(
+                    "{:<6} 비교 {:>3}개  평균 {:.5}  최소 {:.5}  건너뜀 {}",
+                    s.label, s.n, s.mean, s.min, s.skipped
+                );
+            }
+            println!("소요 {:.1}초", r.elapsed.as_secs_f64());
+            0
+        }
+        Err(e) => {
+            println!("검사 실패: {e}");
+            1
+        }
+    }
+}
+
+/// 질의 쪽 비교: 같은 질의를 두 서버로 임베딩해 기존 인덱스에서 섹션별 Top-10이 얼마나 겹치는지
+///   gemma-search.exe --compare-queries <포트A> <포트B> <질의>...
+pub fn compare_queries(args: &[String]) -> i32 {
+    use crate::embed::client::{EmbedClient, EmbedInput};
+    use crate::search::store::Section;
+    let (Some(pa), Some(pb)) = (
+        args.first().and_then(|s| s.parse::<u16>().ok()),
+        args.get(1).and_then(|s| s.parse::<u16>().ok()),
+    ) else {
+        eprintln!("사용법: --compare-queries <포트A> <포트B> <질의>...");
+        return 2;
+    };
+    let dir = crate::config::data_dir();
+    let cfg = Config::load(&dir);
+    let db = crate::index::db::Db::open(&dir.join("index.db")).expect("DB");
+    let mut store = VectorStore::new(cfg.search_dim);
+    store.fill_from_db(&db).expect("벡터 적재");
+    println!("벡터 {}개 적재", store.live_chunks());
+    let (ca, cb) = (EmbedClient::new(pa), EmbedClient::new(pb));
+    let k = 10;
+    let mut totals = [(0usize, 0usize); 5];
+    let mut top1_same = [(0usize, 0usize); 5];
+    for q in &args[2..] {
+        let inp = EmbedInput::Text(crate::embed::prompt::query(q));
+        let va = ca.embed(std::slice::from_ref(&inp)).expect("A").remove(0);
+        let vb = cb.embed(std::slice::from_ref(&inp)).expect("B").remove(0);
+        let ra = store.search(&va, &Filter::default(), k, None);
+        let rb = store.search(&vb, &Filter::default(), k, None);
+        let mut line = format!("{q:<24} 질의 cos {:.4} |", crate::embed::vecmath::dot(&va, &vb));
+        for ((sec, ha), (_, hb)) in ra.iter().zip(rb.iter()) {
+            if ha.is_empty() {
+                continue;
+            }
+            let sa: std::collections::HashSet<i64> = ha.iter().map(|h| h.file_id).collect();
+            let common = hb.iter().filter(|h| sa.contains(&h.file_id)).count();
+            let i = *sec as usize;
+            totals[i].0 += common;
+            totals[i].1 += ha.len().min(hb.len());
+            top1_same[i].1 += 1;
+            if ha.first().map(|h| h.file_id) == hb.first().map(|h| h.file_id) {
+                top1_same[i].0 += 1;
+            }
+            let ds: f32 = ha.iter().zip(hb.iter()).map(|(a, b)| (a.score - b.score).abs()).fold(0.0, f32::max);
+            line += &format!(" {} {}/{} Δ{:.3}", sec.label(), common, ha.len().min(hb.len()), ds);
+        }
+        println!("{line}");
+    }
+    println!("── 합계 (Top-{k} 겹침, 1위 일치)");
+    for s in Section::ALL {
+        let (c, t) = totals[s as usize];
+        let (s1, n1) = top1_same[s as usize];
+        if t > 0 {
+            println!("{:<8} {c}/{t} ({:.1}%)  1위 {s1}/{n1}", s.label(), c as f64 * 100.0 / t as f64);
+        }
+    }
+    0
+}
+
 /// 이미 떠 있는 서버(설정 포트)에 대해 클라이언트 왕복 시간 측정
 pub fn bench(file: &str) -> i32 {
     use crate::embed::client::{EmbedClient, EmbedInput};
@@ -169,6 +494,8 @@ pub fn run(args: &[String]) -> i32 {
         println!("서버 시작 실패: {e}");
         return 1;
     }
+    // 설정 포트를 못 써서 다른 포트로 떴을 수 있다
+    cfg.port = server.port();
     let t0 = Instant::now();
     let caps = loop {
         if let Some(c) = server.capabilities() {
@@ -332,7 +659,7 @@ pub fn run(args: &[String]) -> i32 {
         qs.push(QueryKind::Image(PathBuf::from(img.path())));
     }
     for q in qs {
-        let o = query::run(cfg.port, &store, &db, q, Filter::default(), 3, cfg.ffmpeg());
+        let o = query::run(cfg.port, &store, &db, q, Filter::default(), 3, 0.0, cfg.ffmpeg());
         println!("\n질의 {} ({:.0}ms)", o.label, o.elapsed.as_secs_f32() * 1000.0);
         if let Some(e) = &o.error {
             println!("  오류: {e}");
@@ -350,10 +677,26 @@ pub fn run(args: &[String]) -> i32 {
                         | (crate::extract::Modality::Audio, _) => format!("@{}", fmt_ts(h.hit.locator)),
                         _ => String::new(),
                     };
-                    format!("{}{} {:.3}", h.file_name, loc, h.hit.score)
+                    let kw = if h.hit.coverage > 0.0 { format!(" 단어{:.2}", h.hit.coverage) } else { String::new() };
+                    format!("{}{} {:.3}{kw}", h.file_name, loc, h.hit.score)
                 })
                 .collect();
             println!("  {:<6} {}", sec.label(), s.join(" | "));
+            for h in hits.iter().filter(|h| h.highlight.is_some()) {
+                let t: String = h
+                    .highlight
+                    .as_deref()
+                    .unwrap_or_default()
+                    .chars()
+                    .map(|c| match c {
+                        crate::search::keyword::MARK_START => '[',
+                        crate::search::keyword::MARK_END => ']',
+                        c if c.is_control() => ' ',
+                        c => c,
+                    })
+                    .collect();
+                println!("         └ {}: {}", h.file_name, t);
+            }
         }
     }
 

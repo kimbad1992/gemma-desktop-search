@@ -33,7 +33,7 @@ impl GemmaApp {
                 .add_enabled(!running && state != ServerState::External, egui::Button::new(RichText::new("▶ 서버 시작").size(15.0)))
                 .clicked()
             {
-                self.start_server();
+                self.start_server_manual();
             }
             if ui
                 .add_enabled(running || state == ServerState::External, egui::Button::new(RichText::new("■ 중지").size(15.0)))
@@ -47,7 +47,7 @@ impl GemmaApp {
                 .clicked()
             {
                 self.stop_server();
-                self.start_server();
+                self.start_server_manual();
             }
             if ui
                 .add_enabled(!running && state != ServerState::External, egui::Button::new("외부 서버 연결"))

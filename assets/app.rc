@@ -1,0 +1,4 @@
+// 아이콘 리소스: 1 = 앱 아이콘, 2 = 트레이(인덱싱 중), 3 = 트레이(일시정지)
+1 ICON "icon.ico"
+2 ICON "tray-busy.ico"
+3 ICON "tray-paused.ico"

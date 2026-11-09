@@ -169,6 +169,22 @@ pub fn segments(dur: f64, seg: f64, max: usize) -> Vec<(f64, f64)> {
     }
 }
 
+/// 오디오 창 시작 위치: seg초 창을 stride초마다 겹쳐서(문장이 두 창 사이에 끊기지 않게) 전체를 덮는다.
+/// 창이 max개를 넘으면 전체에 고르게 분산.
+pub fn audio_windows(dur: f64, seg: f64, stride: f64, max: usize) -> Vec<f64> {
+    let (seg, stride) = (seg.max(1.0), stride.clamp(1.0, seg.max(1.0)));
+    if dur <= seg {
+        return vec![0.0];
+    }
+    let n = ((dur - seg) / stride).ceil() as usize + 1;
+    let max = max.max(1);
+    if n <= max {
+        (0..n).map(|i| (i as f64 * stride).min(dur - seg)).collect()
+    } else {
+        (0..max).map(|i| (dur - seg) * i as f64 / (max - 1).max(1) as f64).collect()
+    }
+}
+
 /// HEIC/AVIF 등 image 크레이트가 못 읽는 이미지를 JPEG로
 pub fn image_to_jpeg(ffmpeg: &Path, path: &Path) -> Result<Vec<u8>> {
     let args = vec![
@@ -272,6 +288,17 @@ mod tests {
         assert_eq!(s[1].0, 900.0);
         // 끝에 1초 미만 자투리는 버림
         assert_eq!(segments(60.5, 30.0, 20).len(), 2);
+    }
+
+    #[test]
+    fn audio_windows_overlap_and_cover() {
+        // 70초, 30초 창을 25초마다 → 0, 25, 40(마지막 창은 끝에 맞춤)
+        assert_eq!(audio_windows(70.0, 30.0, 25.0, 100), vec![0.0, 25.0, 40.0]);
+        assert_eq!(audio_windows(20.0, 30.0, 25.0, 100), vec![0.0]);
+        // 창이 너무 많으면 처음~끝을 고르게
+        let w = audio_windows(3600.0, 30.0, 25.0, 5);
+        assert_eq!(w.len(), 5);
+        assert_eq!((w[0], w[4]), (0.0, 3570.0));
     }
 
     #[test]

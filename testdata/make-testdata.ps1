@@ -22,6 +22,13 @@ $utf8 = New-Object Text.UTF8Encoding($false)
 신 김치를 쓰면 맛이 더 깊어진다.
 "@, [Text.Encoding]::GetEncoding(949))
 
+# 키워드 검색 확인용: 조사가 붙은 한글 단어, 번호, 오류 코드
+[IO.File]::WriteAllText("$root\문서\전세 계약 메모.txt", @"
+임대차 계약서에서 반려동물 조항을 다시 확인했다.
+관리번호 INV-2047-KR 은 관리사무소에 제출 완료.
+공유기에서 ERR_CONNECTION_RESET 오류가 나면 전원을 껐다 켠다.
+"@, $utf8)
+
 [IO.File]::WriteAllText("$root\문서\account-help.md", @"
 # Account help
 If you forgot your password, click **Forgot password** on the sign-in page.

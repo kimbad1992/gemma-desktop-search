@@ -239,17 +239,26 @@ impl ServerManager {
         if cfg.has_mmproj() && !Path::new(cfg.mmproj_path.trim()).is_file() {
             bail!("mmproj 파일이 없습니다: {}", cfg.mmproj_path);
         }
-        // 포트 확인
+        // 포트 확인. Hyper-V/WSL이 재부팅 때마다 포트 범위를 예약해(예: 8067~8566) 설정한 포트를 못 쓰게 되는
+        // 경우가 있다 → 다른 서버가 응답 중인 게 아니면 빈 포트를 골라 쓴다.
+        let mut cfg = cfg.clone();
         if std::net::TcpListener::bind(("127.0.0.1", cfg.port)).is_err() {
-            let responding = EmbedClient::new(cfg.port).health().is_ok();
-            if responding {
+            if EmbedClient::new(cfg.port).health().is_ok() {
                 bail!(
                     "포트 {}에서 이미 다른 서버가 응답 중입니다. '외부 서버 연결'을 쓰거나 포트를 바꾸세요.",
                     cfg.port
                 );
             }
-            bail!("포트 {}를 사용할 수 없습니다 (다른 프로그램이 점유).", cfg.port);
+            let Some(free) = free_port(cfg.port) else {
+                bail!("포트 {}를 사용할 수 없고 빈 포트도 찾지 못했습니다.", cfg.port);
+            };
+            self.log(format!(
+                "[앱] 포트 {}를 쓸 수 없어(다른 프로그램이 점유했거나 Windows 예약 범위) 포트 {free}를 사용합니다",
+                cfg.port
+            ));
+            cfg.port = free;
         }
+        let cfg = &cfg;
 
         let args = build_args(cfg, serve_mode);
         let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -521,6 +530,21 @@ fn spawn_log_reader(
 }
 
 /// 종료 코드와 마지막 로그를 사람이 읽을 수 있는 설명으로
+/// 쓸 수 있는 포트: 원래 포트+10000 근처 → 그래도 없으면 OS가 고른 포트
+fn free_port(preferred: u16) -> Option<u16> {
+    let ok = |p: u16| std::net::TcpListener::bind(("127.0.0.1", p)).is_ok();
+    let base = preferred.checked_add(10_000).unwrap_or(18_090);
+    (0..50u16)
+        .filter_map(|i| base.checked_add(i))
+        .find(|p| ok(*p))
+        .or_else(|| {
+            std::net::TcpListener::bind(("127.0.0.1", 0))
+                .ok()
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.port())
+        })
+}
+
 pub fn explain_exit(status: ExitStatus, logs: &VecDeque<String>) -> String {
     let code = status.code().map(|c| c as u32);
     let mut msg = match code {

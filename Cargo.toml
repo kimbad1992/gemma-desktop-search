@@ -1,6 +1,6 @@
 [package]
 name = "gemma-search"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
@@ -26,12 +26,20 @@ rfd = "0.18"
 anyhow = "1"
 parking_lot = "0.13"
 half = "2"
+sha2 = "0.10"
+raw-window-handle = "0.6"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Graphics_Gdi",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # 디버그 빌드에서도 이미지 디코딩/벡터 연산이 쓸 만한 속도로 돌도록 의존성은 최적화
@@ -42,3 +50,6 @@ opt-level = 2
 opt-level = 3
 # catch_unwind(PDF 추출 보호)가 동작하려면 unwind 유지 — panic = "abort" 금지
 panic = "unwind"
+
+[build-dependencies]
+embed-resource = "3"

@@ -18,3 +18,7 @@
 *.swp
 Thumbs.db
 desktop.ini
+
+# 포터블 준비물 (설정 → 준비물 받기)
+/models/
+/llama.cpp/

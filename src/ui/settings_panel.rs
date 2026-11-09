@@ -116,6 +116,9 @@ impl GemmaApp {
             {
                 match self.cfg.save(&self.data_dir) {
                     Ok(()) => {
+                        if let Err(e) = crate::autostart::sync(self.cfg.start_with_windows) {
+                            self.notify(format!("로그인 시 실행 설정 실패: {e}"), true);
+                        }
                         self.saved_cfg = self.cfg.clone();
                         self.notify(
                             format!("설정을 저장했습니다: {}", self.data_dir.join("config.toml").display()),
@@ -143,6 +146,8 @@ impl GemmaApp {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            self.download_settings(ui);
+            ui.separator();
             self.server_settings(ui);
             ui.add_space(10.0);
             self.tool_settings(ui);
@@ -289,7 +294,88 @@ impl GemmaApp {
             .on_hover_text(
                 "충돌 때 처리 중이던 파일을 기록해 두고, 같은 파일이 두 번 충돌에 걸리면 그 파일의 내용 인덱싱은 건너뜁니다.\n서버 로그: data\\logs\\llama-server.log",
             );
+            ui.add_space(6.0);
+            ui.label(RichText::new("상주 · 자동 실행").strong());
+            ui.checkbox(
+                &mut self.cfg.global_hotkey,
+                format!("어느 앱에서든 {}로 빠른 검색창 띄우기 (앱을 다시 시작하면 적용)", crate::shell::HOTKEY_LABEL),
+            );
+            ui.checkbox(&mut self.cfg.close_to_tray, "창을 닫으면 트레이로 (트레이 아이콘 우클릭 → 종료로 끝냄)");
+            ui.checkbox(&mut self.cfg.start_with_windows, "Windows에 로그인하면 트레이로 시작")
+                .on_hover_text("저장하면 바로 적용됩니다. 등록 위치: HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+            ui.checkbox(&mut self.cfg.index_on_start, "앱을 켤 때 변경분 인덱싱");
+            ui.checkbox(&mut self.cfg.server_on_demand, "검색할 때 서버가 꺼져 있으면 자동으로 켜기");
+            ui.horizontal(|ui| {
+                ui.label("자동으로 켠 서버를 쓰지 않으면");
+                ui.add(egui::DragValue::new(&mut self.cfg.idle_stop_minutes).range(0..=240).suffix("분"));
+                ui.label("뒤에 끄기 (0 = 끄지 않음)");
+            })
+            .response
+            .on_hover_text("검색이나 인덱싱 때문에 앱이 켠 서버만 끕니다. 서버 탭에서 직접 켠 서버는 그대로 둡니다. 꺼도 다음 검색 때 다시 켭니다 (2초 안팎).");
+            ui.checkbox(&mut self.cfg.check_updates, "하루 한 번 새 버전 확인 (GitHub, 파일 정보는 보내지 않음)");
         });
+    }
+
+
+    /// 포터블 준비물: 모델과 llama.cpp를 프로그램 폴더 아래로 받는다
+    fn download_settings(&mut self, ui: &mut egui::Ui) {
+        use crate::download::{Pack, LLAMA_BUILD};
+        ui.label(RichText::new("준비물 받기").size(17.0).strong());
+        let app_dir = crate::config::app_dir();
+        ui.label(
+            RichText::new(format!(
+                "모델과 llama.cpp를 이 프로그램 폴더({}) 아래에 받고 경로를 맞춥니다. 폴더째 옮겨도 그대로 씁니다.",
+                app_dir.display()
+            ))
+            .weak(),
+        );
+        let st = self.dl.lock().clone();
+        let model_ok = std::path::Path::new(self.cfg.model_path.trim()).is_file();
+        let llama_ok = crate::server::resolve_binary(&self.cfg.llama_path).is_ok();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if model_ok { "✔ 모델 있음" } else { "✖ 모델 없음" });
+            ui.add_enabled_ui(!st.running, |ui| {
+                if ui.button(Pack::Model.label()).clicked() {
+                    crate::download::start(Pack::Model, app_dir.clone(), self.dl.clone(), self.dl_cancel.clone(), ui.ctx().clone());
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(if llama_ok { "✔ llama.cpp 있음" } else { "✖ llama.cpp 없음" });
+            ui.add_enabled_ui(!st.running, |ui| {
+                for p in [Pack::LlamaCuda13, Pack::LlamaCuda12, Pack::LlamaVulkan, Pack::LlamaCpu] {
+                    if ui
+                        .button(p.label())
+                        .on_hover_text(format!("검증한 빌드 {LLAMA_BUILD}로 고정해서 받습니다"))
+                        .clicked()
+                    {
+                        crate::download::start(p, app_dir.clone(), self.dl.clone(), self.dl_cancel.clone(), ui.ctx().clone());
+                    }
+                }
+            });
+        });
+        if st.running {
+            ui.horizontal(|ui| {
+                let frac = if st.total > 0 { st.done as f32 / st.total as f32 } else { 0.0 };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(360.0)
+                        .text(format!(
+                            "{} · {:.0}/{:.0}MB",
+                            st.file,
+                            st.done as f64 / 1048576.0,
+                            st.total as f64 / 1048576.0
+                        )),
+                );
+                if ui.button("취소").clicked() {
+                    self.dl_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        ui.label(
+            RichText::new("ffmpeg(영상·오디오·HEIC)는 따로 설치하세요: winget install Gyan.FFmpeg").small().weak(),
+        );
     }
 
     fn tool_settings(&mut self, ui: &mut egui::Ui) {
@@ -388,11 +474,12 @@ impl GemmaApp {
                         self.cfg.video_window_secs()
                     ));
                 ui.label("영상당 최대");
-                ui.add(egui::DragValue::new(&mut self.cfg.video_max_segments).range(1..=500).suffix("구간"));
+                ui.add(egui::DragValue::new(&mut self.cfg.video_max_segments).range(1..=2000).suffix("구간"));
                 ui.label("오디오 구간");
                 ui.add(egui::DragValue::new(&mut self.cfg.audio_segment_secs).range(5..=300).suffix("초"));
                 ui.label("파일당 최대");
-                ui.add(egui::DragValue::new(&mut self.cfg.audio_max_segments).range(1..=200).suffix("구간"));
+                ui.add(egui::DragValue::new(&mut self.cfg.audio_max_segments).range(1..=2000).suffix("구간"))
+                    .on_hover_text("오디오는 창을 겹쳐서(30초 창이면 25초마다) 읽습니다. 이보다 많으면 전체에 고르게 분산.");
                 ui.label("미디어 최대 크기");
                 ui.add(egui::DragValue::new(&mut self.cfg.max_media_mb).range(1..=65536).suffix("MB"));
                 ui.label("작업 스레드");
@@ -447,7 +534,7 @@ impl GemmaApp {
             ui.horizontal(|ui| {
                 ui.label("섹션별 최대 결과 수");
                 ui.add(egui::DragValue::new(&mut self.cfg.top_k).range(5..=500))
-                    .on_hover_text("검색할 때 섹션마다 가져오는 최대 개수. 최소 일치도 필터는 이 안에서 적용됩니다.");
+                    .on_hover_text("검색할 때 섹션마다 가져오는 최대 개수. 최소 관련도 필터는 이 안에서 적용됩니다.");
             });
         });
     }
@@ -464,17 +551,24 @@ fn find_mmproj(model_path: &str) -> Option<String> {
             n.starts_with("mmproj") && n.ends_with(".gguf")
         })
         .collect();
-    // BF16 > F16 > Q8 순으로 선호
+    // 모델과 같은 양자화(Q8 모델 → Q8 mmproj)를 먼저, 없으면 Q8 > BF16 > F32
+    let model = Path::new(model_path.trim())
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let quant = ["q8_0", "bf16", "f32", "q4"].into_iter().find(|q| model.contains(q));
     found.sort_by_key(|p| {
-        let n = p.to_string_lossy().to_lowercase();
-        if n.contains("bf16") {
+        let n = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if quant.is_some_and(|q| n.contains(q)) {
             0
-        } else if n.contains("f32") {
-            1
         } else if n.contains("q8") {
+            1
+        } else if n.contains("bf16") {
             2
-        } else {
+        } else if n.contains("f32") {
             3
+        } else {
+            4
         }
     });
     found.first().map(|p| p.display().to_string())
