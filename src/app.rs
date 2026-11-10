@@ -125,7 +125,8 @@ pub struct QuickState {
 /// 같이 쓰는 인자: `--tab`, `--theme`, `--scroll`, `--size 1280x860`, `--query "질의"`,
 /// `--select`(첫 결과를 고른 상태), `--quick`(빠른 검색창), `--setup`(처음 설정), `--shot-wait <초>`,
 /// `--index --shot-indexing`(인덱싱이 도는 중), `--overlay`(인덱싱 알림 창), `--view images`(결과의 섹션 보기),
-/// `--open filter_kinds`(필터 드롭다운을 펼친 채로).
+/// `--open filter_kinds`(필터 드롭다운을 펼친 채로), `--update-on-start`(업데이트를 누른 것처럼. 다시 시작은 하지 않는다),
+/// `--fake-update v9.9.9`(새 버전이 있는 것처럼).
 /// 쓰는 인덱스와 섞이지 않게 `GEMMA_SEARCH_DATA`로 별도 데이터 폴더를 준다.
 pub struct Shot {
     path: PathBuf,
@@ -260,6 +261,10 @@ pub struct GemmaApp {
     pub quick: Option<QuickState>,
     /// 화면 확인용 실행 (`--shot`)
     pub shot: Option<Shot>,
+    /// 업데이트 진행 상태 (받기·교체는 백그라운드 스레드가 한다)
+    pub updater: crate::update::Shared,
+    /// 마지막으로 처리한 업데이트 단계 (바뀌었을 때 한 번만 알리려고)
+    update_seen: crate::update::Stage,
     /// 화면 확인용 (`--view images`): 결과가 오면 이 섹션 보기로 바꾼다
     shot_view: Option<Section>,
     /// 메뉴 맨 위의 앱 아이콘
@@ -403,6 +408,8 @@ impl GemmaApp {
             keep_hidden_frames: if starts_hidden() { 4 } else { 0 },
             hidden_flag: Arc::new(AtomicBool::new(starts_hidden())),
             shot: Shot::from_args(),
+            updater: Default::default(),
+            update_seen: Default::default(),
             shot_view: None,
             logo: None,
             titlebar_dark: None,
@@ -582,6 +589,13 @@ impl GemmaApp {
             let ffmpeg = app.cfg.ffmpeg().is_some();
             app.probe.start(ffmpeg, &cc.egui_ctx);
         }
+        if flag("--after-update") {
+            app.notify(format!("v{} 버전으로 업데이트했습니다.", env!("CARGO_PKG_VERSION")), false);
+        }
+        // 화면 확인용: "업데이트"를 누른 것처럼 시작한다
+        if flag("--update-on-start") {
+            app.start_update(&cc.egui_ctx);
+        }
         // 화면 확인용: 빠른 검색창·처음 설정 화면을 창 모양을 바꾸지 않고 그린다 (크기는 --size로 맞춘다)
         if app.shot.is_some() {
             if flag("--quick") {
@@ -597,6 +611,11 @@ impl GemmaApp {
                 app.open_setup(&cc.egui_ctx);
             }
             *widgets::TEST_OPEN.lock() = value("--open");
+            // 새 버전이 있는 것처럼 ("업데이트 가능" 표시 확인)
+            if let Some(tag) = value("--fake-update") {
+                let page = format!("https://github.com/{}/releases", crate::update::REPO);
+                app.update_available = Some((tag, page));
+            }
             app.shot_view = match value("--view").as_deref() {
                 Some("docs") => Some(Section::Docs),
                 Some("images") => Some(Section::Images),
@@ -1752,12 +1771,16 @@ impl GemmaApp {
         if let Some(rx) = &self.update_rx {
             if let Ok(r) = rx.try_recv() {
                 if let Some((tag, _)) = &r {
-                    self.notify(format!("새 버전 {tag}이 나왔습니다. 상태 표시줄의 링크에서 받을 수 있습니다."), false);
+                    self.notify(
+                        format!("새 버전({tag})이 나왔습니다. 왼쪽 메뉴 아래의 '업데이트 가능'을 누르면 받아서 바꿉니다."),
+                        false,
+                    );
                 }
                 self.update_available = r;
                 self.update_rx = None;
             }
         }
+        self.poll_update(ctx);
 
         let (state, title_prefix, done_msg) = {
             let p = self.indexer.progress.lock();
@@ -1923,7 +1946,6 @@ impl GemmaApp {
             format!("{} {pct}", prog.state.label())
         });
         let warnings = self.shell_warnings();
-        let update = self.update_available.clone();
         let (mut go_server, mut go_index) = (false, false);
         let semibold = || egui::FontFamily::Name(theme::SEMIBOLD.into());
 
@@ -1944,12 +1966,7 @@ impl GemmaApp {
                 })
                 .on_hover_text(warnings.join("\n\n"));
             }
-            if let Some((tag, url)) = &update {
-                centered(ui, 16.0, &mut |ui| {
-                    ui.hyperlink_to(Icon::Download.unicode().to_string(), url)
-                        .on_hover_text(format!("새 버전 {tag} 받기"));
-                });
-            }
+            self.nav_update(ui, true);
             let r = centered(ui, 14.0, &mut |ui| widgets::dot(ui, widgets::server_color(&ss)));
             if r
                 .interact(egui::Sense::click())
@@ -1978,9 +1995,7 @@ impl GemmaApp {
                 .response
                 .on_hover_text(warnings.join("\n\n"));
             }
-            if let Some((tag, url)) = &update {
-                ui.hyperlink_to(small(&format!("새 버전 {tag} 받기")), url);
-            }
+            self.nav_update(ui, false);
             let card = || {
                 egui::Frame::new()
                     .fill(p.card_fill)
@@ -2053,6 +2068,137 @@ impl GemmaApp {
         }
     }
 
+    /// 업데이트를 시작한다: 새 버전이 있는지 확인하고, 있으면 받아서 지금 exe와 바꾼다 (`update.rs`).
+    /// 바꾼 뒤에는 `poll_update`가 다시 시작한다.
+    pub fn start_update(&mut self, ctx: &egui::Context) {
+        crate::update::start(self.updater.clone(), ctx.clone());
+    }
+
+    /// 새 exe로 다시 시작한다 (창을 숨겨 둔 상태였으면 다시 숨긴 채로)
+    pub fn restart_for_update(&mut self, ctx: &egui::Context) {
+        match crate::update::spawn_restart(!self.window_visible) {
+            Ok(()) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => self.notify(format!("다시 시작하지 못했습니다. 앱을 껐다 켜 주세요: {e}"), true),
+        }
+    }
+
+    /// 업데이트 단계가 바뀌었을 때 한 번씩: 결과를 알리고, 바꾸기가 끝났으면 다시 시작한다
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        use crate::update::Stage;
+        let stage = self.updater.lock().clone();
+        if stage == self.update_seen {
+            return;
+        }
+        match &stage {
+            Stage::UpToDate => {
+                self.update_available = None;
+                self.notify(stage.text(), false);
+            }
+            Stage::Ready { tag } => {
+                self.update_available = None;
+                if self.indexer.is_active() {
+                    // 인덱싱을 끊지 않는다: 끝난 뒤 "다시 시작"을 누르게 한다
+                    self.notify(
+                        format!("{tag} 버전으로 바꿨습니다. 인덱싱이 끝난 뒤 '다시 시작'을 누르면 적용됩니다."),
+                        false,
+                    );
+                } else if self.shot.is_none() {
+                    self.restart_for_update(ctx);
+                }
+            }
+            Stage::Failed { message, .. } => self.notify(format!("업데이트하지 못했습니다: {message}"), true),
+            _ => {}
+        }
+        self.update_seen = stage;
+    }
+
+    /// 메뉴 아래의 업데이트 표시: 새 버전이 있으면 "업데이트 가능"(누르면 받아서 바꾼다),
+    /// 진행 중이면 진행 상황, 바꾼 뒤 다시 시작을 기다리는 중이면 "다시 시작".
+    fn nav_update(&mut self, ui: &mut egui::Ui, compact: bool) {
+        use crate::ui::theme::{self, palette};
+        use crate::update::Stage;
+        use widgets::{Btn, Icon};
+        let stage = self.updater.lock().clone();
+        let ctx = ui.ctx().clone();
+        let p = palette(ui.visuals());
+        // 아이콘만 있는 메뉴에서는 가운데에 놓는다
+        let centered = |ui: &mut egui::Ui, w: f32, add: &mut dyn FnMut(&mut egui::Ui) -> egui::Response| {
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+                add(ui)
+            })
+            .inner
+        };
+        // 누르는 카드 한 장: 아이콘 + 제목, 그 아래 작은 설명 (아래에서 위로 쌓는 배치라 아래 줄부터 넣는다)
+        let card = |ui: &mut egui::Ui, glyph: Icon, title: &str, sub: &str| {
+            egui::Frame::new()
+                .fill(p.accent.gamma_multiply(0.14))
+                .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.5)))
+                .corner_radius(10)
+                .inner_margin(egui::Margin::symmetric(10, 9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(sub).small().weak());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(2.0);
+                        widgets::icon(ui, glyph, 14.0, p.accent_text);
+                        ui.label(
+                            RichText::new(title)
+                                .size(13.0)
+                                .family(egui::FontFamily::Name(theme::SEMIBOLD.into()))
+                                .color(p.accent_text),
+                        );
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+        };
+        match &stage {
+            s if s.busy() => {
+                if compact {
+                    centered(ui, 16.0, &mut |ui| widgets::spinner(ui)).on_hover_text(stage.text());
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(2.0);
+                        widgets::spinner(ui);
+                        ui.label(RichText::new(stage.text()).small());
+                    });
+                }
+            }
+            Stage::Ready { tag } => {
+                let r = if compact {
+                    centered(ui, theme::CONTROL_H, &mut |ui| widgets::icon_button(ui, Btn::Primary, Icon::RotateCw, ""))
+                } else {
+                    card(ui, Icon::RotateCw, "다시 시작", &format!("{tag} 설치됨 · 누르면 적용"))
+                };
+                if r.on_hover_text(stage.text()).clicked() {
+                    self.restart_for_update(&ctx);
+                }
+            }
+            _ => {
+                let Some((tag, _)) = self.update_available.clone() else { return };
+                let hover = format!("새 버전({tag})이 있습니다. 누르면 받아서 지금 프로그램과 바꾸고 다시 시작합니다.");
+                let r = if compact {
+                    centered(ui, theme::CONTROL_H, &mut |ui| widgets::icon_button(ui, Btn::Secondary, Icon::Download, ""))
+                } else {
+                    card(ui, Icon::Download, "업데이트 가능", &format!("{tag} · 누르면 설치"))
+                };
+                if r.on_hover_text(hover).clicked() {
+                    self.start_update(&ctx);
+                }
+            }
+        }
+    }
+
     /// Windows 11: 제목 표시줄 색을 앱 바탕에 맞춘다 (테마가 바뀌면 다시). Windows 10에서는 아무 일도 없다.
     fn sync_titlebar(&mut self, dark: bool) {
         if self.titlebar_dark == Some(dark) || self.main_hwnd == 0 {
@@ -2097,7 +2243,8 @@ impl GemmaApp {
             let p = self.indexer.progress.lock();
             p.state == RunState::Running && !p.scanning && p.processed >= 8
         };
-        let mut busy = self.search_rx.is_some()
+        let mut busy = self.updater.lock().busy()
+            || self.search_rx.is_some()
             || self.auto_query.is_some()
             || self.pending_search.is_some()
             || self.store_loading.load(Ordering::SeqCst)

@@ -22,7 +22,19 @@ mod util;
 use eframe::egui;
 
 fn main() -> eframe::Result {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // exe를 바꾸기 전의 위치를 기억해 둔다 (업데이트 뒤 같은 자리의 새 exe로 다시 시작)
+    update::exe_path();
+    // 업데이트 뒤 다시 시작한 경우: 이전 프로세스가 끝나기를 기다린다
+    if let Some(i) = args.iter().position(|a| a == "--after-update") {
+        if let Some(pid) = args.get(i + 1).and_then(|p| p.parse::<u32>().ok()) {
+            update::wait_for_previous(pid);
+        }
+        args.drain(i..(i + 2).min(args.len()));
+    }
+    if args.first().map(|a| a == "--update").unwrap_or(false) {
+        std::process::exit(update::run_cli());
+    }
     if args.first().map(|a| a == "--headless-test").unwrap_or(false) {
         std::process::exit(headless::run(&args[1..]));
     }

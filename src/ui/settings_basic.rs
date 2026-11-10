@@ -46,6 +46,7 @@ impl GemmaApp {
         self.basic_kinds(ui);
         self.basic_performance(ui);
         self.basic_behavior(ui);
+        self.basic_update(ui);
 
         ui.add_space(space::M);
         ui.horizontal(|ui| {
@@ -466,12 +467,88 @@ impl GemmaApp {
                     }
                 });
             }
-            widgets::toggle_row(
-                ui,
-                &mut c.check_updates,
-                "새 버전 알림",
-                "하루 한 번 새 버전을 확인합니다. 내 파일 정보는 보내지 않습니다",
-            );
         });
+    }
+
+    /// 업데이트: 지금 버전, 새 버전이 있으면 "업데이트 가능", 누르면 확인하고 받아서 바꾼 뒤 다시 시작
+    fn basic_update(&mut self, ui: &mut egui::Ui) {
+        use crate::update::Stage;
+        use widgets::Icon;
+        let stage = self.updater.lock().clone();
+        let ctx = ui.ctx().clone();
+        let available = self.update_available.as_ref().map(|(tag, _)| tag.clone());
+        let (mut start, mut restart) = (false, false);
+        widgets::section(
+            ui,
+            "업데이트",
+            Some("누르면 새 버전이 있는지 확인하고, 있으면 받아서 지금 프로그램과 바꾼 뒤 다시 시작합니다. 설정과 검색 자료는 그대로입니다."),
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("지금 버전 v{}", env!("CARGO_PKG_VERSION")))
+                            .text_style(crate::ui::theme::ts_strong()),
+                    );
+                    if let (Some(tag), false) = (&available, matches!(stage, Stage::Ready { .. })) {
+                        widgets::tone_tag(ui, Tone::Info, &format!("업데이트 가능 {tag}"));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if matches!(stage, Stage::Ready { .. }) {
+                            restart = widgets::icon_button(ui, Btn::Primary, Icon::RotateCw, "다시 시작").clicked();
+                        } else if available.is_some() {
+                            start = widgets::icon_button_enabled(ui, Btn::Primary, !stage.busy(), Icon::Download, "업데이트")
+                                .clicked();
+                        } else {
+                            start =
+                                widgets::icon_button_enabled(ui, Btn::Secondary, !stage.busy(), Icon::RefreshCw, "업데이트 확인")
+                                    .clicked();
+                        }
+                    });
+                });
+                match &stage {
+                    Stage::Idle => {}
+                    Stage::Checking | Stage::Installing { .. } => {
+                        ui.horizontal(|ui| {
+                            widgets::spinner(ui);
+                            ui.label(stage.text());
+                        });
+                    }
+                    Stage::Downloading { done, total, .. } => {
+                        let frac = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                        widgets::progress_accent(ui, frac, 6.0, true);
+                        widgets::caption(
+                            ui,
+                            &format!(
+                                "{} · {:.1} / {:.1}MB",
+                                stage.text(),
+                                *done as f64 / 1048576.0,
+                                *total as f64 / 1048576.0
+                            ),
+                        );
+                    }
+                    Stage::UpToDate | Stage::Ready { .. } => widgets::status_line(ui, Tone::Ok, &stage.text()),
+                    Stage::Failed { message, page } => {
+                        widgets::callout_ui(ui, Tone::Danger, "업데이트하지 못했습니다", |ui| {
+                            ui.label(message);
+                            if let Some(page) = page {
+                                ui.hyperlink_to("릴리스 페이지에서 직접 받기", page);
+                            }
+                        });
+                    }
+                }
+                ui.add_space(space::XS);
+                widgets::toggle_row(
+                    ui,
+                    &mut self.cfg.check_updates,
+                    "새 버전 알림",
+                    "하루 한 번 새 버전이 있는지 확인해 알려 줍니다. 내 파일 정보는 보내지 않습니다",
+                );
+            },
+        );
+        if start {
+            self.start_update(&ctx);
+        }
+        if restart {
+            self.restart_for_update(&ctx);
+        }
     }
 }
