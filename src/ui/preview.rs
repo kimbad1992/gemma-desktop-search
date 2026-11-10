@@ -57,40 +57,34 @@ pub fn make_preview(
 
 impl GemmaApp {
     pub fn preview_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, hv: &HitView, expr: Option<&str>) {
+        use crate::ui::theme::{self, Tone};
+        use crate::ui::widgets::{Btn, ScoreStyle};
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.add(egui::Label::new(RichText::new(&hv.file_name).strong().size(16.0)).truncate());
+            ui.add(egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_item()).strong()).truncate());
         });
         ui.add(egui::Label::new(RichText::new(&hv.hit.path).small().weak()).wrap());
         ui.horizontal_wrapped(|ui| {
-            let score = hv.hit.score;
-            ui.add(
-                egui::ProgressBar::new(crate::ui::search_panel::bar(score))
-                    .desired_width(70.0)
-                    .desired_height(16.0)
-                    .fill(crate::ui::search_panel::score_color(score))
-                    .text(RichText::new(format!("관련도 {score:.1}")).size(11.0)),
-            )
-            .on_hover_text(format!(
+            widgets::score_bar(ui, hv.hit.score, ScoreStyle::Labeled).on_hover_text(format!(
                 "관련도 {:.1} = 의미 {:.1} + 검색어 {:.1}\n\n관련도는 이 검색에서 대부분의 파일(중앙값)보다 표준편차 몇 배만큼 튀는지입니다.\n어떤 검색어에나 잘 걸리는 파일(밋밋한 스크린샷 등)은 그만큼 빼고 계산합니다.\n대략 7 이상 뚜렷함, 5.5 이상 관련 있음, 그 아래는 약함.\n(코사인 유사도 원래 값 {:.3})",
                 hv.hit.score,
                 hv.hit.meaning,
                 hv.hit.score - hv.hit.meaning,
                 hv.hit.cosine
             ));
-            ui.label(RichText::new(why(hv)).color(widgets::BLUE));
+            widgets::tone_label(ui, Tone::Info, why(hv));
         });
         ui.horizontal_wrapped(|ui| {
-            if ui.button(open_label(hv)).on_hover_text("Enter").clicked() {
+            if widgets::button(ui, Btn::Primary, &open_label(hv)).on_hover_text("Enter").clicked() {
                 self.open_hit(hv);
             }
-            if ui.button("폴더에서 보기").on_hover_text("Ctrl+Enter").clicked() {
+            if widgets::button(ui, Btn::Secondary, "폴더에서 보기").on_hover_text("Ctrl+Enter").clicked() {
                 crate::util::reveal_path(&hv.hit.path);
             }
-            if ui.button("파일 복사").on_hover_text("Ctrl+C").clicked() {
+            if widgets::button(ui, Btn::Secondary, "파일 복사").on_hover_text("Ctrl+C").clicked() {
                 self.copy_file(&hv.hit.path);
             }
-            if ui.button("✕").on_hover_text("미리보기 닫기").clicked() {
+            if widgets::button(ui, Btn::Ghost, "✕").on_hover_text("미리보기 닫기").clicked() {
                 self.selected = None;
             }
         });

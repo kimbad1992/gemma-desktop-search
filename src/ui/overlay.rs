@@ -14,7 +14,8 @@ use eframe::egui::{self, RichText};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
-const SIZE: [f32; 2] = [360.0, 112.0];
+/// 본문 14·작은 글 11.5 기준으로 다섯 줄이 들어가는 크기
+const SIZE: [f32; 2] = [392.0, 136.0];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayAction {
@@ -114,13 +115,16 @@ fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<Ov
         let _ = tx.send(a);
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     };
+    let tone = widgets::run_tone(p.state).fg(ui.visuals());
+    let warn = crate::ui::theme::Tone::Warn.fg(ui.visuals());
     let frame = egui::Frame::new()
-        .fill(ui.visuals().panel_fill)
-        .stroke(egui::Stroke::new(1.0, widgets::run_color(p.state)))
+        .fill(crate::ui::theme::palette(ui.visuals()).card_fill)
+        .stroke(egui::Stroke::new(1.0, tone))
         .inner_margin(10);
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
         ui.horizontal(|ui| {
-            widgets::dot(ui, widgets::run_color(p.state));
+            widgets::dot(ui, tone);
             let head = match p.state {
                 RunState::Paused => "인덱싱 일시정지".to_string(),
                 RunState::Stopping => "인덱싱 중지하는 중…".to_string(),
@@ -129,12 +133,12 @@ fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<Ov
             };
             ui.label(RichText::new(format!("Gemma Search · {head}")).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("GPU·CPU 사용 중").small().color(widgets::ORANGE))
+                ui.label(RichText::new("GPU·CPU 사용 중").small().color(warn))
                     .on_hover_text("llama-server가 그래픽카드로 파일을 임베딩하고 있습니다. 일시정지하면 바로 멈춥니다.");
             });
         });
         let frac = if p.scanning { 0.0 } else { p.fraction().unwrap_or(0.0) };
-        ui.add(egui::ProgressBar::new(frac).desired_height(8.0).fill(widgets::run_color(p.state)));
+        widgets::progress(ui, frac, tone, 8.0, false);
         let (fps, _) = p.rates();
         let mut line = format!("{} / {}", fmt_num(p.processed), fmt_num(p.discovered));
         if fps > 0.0 {

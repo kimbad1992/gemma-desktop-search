@@ -35,6 +35,76 @@ pub struct Notice {
     pub at: Instant,
 }
 
+/// 설정 탭에서 보고 있는 화면
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SettingsView {
+    /// 쉬운 말로 된 기본 설정
+    #[default]
+    Basic,
+    /// 전문 항목
+    Advanced,
+}
+
+/// 지금 바로 검색할 수 있는 상태인지 (일반 설정의 "지금 상태")
+#[derive(Clone, Debug, Default)]
+pub struct Health {
+    /// llama.cpp 실행 파일이 있는지
+    pub engine: bool,
+    pub model: bool,
+    /// None = 설정하지 않음(글만 검색), Some(false) = 설정했는데 파일이 없음
+    pub mmproj: Option<bool>,
+    pub folders: usize,
+    pub missing_folders: usize,
+    /// 설정의 폴더가 지금 있는지 (설정의 폴더 순서대로)
+    pub root_exists: Vec<bool>,
+    pub indexed_files: usize,
+    /// ffmpeg와 ffprobe가 모두 있는지
+    pub ffmpeg: bool,
+}
+
+impl Health {
+    /// 인덱싱·검색을 시작할 준비물이 다 있는지 (인덱스가 있는지는 따로 본다)
+    pub fn ready(&self) -> bool {
+        self.engine && self.model && self.folders > 0
+    }
+}
+
+/// 서버를 켤 때 쓰인 설정. 켠 뒤에 이 값들이 바뀌면 다시 시작해야 적용된다.
+#[derive(Clone, PartialEq)]
+struct ServerKey {
+    llama_path: String,
+    model_path: String,
+    mmproj_path: String,
+    extra_dll_dir: String,
+    port: u16,
+    n_gpu_layers: i32,
+    ctx_size: u32,
+    parallel: u32,
+    batch_size: u32,
+    ubatch_size: u32,
+    flash_attn: String,
+    extra_args: String,
+}
+
+impl ServerKey {
+    fn of(c: &Config) -> Self {
+        Self {
+            llama_path: c.llama_path.clone(),
+            model_path: c.model_path.clone(),
+            mmproj_path: c.mmproj_path.clone(),
+            extra_dll_dir: c.extra_dll_dir.clone(),
+            port: c.port,
+            n_gpu_layers: c.n_gpu_layers,
+            ctx_size: c.ctx_size,
+            parallel: c.parallel,
+            batch_size: c.batch_size,
+            ubatch_size: c.ubatch_size,
+            flash_attn: c.flash_attn.clone(),
+            extra_args: c.extra_args.clone(),
+        }
+    }
+}
+
 /// 빠른 검색창 크기 (논리 픽셀)
 const QUICK_SIZE: [f32; 2] = [920.0, 560.0];
 
@@ -111,6 +181,12 @@ pub struct GemmaApp {
     preview_rx: Receiver<((String, i64), Option<egui::ColorImage>)>,
     /// 트레이·전역 단축키 (None이면 상주 기능 없음)
     shell: Option<Shell>,
+    /// 화면 요소 미리보기 (`--tab gallery`, 개발용)
+    show_gallery: bool,
+    /// 마지막으로 본 트레이·단축키 등록 상태 (바뀐 것만 로그·알림)
+    last_shell_status: crate::shell::ShellStatus,
+    /// 트레이 아이콘 없이 창이 숨겨진 시각 (오래 이어지면 창을 꺼낸다)
+    hidden_no_tray_since: Option<Instant>,
     /// 트레이 메뉴의 "종료": 닫기를 취소하지 않고 끝낸다
     quitting: bool,
     /// 빠른 검색창에서 결과를 열었음 → 이번 프레임 끝에 닫기
@@ -142,6 +218,21 @@ pub struct GemmaApp {
     /// 준비물 받기 진행 상태
     pub dl: Arc<Mutex<crate::download::DlState>>,
     pub dl_cancel: Arc<AtomicBool>,
+    /// 차례로 받을 준비물 ("필요한 것 모두 받기")
+    pub dl_queue: Vec<crate::download::Pack>,
+    /// PC 사양 확인 (첫 실행 마법사와 설정이 같이 쓴다)
+    pub probe: crate::ui::probe::ProbeState,
+    /// llama.cpp·모델 파일이 쓸 만한지 확인한 결과 (마법사, 고급 설정)
+    pub file_checks: crate::ui::probe::FileChecks,
+    /// 사양 확인이 끝나면: 추천값을 바로 적용 / 빠진 준비물 받기 시작
+    pub apply_plan_when_probed: bool,
+    pub download_when_probed: bool,
+    /// 설정 탭에서 보고 있는 화면 (일반 | 고급)
+    pub settings_view: SettingsView,
+    /// 준비 상태 요약 (잠깐 캐시: 네트워크 폴더 확인을 매 프레임 하지 않도록)
+    health_cache: Option<(Instant, Health)>,
+    /// 서버를 켤 때의 서버 관련 설정 (그 뒤 바뀌었으면 재시작 안내)
+    server_cfg_at_start: Option<ServerKey>,
     /// 인덱싱 오버레이: 이번 인덱싱 동안 숨김 / 직전 상태 / "창 열기" 눌림
     pub overlay_dismissed: bool,
     pub overlay_last_state: RunState,
@@ -177,11 +268,9 @@ pub const MAX_RECOVER_ATTEMPTS: u32 = 5;
 
 impl GemmaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // 글꼴을 먼저 (테마의 굵은 글자 스타일이 "bold" 패밀리를 쓴다)
         setup_fonts(&cc.egui_ctx);
-        cc.egui_ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            s.spacing.button_padding = egui::vec2(10.0, 4.0);
-        });
+        crate::ui::theme::install(&cc.egui_ctx);
 
         let data_dir = config::data_dir();
         let _ = std::fs::create_dir_all(&data_dir);
@@ -235,6 +324,9 @@ impl GemmaApp {
             preview_tx,
             preview_rx,
             shell: None,
+            show_gallery: false,
+            last_shell_status: Default::default(),
+            hidden_no_tray_since: None,
             quitting: false,
             leave_quick_after_open: false,
             quick_enter: false,
@@ -262,6 +354,14 @@ impl GemmaApp {
             update_rx: None,
             dl: Arc::new(Mutex::new(Default::default())),
             dl_cancel: Arc::new(AtomicBool::new(false)),
+            dl_queue: Vec::new(),
+            probe: Default::default(),
+            file_checks: Default::default(),
+            apply_plan_when_probed: false,
+            download_when_probed: false,
+            settings_view: SettingsView::Basic,
+            health_cache: None,
+            server_cfg_at_start: None,
             setup_open: false,
             setup: Default::default(),
             overlay_dismissed: false,
@@ -304,18 +404,26 @@ impl GemmaApp {
         // 트레이·전역 단축키
         match Shell::start(cc.egui_ctx.clone(), app.cfg.global_hotkey) {
             Ok(s) => {
-                if let Some(e) = &s.hotkey_error {
-                    app.notify(format!("전역 단축키를 쓸 수 없습니다: {e}"), true);
+                let st = s.status();
+                // 이 알림은 8초면 사라지고 첫 실행 마법사에 가려진다 → 상태 표시줄·설정 탭에도 계속 보여준다 (shell_warnings)
+                if let Some(e) = st.tray_problem().or_else(|| st.hotkey_problem()) {
+                    app.notify(e, true);
                 }
                 app.server.log(format!(
-                    "[앱] 트레이 시작 · 단축키 {} · 창 {}",
-                    match (&s.hotkey_error, app.cfg.global_hotkey) {
-                        (_, false) => "끔".to_string(),
-                        (None, true) => format!("{} 등록", crate::shell::HOTKEY_LABEL),
-                        (Some(e), true) => format!("등록 실패 ({e})"),
+                    "[앱] 트레이 {} · 단축키 {} · 창 {}",
+                    if st.tray_ok {
+                        "등록".to_string()
+                    } else {
+                        format!("등록 실패 (오류 {})", st.tray_error)
+                    },
+                    match (st.hotkey_wanted, st.hotkey_ok) {
+                        (false, _) => "끔".to_string(),
+                        (true, true) => format!("{} 등록", crate::shell::HOTKEY_LABEL),
+                        (true, false) => format!("등록 실패 (오류 {})", st.hotkey_error),
                     },
                     if app.window_visible { "보임" } else { "숨김(트레이로 시작)" }
                 ));
+                app.last_shell_status = st;
                 app.shell = Some(s);
             }
             Err(e) => app.notify(format!("트레이 아이콘을 만들지 못했습니다: {e}"), true),
@@ -383,13 +491,35 @@ impl GemmaApp {
                 }
             }
         }
+        // 화면 확인용: 긴 화면을 아래로 내린 채 고정(--scroll 픽셀), 시작하자마자 PC 사양 확인(--probe)
+        if let Some(px) = value("--scroll").and_then(|v| v.parse::<u32>().ok()) {
+            widgets::TEST_SCROLL.store(px, Ordering::Relaxed);
+        }
+        if flag("--probe") {
+            let ffmpeg = app.cfg.ffmpeg().is_some();
+            app.probe.start(ffmpeg, &cc.egui_ctx);
+        }
+        // 화면 확인용: 시스템 테마와 상관없이 밝은/어두운 테마로 고정
+        match value("--theme").as_deref() {
+            Some("light") => cc.egui_ctx.set_theme(egui::ThemePreference::Light),
+            Some("dark") => cc.egui_ctx.set_theme(egui::ThemePreference::Dark),
+            _ => {}
+        }
         if let Some(t) = value("--tab") {
             app.tab = match t.as_str() {
                 "index" => Tab::Index,
                 "server" => Tab::Server,
-                "settings" => Tab::Settings,
+                "settings" | "settings-advanced" => Tab::Settings,
                 _ => Tab::Search,
             };
+            if t == "settings-advanced" {
+                app.settings_view = SettingsView::Advanced;
+            }
+            // 화면 확인용: 부품 미리보기와 알림 예시
+            if t == "gallery" {
+                app.show_gallery = true;
+                app.notify("설정을 저장했습니다. 알림은 이렇게 오른쪽 아래에 잠깐 뜹니다.", false);
+            }
         }
         app
     }
@@ -471,6 +601,10 @@ impl GemmaApp {
         match self.server.start(&self.cfg) {
             Ok(()) => {
                 let actual = self.server.port();
+                // 포트는 실제로 뜬 값으로 기억한다 (아래에서 설정도 그 값으로 맞춘다)
+                let mut key = ServerKey::of(&self.cfg);
+                key.port = actual;
+                self.server_cfg_at_start = Some(key);
                 if actual != self.cfg.port {
                     // 설정 포트를 쓸 수 없어 다른 포트로 띄움 → 다음에도 그 포트를 쓰도록 저장
                     let old = self.cfg.port;
@@ -503,6 +637,139 @@ impl GemmaApp {
         self.server_on_demand = false;
         self.pending_search = None;
         self.notify("서버를 중지했습니다", false);
+    }
+
+    /// 서버를 켠 뒤 서버 관련 설정이 바뀌어, 다시 시작해야 적용되는 상태인지
+    pub fn server_restart_needed(&self) -> bool {
+        self.server.state().is_running()
+            && self
+                .server_cfg_at_start
+                .as_ref()
+                .is_some_and(|k| *k != ServerKey::of(&self.cfg))
+    }
+
+    /// 서버를 껐다 켠다 (앱이 알아서 켠 서버였으면 그 성격을 유지)
+    pub fn restart_server(&mut self) {
+        let on_demand = self.server_on_demand;
+        self.stop_server();
+        if on_demand {
+            self.start_server_auto();
+        } else {
+            self.start_server_manual();
+        }
+    }
+
+    /// 변경분 인덱싱을 시작한다. 서버가 꺼져 있으면 켜고, 준비되는 대로 시작한다.
+    pub fn start_index_when_ready(&mut self) {
+        if self.server.state().is_ready() {
+            self.start_index(false);
+        } else {
+            if !self.server.state().is_running() {
+                self.start_server_auto();
+            }
+            self.auto_index = true;
+        }
+    }
+
+    // ── 준비 상태 · 사양에 맞춘 추천 · 준비물 받기 (마법사와 설정이 같이 쓴다) ──
+
+    /// 지금 바로 검색할 수 있는 상태인지 요약한다
+    pub fn health(&mut self) -> Health {
+        if let Some((at, h)) = &self.health_cache {
+            if at.elapsed() < Duration::from_secs(2) {
+                return h.clone();
+            }
+        }
+        let c = &self.cfg;
+        let is_file = |p: &str| std::path::Path::new(p.trim()).is_file();
+        let root_exists: Vec<bool> = c.roots.iter().map(|r| std::path::Path::new(r.as_str()).is_dir()).collect();
+        let h = Health {
+            engine: crate::server::resolve_binary(&c.llama_path).is_ok(),
+            model: is_file(&c.model_path),
+            mmproj: c.has_mmproj().then(|| is_file(&c.mmproj_path)),
+            folders: c.roots.len(),
+            missing_folders: root_exists.iter().filter(|e| !**e).count(),
+            root_exists,
+            indexed_files: self.store.read().file_count(),
+            ffmpeg: c.ffmpeg().is_some() && c.ffprobe().is_some(),
+        };
+        self.health_cache = Some((Instant::now(), h.clone()));
+        h
+    }
+
+    /// 폴더·경로를 바꾼 직후처럼 준비 상태를 바로 다시 보게 한다
+    pub fn invalidate_health(&mut self) {
+        self.health_cache = None;
+    }
+
+    /// 지금 설정이 이 추천과 같은지
+    pub fn plan_applied(&self, plan: &crate::sysinfo::Plan) -> bool {
+        let c = &self.cfg;
+        c.n_gpu_layers == plan.n_gpu_layers
+            && c.ctx_size == plan.ctx_size
+            && c.parallel == plan.parallel
+            && c.batch_size == plan.batch_size
+            && c.ubatch_size == plan.ubatch_size
+            && c.workers == plan.workers
+    }
+
+    /// 사양에 맞춘 추천을 설정에 반영한다 (저장은 하지 않는다)
+    pub fn apply_plan(&mut self, plan: &crate::sysinfo::Plan) {
+        self.cfg.n_gpu_layers = plan.n_gpu_layers;
+        self.cfg.ctx_size = plan.ctx_size;
+        self.cfg.parallel = plan.parallel;
+        self.cfg.batch_size = plan.batch_size;
+        self.cfg.ubatch_size = plan.ubatch_size;
+        self.cfg.workers = plan.workers;
+    }
+
+    /// 추천을 반영하고 그 값들만 바로 저장한다 (설정 탭의 다른 미저장 변경은 그대로 둔다)
+    pub fn apply_plan_and_persist(&mut self, plan: &crate::sysinfo::Plan) {
+        self.apply_plan(plan);
+        let mut s = self.saved_cfg.clone();
+        s.n_gpu_layers = plan.n_gpu_layers;
+        s.ctx_size = plan.ctx_size;
+        s.parallel = plan.parallel;
+        s.batch_size = plan.batch_size;
+        s.ubatch_size = plan.ubatch_size;
+        s.workers = plan.workers;
+        match s.save(&self.data_dir) {
+            Ok(()) => self.saved_cfg = s,
+            Err(e) => self.notify(format!("설정 저장 실패: {e}"), true),
+        }
+    }
+
+    /// 빠진 준비물(모델, llama.cpp)을 차례로 받는다. llama.cpp는 `llama` 판으로.
+    pub fn download_missing(&mut self, ctx: &egui::Context, llama: crate::download::Pack) {
+        use crate::download::Pack;
+        if self.dl.lock().running {
+            return;
+        }
+        let mut todo = Vec::new();
+        if !std::path::Path::new(self.cfg.model_path.trim()).is_file() {
+            todo.push(Pack::Model);
+        }
+        if crate::server::resolve_binary(&self.cfg.llama_path).is_err() {
+            todo.push(llama);
+        }
+        if todo.is_empty() {
+            return;
+        }
+        let first = todo.remove(0);
+        self.dl_queue = todo;
+        crate::download::start(first, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), ctx.clone());
+    }
+
+    /// 받기가 끝날 때마다 대기열의 다음 준비물을 받는다 (실패했으면 대기열을 비운다)
+    fn next_download(&mut self, ctx: &egui::Context, last_ok: bool) {
+        if !last_ok {
+            self.dl_queue.clear();
+            return;
+        }
+        if !self.dl_queue.is_empty() {
+            let next = self.dl_queue.remove(0);
+            crate::download::start(next, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), ctx.clone());
+        }
     }
 
     // ── 상주: 트레이·빠른 검색창·서버 자동 켜기/끄기 ──
@@ -639,13 +906,8 @@ impl GemmaApp {
                         } else {
                             self.indexer.pause();
                         }
-                    } else if self.server.state().is_ready() {
-                        self.start_index(false);
                     } else {
-                        if !self.server.state().is_running() {
-                            self.start_server_auto();
-                        }
-                        self.auto_index = true;
+                        self.start_index_when_ready();
                     }
                 }
                 ShellEvent::ToggleServer => {
@@ -659,16 +921,92 @@ impl GemmaApp {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                ShellEvent::Status => self.on_shell_status(),
             }
         }
     }
 
-    /// 창 닫기: 트레이가 있으면 끝내지 않고 숨긴다 (트레이 메뉴의 "종료"로 끝냄)
+    /// 트레이 아이콘·단축키 등록 상태가 바뀜 (셸 스레드가 실패한 등록을 계속 다시 시도한다)
+    fn on_shell_status(&mut self) {
+        let Some(st) = self.shell.as_ref().map(|s| s.status()) else { return };
+        let old = std::mem::replace(&mut self.last_shell_status, st);
+        if st.tray_ok != old.tray_ok {
+            self.server.log(if st.tray_ok {
+                "[앱] 트레이 아이콘 등록".to_string()
+            } else {
+                format!("[앱] 트레이 아이콘 등록 실패 (오류 {})", st.tray_error)
+            });
+        }
+        if st.hotkey_ok != old.hotkey_ok {
+            if st.hotkey_ok {
+                self.server.log(format!("[앱] 단축키 {} 등록", crate::shell::HOTKEY_LABEL));
+                self.notify(
+                    format!("이제 {}로 어디서든 검색할 수 있습니다", crate::shell::HOTKEY_LABEL),
+                    false,
+                );
+            } else {
+                self.server.log(format!("[앱] 단축키 등록 실패 (오류 {})", st.hotkey_error));
+            }
+        }
+    }
+
+    /// 트레이 아이콘이 실제로 있는지 (없으면 창을 숨겨서는 안 된다: 다시 꺼낼 방법도 끝낼 메뉴도 없다)
+    pub fn tray_available(&self) -> bool {
+        self.shell.as_ref().is_some_and(|s| s.status().tray_ok)
+    }
+
+    /// 전역 단축키가 실제로 등록돼 있는지
+    pub fn hotkey_available(&self) -> bool {
+        self.shell.as_ref().is_some_and(|s| s.hotkey_registered())
+    }
+
+    /// 상주 기능(트레이·단축키) 중 지금 안 되는 것. 상태 표시줄과 설정 탭에 계속 보여준다.
+    pub fn shell_warnings(&self) -> Vec<String> {
+        let Some(shell) = &self.shell else {
+            return vec!["트레이·전역 단축키를 시작하지 못했습니다. 창을 닫으면 앱이 끝납니다.".to_string()];
+        };
+        let st = shell.status();
+        let mut out = Vec::new();
+        if let Some(mut m) = st.tray_problem() {
+            if self.cfg.close_to_tray {
+                m.push_str(" 트레이 아이콘이 없는 동안은 창을 닫으면 숨기지 않고 앱을 끝냅니다.");
+            }
+            out.push(m);
+        }
+        if let Some(m) = st.hotkey_problem() {
+            out.push(m);
+        }
+        out
+    }
+
+    /// 트레이 아이콘 없이 숨어 있으면(트레이로 시작했는데 등록이 안 된 경우) 꺼낼 방법이 없다 → 창을 띄운다.
+    /// 로그인 직후에는 작업 표시줄이 늦게 뜰 수 있어 잠시 기다린다 (그동안 셸 스레드가 다시 시도한다).
+    fn rescue_hidden_window(&mut self, ctx: &egui::Context) {
+        if self.window_visible || self.quick.is_some() || self.tray_available() {
+            self.hidden_no_tray_since = None;
+            return;
+        }
+        let since = *self.hidden_no_tray_since.get_or_insert_with(Instant::now);
+        if since.elapsed() > Duration::from_secs(20) {
+            self.hidden_no_tray_since = None;
+            self.show_window(ctx);
+            self.notify(
+                "트레이 아이콘을 만들 수 없어 창을 띄웠습니다. 설정 탭의 '상주 · 자동 실행'에서 이유를 볼 수 있습니다.",
+                true,
+            );
+        }
+    }
+
+    /// 창 닫기: 트레이 아이콘이 있으면 끝내지 않고 숨긴다 (트레이 메뉴의 "종료"로 끝냄)
     fn handle_close(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.viewport().close_requested()) {
             return;
         }
         if self.quitting || !self.cfg.close_to_tray || self.shell.is_none() {
+            return;
+        }
+        // 트레이 아이콘을 못 만들었으면 숨기지 않는다: 숨기면 창을 다시 꺼낼 수도, 앱을 끝낼 수도 없게 된다
+        if !self.tray_available() {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1196,8 +1534,23 @@ impl GemmaApp {
             } else {
                 self.notify(format!("{} 받기 실패: {msg}", pack.label()), true);
             }
-            // 마법사의 "모두 받기": 다음 준비물
-            self.setup_next_download(ctx, ok);
+            // "필요한 것 모두 받기": 다음 준비물
+            self.next_download(ctx, ok);
+            self.invalidate_health();
+        }
+        // 사양 확인이 끝났으면 기다리던 동작(추천값 적용, 준비물 받기)을 이어서
+        if self.probe.poll() {
+            if let Some(plan) = self.probe.plan().cloned() {
+                if self.apply_plan_when_probed {
+                    self.apply_plan_and_persist(&plan);
+                    self.notify("이 PC에 맞게 설정했습니다", false);
+                }
+                if self.download_when_probed {
+                    self.download_missing(ctx, plan.llama);
+                }
+            }
+            self.apply_plan_when_probed = false;
+            self.download_when_probed = false;
         }
 
         // 트레이·단축키, 기다리던 검색, 유휴 서버, 빠른 검색창
@@ -1292,23 +1645,31 @@ impl GemmaApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Gemma Search").size(20.0).strong());
+            ui.label(
+                RichText::new("Gemma Search")
+                    .text_style(crate::ui::theme::ts_section())
+                    .strong(),
+            );
             ui.add_space(12.0);
-            for (tab, label) in [
-                (Tab::Search, "검색"),
-                (Tab::Index, "인덱스"),
-                (Tab::Server, "서버"),
-                (Tab::Settings, "설정"),
-            ] {
-                ui.selectable_value(&mut self.tab, tab, RichText::new(label).size(16.0));
-            }
+            // 저장하지 않은 설정이 있으면 탭 이름에 점을 붙인다
+            let settings = if self.cfg != self.saved_cfg { "설정 •" } else { "설정" };
+            widgets::segmented(
+                ui,
+                &mut self.tab,
+                &[
+                    (Tab::Search, "검색"),
+                    (Tab::Index, "인덱스"),
+                    (Tab::Server, "서버"),
+                    (Tab::Settings, settings),
+                ],
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ss = self.server.state();
-                let r = widgets::badge(
+                let r = widgets::tone_badge(
                     ui,
-                    widgets::server_color(&ss),
+                    widgets::server_tone(&ss),
                     &format!("서버 {}", ss.label()),
                     false,
                     matches!(
@@ -1316,7 +1677,7 @@ impl GemmaApp {
                         crate::server::ServerState::Starting | crate::server::ServerState::Loading
                     ),
                 );
-                if r.interact(egui::Sense::click()).clicked() {
+                if r.interact(egui::Sense::click()).on_hover_text("서버 탭 열기").clicked() {
                     self.tab = Tab::Server;
                 }
                 let p = self.indexer.progress.lock().clone();
@@ -1325,31 +1686,32 @@ impl GemmaApp {
                         Some(f) if p.state.is_active() => format!("{} {:.0}%", p.state.label(), f * 100.0),
                         _ => p.state.label().to_string(),
                     };
-                    let r = widgets::badge(
+                    let r = widgets::tone_badge(
                         ui,
-                        widgets::run_color(p.state),
+                        widgets::run_tone(p.state),
                         &text,
                         false,
                         p.state == RunState::Running,
                     );
-                    if r.interact(egui::Sense::click()).clicked() {
+                    if r.interact(egui::Sense::click()).on_hover_text("인덱스 탭 열기").clicked() {
                         self.tab = Tab::Index;
                     }
                 }
             });
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::ui::theme::Tone;
+        let small = |s: String| RichText::new(s).small();
         ui.horizontal(|ui| {
+            // 왼쪽: 서버 · 인덱스 크기 · (진행 중일 때만) 인덱싱
             let ss = self.server.state();
             widgets::dot(ui, widgets::server_color(&ss));
-            let port = self.server.port();
+            let r = ui.label(small(format!("서버 {}", ss.label())));
             if ss.is_ready() {
-                ui.label(format!("서버 {} :{port}", ss.label()));
-            } else {
-                ui.label(format!("서버 {}", ss.label()));
+                r.on_hover_text(format!("포트 {}", self.server.port()));
             }
             ui.separator();
 
@@ -1360,69 +1722,50 @@ impl GemmaApp {
             if loading {
                 ui.spinner();
                 let s = self.store_status.lock().clone();
-                ui.label(if s.is_empty() { "인덱스 불러오는 중…".to_string() } else { s });
+                ui.label(small(if s.is_empty() { "인덱스 불러오는 중…".to_string() } else { s }));
             } else {
-                ui.label(format!(
-                    "인덱스 파일 {}개 · 벡터 {}개",
-                    fmt_num(files as u64),
-                    fmt_num(chunks as u64)
-                ));
+                ui.label(small(format!("파일 {}개", fmt_num(files as u64))))
+                    .on_hover_text(format!("검색할 수 있는 파일 수 · 벡터 {}개", fmt_num(chunks as u64)));
             }
-            ui.separator();
 
             let p = self.indexer.progress.lock().clone();
-            widgets::dot(ui, widgets::run_color(p.state));
-            match p.state {
-                RunState::Idle => {
-                    ui.label("인덱싱 대기");
-                }
-                s if s.is_active() => {
-                    let pct = p
-                        .fraction()
-                        .map(|f| format!("{:.0}%", f * 100.0))
-                        .unwrap_or_else(|| "탐색 중".into());
-                    ui.label(format!(
-                        "{} {pct} ({}/{})",
-                        s.label(),
-                        fmt_num(p.processed),
-                        fmt_num(p.discovered)
-                    ));
-                }
-                s => {
-                    ui.label(format!("인덱싱 {} — {}개 처리", s.label(), fmt_num(p.processed)));
-                }
-            }
-            ui.separator();
-
-            if self.search_rx.is_some() {
-                ui.spinner();
-                ui.label("검색 중…");
-            } else if let Some(o) = &self.outcome {
-                if o.error.is_some() {
-                    ui.colored_label(widgets::RED, "검색 실패");
-                } else {
-                    ui.label(format!(
-                        "검색: {}개 ({:.2}초)",
-                        o.total_files(),
-                        o.elapsed.as_secs_f32()
-                    ));
-                }
-            }
-
-            if let Some((tag, url)) = &self.update_available {
+            if p.state.is_active() {
                 ui.separator();
-                ui.hyperlink_to(RichText::new(format!("새 버전 {tag} 받기")).color(widgets::GREEN), url);
+                widgets::dot(ui, widgets::run_color(p.state));
+                let pct = p
+                    .fraction()
+                    .map(|f| format!("{:.0}%", f * 100.0))
+                    .unwrap_or_else(|| "탐색 중".into());
+                ui.label(small(format!(
+                    "{} {pct} ({}/{})",
+                    p.state.label(),
+                    fmt_num(p.processed),
+                    fmt_num(p.discovered)
+                )));
             }
-            if let Some(n) = &self.notice {
-                if n.at.elapsed() < Duration::from_secs(8) {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let c = if n.error { widgets::RED } else { widgets::BLUE };
-                        ui.colored_label(c, crate::util::truncate_chars(&n.text, 120))
-                            .on_hover_text(&n.text);
-                    });
+
+            // 오른쪽: 계속 알아야 하는 것만 (알림은 토스트로 뜬다)
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some((tag, url)) = &self.update_available {
+                    ui.hyperlink_to(small(format!("새 버전 {tag} 받기")), url);
                 }
-            }
+                let warnings = self.shell_warnings();
+                if !warnings.is_empty() {
+                    widgets::tone_label(ui, Tone::Warn, "⚠ 상주 기능 제한").on_hover_text(warnings.join("\n\n"));
+                }
+            });
         });
+    }
+
+    /// 알림을 오른쪽 아래 토스트로 보여준다 (오류는 15초, 안내는 6초 또는 닫을 때까지)
+    fn show_toast(&mut self, ctx: &egui::Context) {
+        let Some((text, error, age)) = self.notice.as_ref().map(|n| (n.text.clone(), n.error, n.at.elapsed())) else {
+            return;
+        };
+        let ttl = Duration::from_secs(if error { 15 } else { 6 });
+        if age > ttl || widgets::toast(ctx, &text, error) {
+            self.notice = None;
+        }
     }
 
     fn rebuild_dialog(&mut self, ctx: &egui::Context) {
@@ -1438,12 +1781,12 @@ impl GemmaApp {
                 ui.label("파일이 많으면 오래 걸릴 수 있습니다. 계속할까요?");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("재구축 시작").color(widgets::RED)).clicked() {
+                    if widgets::button(ui, widgets::Btn::Danger, "재구축 시작").clicked() {
                         self.confirm_rebuild = false;
                         self.recover_attempts = 0;
                         self.start_index(true);
                     }
-                    if ui.button("취소").clicked() {
+                    if widgets::button(ui, widgets::Btn::Secondary, "취소").clicked() {
                         self.confirm_rebuild = false;
                     }
                 });
@@ -1464,6 +1807,7 @@ impl eframe::App for GemmaApp {
         }
         self.poll(ctx);
         self.handle_close(ctx);
+        self.rescue_hidden_window(ctx);
         self.overlay_logic(ctx);
         // 트레이로 숨겨져 있어도 인덱싱 오버레이는 그려야 한다 → 이번 프레임은 ui를 부르게
         if !self.window_visible && self.overlay_should_show(ctx) {
@@ -1493,19 +1837,27 @@ impl eframe::App for GemmaApp {
                 return;
             }
         }
+        // 토스트·대화상자는 숨김 상태의 이른 반환 뒤에만 그린다 (숨긴 창에서 즉시형 창을 띄우면 패닉)
         if self.setup_open {
             egui::CentralPanel::default().show(ui, |ui| self.setup_ui(ui));
+            self.show_toast(&ctx);
             return;
         }
         egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Search => self.search_tab(ui),
-            Tab::Index => self.index_tab(ui),
-            Tab::Server => self.server_tab(ui),
-            Tab::Settings => self.settings_tab(ui),
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.show_gallery {
+                return widgets::gallery(ui);
+            }
+            match self.tab {
+                Tab::Search => self.search_tab(ui),
+                Tab::Index => self.index_tab(ui),
+                Tab::Server => self.server_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
+            }
         });
         self.rebuild_dialog(&ctx);
+        self.show_toast(&ctx);
     }
 }
 
@@ -1516,38 +1868,68 @@ impl Drop for GemmaApp {
     }
 }
 
-/// Windows 기본 조합: 라틴은 Segoe UI, 한글은 맑은 고딕.
-/// (맑은 고딕만 쓰면 경로의 '\'가 '₩'로 보인다)
+/// 앱에 넣은 화면 글꼴: Pretendard 가변 글꼴 v1.3.9 (SIL OFL 1.1 — assets/fonts/Pretendard-LICENSE.txt).
+/// 어느 PC에서나 같은 모양으로 보이도록 exe에 포함한다. 파일 하나로 굵기를 달리해 쓴다.
+static PRETENDARD: &[u8] = include_bytes!("../assets/fonts/PretendardVariable.ttf");
+
+/// 화면 글꼴을 정한다: Pretendard를 굵기별 패밀리로 등록하고, 거기에 없는 글자는 Windows 글꼴로 대체한다.
 fn setup_fonts(ctx: &egui::Context) {
+    use crate::ui::theme;
+    use egui::epaint::text::VariationCoords;
+    use egui::FontFamily;
+
     let mut fonts = egui::FontDefinitions::default();
-    // (이름, 경로, Proportional 앞쪽에 넣을 위치 / None이면 맨 뒤)
-    let candidates: [(&str, &str, Option<usize>); 3] = [
-        ("segoe-ui", r"C:\Windows\Fonts\segoeui.ttf", Some(0)),
-        ("malgun", r"C:\Windows\Fonts\malgun.ttf", Some(1)),
-        ("segoe-symbol", r"C:\Windows\Fonts\seguisym.ttf", None),
-    ];
-    let mut inserted = 0usize;
-    for (name, path, pos) in candidates {
-        let Ok(bytes) = std::fs::read(path) else { continue };
+    let face = |fonts: &mut egui::FontDefinitions, name: &str, wght: f32| {
+        let mut data = egui::FontData::from_static(PRETENDARD);
+        data.tweak.coords = VariationCoords::new([(b"wght", wght)]);
+        fonts.font_data.insert(name.to_string(), Arc::new(data));
+    };
+    face(&mut fonts, "pretendard", 400.0);
+
+    // Pretendard에 없는 글자(한자 등)는 맑은 고딕, 기호는 Segoe UI Symbol
+    let system = |fonts: &mut egui::FontDefinitions, name: &str, path: &str| -> bool {
+        let Ok(bytes) = std::fs::read(path) else { return false };
         fonts
             .font_data
             .insert(name.to_string(), Arc::new(egui::FontData::from_owned(bytes)));
-        let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-        match pos {
-            Some(_) => {
-                prop.insert(inserted.min(prop.len()), name.to_string());
-                inserted += 1;
-            }
-            None => prop.push(name.to_string()),
-        }
-        if name != "segoe-ui" {
-            // 고정폭(로그)은 기본 Hack 뒤에 한글/기호 대체 글꼴로
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .push(name.to_string());
-        }
+        true
+    };
+    let has_malgun = system(&mut fonts, "malgun", r"C:\Windows\Fonts\malgun.ttf");
+    let has_symbols = system(&mut fonts, "segoe-symbol", r"C:\Windows\Fonts\seguisym.ttf");
+
+    // 본문: Pretendard → 맑은 고딕 → egui 기본 글꼴(이모지 등) → 기호
+    let prop = fonts.families.entry(FontFamily::Proportional).or_default();
+    let defaults = std::mem::take(prop);
+    prop.push("pretendard".to_string());
+    if has_malgun {
+        prop.push("malgun".to_string());
+    }
+    prop.extend(defaults);
+    if has_symbols {
+        prop.push("segoe-symbol".to_string());
+    }
+    let prop_list = prop.clone();
+
+    // 고정폭(로그): 기본 Hack 뒤에 한글·기호 대체 글꼴
+    let mono = fonts.families.entry(FontFamily::Monospace).or_default();
+    mono.push("pretendard".to_string());
+    if has_malgun {
+        mono.push("malgun".to_string());
+    }
+    if has_symbols {
+        mono.push("segoe-symbol".to_string());
+    }
+
+    // 굵기별 패밀리: 버튼(500), 강조 라벨(600), 제목·숫자(700). 그 굵기에 없는 글자는 본문 글꼴 목록으로 대체된다.
+    for (family, name, wght) in [
+        (theme::MEDIUM, "pretendard-500", 500.0),
+        (theme::SEMIBOLD, "pretendard-600", 600.0),
+        (theme::BOLD, "pretendard-700", 700.0),
+    ] {
+        face(&mut fonts, name, wght);
+        let mut list = vec![name.to_string()];
+        list.extend(prop_list.iter().cloned());
+        fonts.families.insert(FontFamily::Name(family.into()), list);
     }
     ctx.set_fonts(fonts);
 }

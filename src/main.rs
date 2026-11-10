@@ -13,6 +13,7 @@ mod sysinfo;
 mod update;
 mod index;
 mod open;
+mod precheck;
 mod search;
 mod server;
 mod ui;

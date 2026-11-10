@@ -213,7 +213,18 @@ impl Config {
             Err(_) => return Self::default(),
         };
         cfg.migrate();
+        cfg.reanchor_portable(&app_dir());
         cfg
+    }
+
+    /// 포터블 폴더를 통째로 옮긴 경우: 설정에는 절대 경로가 저장돼 있어 예전 위치를 가리킨다.
+    /// 저장된 경로가 없어졌고 지금 프로그램 폴더 아래에 같은 꼬리 경로가 있으면 그쪽으로 바꾼다.
+    fn reanchor_portable(&mut self, base: &Path) {
+        for p in [&mut self.llama_path, &mut self.model_path, &mut self.mmproj_path] {
+            if let Some(moved) = reanchor(p.as_str(), base) {
+                *p = moved;
+            }
+        }
     }
 
     /// 예전 기본값 그대로인 항목만 새 기본값으로 옮긴다 (사용자가 바꾼 값은 유지)
@@ -322,6 +333,25 @@ fn default_path(candidates: &[PathBuf]) -> String {
         .unwrap_or_default()
 }
 
+/// `stored`가 이제 없는 경로일 때, 그 꼬리 부분을 긴 것부터 `base` 아래에서 찾는다.
+/// 예: `C:\old\app\models\m\x.gguf`(없음), base `D:\new\app` → `D:\new\app\models\m\x.gguf`(있으면).
+/// 경로가 그대로 있거나, 비어 있거나, `base` 아래에도 없으면 None.
+fn reanchor(stored: &str, base: &Path) -> Option<String> {
+    let stored = stored.trim();
+    if stored.is_empty() || Path::new(stored).exists() {
+        return None;
+    }
+    // 드라이브·루트를 뺀 폴더·파일 이름들
+    let parts: Vec<_> = Path::new(stored)
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .collect();
+    (0..parts.len()).find_map(|start| {
+        let candidate = parts[start..].iter().fold(base.to_path_buf(), |dir, part| dir.join(part));
+        candidate.exists().then(|| candidate.display().to_string())
+    })
+}
+
 /// 키·인증서가 들어 있는 폴더 (기본 제외)
 const SENSITIVE_DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube"];
 
@@ -348,6 +378,28 @@ mod tests {
         assert_eq!((c.video_max_segments, c.audio_max_segments), (240, 50), "예전 기본값만 상향");
         assert!(c.exclude_dirs.iter().any(|d| d == ".ssh"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reanchors_paths_after_portable_folder_moved() {
+        let base = std::env::temp_dir().join(format!("gs-move-{}", std::process::id()));
+        let model = base.join("models").join("m").join("x.gguf");
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(&model, b"").unwrap();
+        std::fs::create_dir_all(base.join("llama.cpp")).unwrap();
+        // 옮기기 전 위치(이제 없음)를 가리키는 경로는 새 프로그램 폴더 아래로
+        let old = std::env::temp_dir().join(format!("gs-gone-{}", std::process::id())).join("app");
+        let old_model = old.join("models").join("m").join("x.gguf").display().to_string();
+        assert_eq!(reanchor(&old_model, &base), Some(model.display().to_string()));
+        assert_eq!(
+            reanchor(&old.join("llama.cpp").display().to_string(), &base),
+            Some(base.join("llama.cpp").display().to_string())
+        );
+        // 그대로 있는 경로, 빈 값, 새 위치에도 없는 경로는 건드리지 않는다
+        assert_eq!(reanchor(&model.display().to_string(), &base), None);
+        assert_eq!(reanchor("  ", &base), None);
+        assert_eq!(reanchor(&old.join("models").join("m").join("y.gguf").display().to_string(), &base), None);
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 

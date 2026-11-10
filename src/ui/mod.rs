@@ -1,9 +1,13 @@
 pub mod index_panel;
 pub mod overlay;
 pub mod preview;
+pub mod probe;
 pub mod quick;
 pub mod search_panel;
 pub mod server_panel;
+pub mod settings_advanced;
+pub mod settings_basic;
 pub mod settings_panel;
 pub mod setup;
+pub mod theme;
 pub mod widgets;

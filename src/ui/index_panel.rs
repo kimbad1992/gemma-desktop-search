@@ -1,286 +1,350 @@
-//! 인덱스 탭: 진행 상태를 한눈에 (상태 배지, 진행 막대, 카운터, 종류별 표, 속도/ETA, 오류 목록)
+//! 인덱스 탭: 지금 상태와 주 동작, 이번 실행의 통계, 종류별·전체 인덱스, 폴더·오류 목록, 전체 재구축
 
 use crate::app::GemmaApp;
 use crate::extract::Kind;
 use crate::index::progress::RunState;
-use crate::ui::widgets;
+use crate::ui::theme::{self, space, Tone};
+use crate::ui::widgets::{self, Btn};
 use crate::util::{fmt_dur, fmt_num};
 use eframe::egui::{self, RichText};
 
+/// 머리 카드에서 누른 버튼
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Act {
+    None,
+    Start,
+    Pause,
+    Resume,
+    Stop,
+    Settings,
+}
+
+/// 이름 | 값 한 줄
+fn kv(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.label(RichText::new(key).weak());
+    ui.label(value);
+    ui.end_row();
+}
+
 impl GemmaApp {
     pub fn index_tab(&mut self, ui: &mut egui::Ui) {
-        let p = self.indexer.progress.lock().clone();
-        let blocker = self.index_blocker();
-
-        // ── 상태 + 제어 버튼 ──
-        ui.horizontal(|ui| {
-            let label = match p.state {
-                RunState::Running if p.full_rebuild && p.scanning => "전체 재구축 중 (폴더 탐색 중)",
-                RunState::Running if p.full_rebuild => "전체 재구축 중",
-                RunState::Running if p.scanning => "인덱싱 진행 중 (폴더 탐색 중)",
-                s => s.label(),
-            };
-            widgets::badge(ui, widgets::run_color(p.state), label, true, p.state == RunState::Running);
-            ui.add_space(16.0);
-
-            let active = p.state.is_active();
-            let start = ui
-                .add_enabled(blocker.is_none(), egui::Button::new(RichText::new("▶ 인덱싱 시작 (변경분)").size(15.0)));
-            let start = match &blocker {
-                Some(b) if !active => start.on_disabled_hover_text(b),
-                _ => start.on_hover_text("새 파일과 바뀐 파일만 처리합니다"),
-            };
-            if start.clicked() {
-                self.recover_attempts = 0;
-                self.start_index(false);
-            }
-            if ui
-                .add_enabled(blocker.is_none(), egui::Button::new("전체 재구축"))
-                .on_hover_text("인덱스를 지우고 처음부터 다시 만듭니다")
-                .clicked()
-            {
-                self.confirm_rebuild = true;
-            }
-            match p.state {
-                RunState::Running => {
-                    if ui.button(RichText::new("❚❚ 일시정지").size(15.0)).clicked() {
-                        self.indexer.pause();
-                    }
-                }
-                RunState::Paused => {
-                    if ui.button(RichText::new("▶ 재개").size(15.0)).clicked() {
-                        self.indexer.resume();
-                    }
-                }
-                _ => {}
-            }
-            if ui
-                .add_enabled(matches!(p.state, RunState::Running | RunState::Paused), egui::Button::new(RichText::new("■ 중지").size(15.0)))
-                .on_hover_text("처리 중인 파일까지만 마치고 멈춥니다. 다음 실행에서 이어서 처리됩니다.")
-                .clicked()
-            {
-                self.indexer.stop();
-            }
-        });
-
-        if self.recover_attempts > 0 {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                widgets::badge(
-                    ui,
-                    widgets::ORANGE,
-                    &format!(
-                        "서버 자동 복구 {}/{}회 — llama-server가 비정상 종료되어 다시 띄우고 이어서 인덱싱했습니다",
-                        self.recover_attempts,
-                        crate::app::MAX_RECOVER_ATTEMPTS
-                    ),
-                    false,
-                    false,
-                );
-            });
-        }
-
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("대상 폴더:").weak());
-            if self.cfg.roots.is_empty() {
-                ui.colored_label(widgets::ORANGE, "없음");
-            } else {
-                ui.label(self.cfg.roots.join("   ·   "));
-            }
-            if ui.link("설정에서 변경").clicked() {
-                self.tab = crate::app::Tab::Settings;
-            }
-        });
-
-        if p.state == RunState::Failed && !p.message.is_empty() {
-            ui.add_space(4.0);
-            egui::Frame::new()
-                .fill(widgets::RED.gamma_multiply(0.12))
-                .stroke(egui::Stroke::new(1.0, widgets::RED))
-                .corner_radius(6)
-                .inner_margin(8)
-                .show(ui, |ui| {
-                    ui.colored_label(widgets::RED, RichText::new(&p.message).strong());
+        widgets::page(ui, "index_page", theme::DASH_W, |ui| {
+            self.index_header(ui);
+            self.index_run_stats(ui);
+            if ui.available_width() >= 900.0 {
+                ui.columns(2, |cols| {
+                    self.index_kinds(&mut cols[0]);
+                    self.index_totals(&mut cols[1]);
                 });
-        }
-
-        // ── 진행 막대 ──
-        ui.add_space(8.0);
-        let bar = match p.fraction() {
-            Some(f) => egui::ProgressBar::new(f).text(
-                RichText::new(format!(
-                    "{:.1}%  ({} / {})",
-                    f * 100.0,
-                    fmt_num(p.processed),
-                    fmt_num(p.discovered)
-                ))
-                .size(14.0),
-            ),
-            None if p.state.is_active() => egui::ProgressBar::new(if p.discovered > 0 {
-                (p.processed as f32 / p.discovered as f32).clamp(0.0, 1.0)
             } else {
-                0.0
-            })
-            .animate(true)
-            .text(
-                RichText::new(format!(
-                    "폴더 탐색 중… 발견 {}개 · 처리 {}개",
-                    fmt_num(p.discovered),
-                    fmt_num(p.processed)
-                ))
-                .size(14.0),
-            ),
-            None => egui::ProgressBar::new(0.0).text("대기"),
-        };
-        let bar = if p.state == RunState::Paused {
-            bar.fill(widgets::YELLOW)
-        } else if p.state == RunState::Completed {
-            bar.fill(widgets::BLUE)
-        } else {
-            bar
-        };
-        ui.add(bar.desired_height(26.0).animate(p.state == RunState::Running));
+                self.index_kinds(ui);
+                self.index_totals(ui);
+            }
+            self.index_lists(ui);
+            self.index_rebuild(ui);
+        });
+    }
 
-        // ── 카운터 카드 ──
-        ui.add_space(8.0);
+    /// 상태 배지, 주 동작 버튼, 진행 막대, 시작할 수 없는 이유
+    fn index_header(&mut self, ui: &mut egui::Ui) {
+        let p = self.indexer.progress.lock().clone();
+        let loading = self.store_loading.load(std::sync::atomic::Ordering::SeqCst);
+        let no_roots = self.cfg.roots.is_empty();
+        let waiting = self.auto_index && !p.state.is_active();
+        let mut act = Act::None;
+
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let label = match p.state {
+                    RunState::Running if p.full_rebuild && p.scanning => "전체 재구축 중 (폴더 탐색 중)",
+                    RunState::Running if p.full_rebuild => "전체 재구축 중",
+                    RunState::Running if p.scanning => "인덱싱 진행 중 (폴더 탐색 중)",
+                    s => s.label(),
+                };
+                widgets::tone_badge(ui, widgets::run_tone(p.state), label, true, p.state == RunState::Running);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 오른쪽부터 놓인다
+                    match p.state {
+                        RunState::Running => {
+                            if widgets::button(ui, Btn::Secondary, "■ 중지")
+                                .on_hover_text("처리 중인 파일까지만 마치고 멈춥니다. 다음에 이어서 처리됩니다.")
+                                .clicked()
+                            {
+                                act = Act::Stop;
+                            }
+                            if widgets::button(ui, Btn::Secondary, "❚❚ 일시정지").clicked() {
+                                act = Act::Pause;
+                            }
+                        }
+                        RunState::Paused => {
+                            if widgets::button(ui, Btn::Secondary, "■ 중지").clicked() {
+                                act = Act::Stop;
+                            }
+                            if widgets::button(ui, Btn::Primary, "▶ 재개").clicked() {
+                                act = Act::Resume;
+                            }
+                        }
+                        RunState::Stopping => {}
+                        _ => {
+                            let can = !loading && !no_roots && !waiting;
+                            if widgets::button_enabled(ui, Btn::Primary, can, "▶ 인덱싱 시작")
+                                .on_hover_text("새 파일과 바뀐 파일만 처리합니다. 서버가 꺼져 있으면 켜고 시작합니다.")
+                                .clicked()
+                            {
+                                act = Act::Start;
+                            }
+                        }
+                    }
+                });
+            });
+
+            // 진행 상황
+            if p.state.is_active() {
+                ui.add_space(space::XS);
+                let frac = p.fraction().unwrap_or_else(|| {
+                    if p.discovered > 0 {
+                        (p.processed as f32 / p.discovered as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                });
+                let color = widgets::run_tone(p.state).fg(ui.visuals());
+                widgets::progress(ui, frac, color, 10.0, p.state == RunState::Running);
+                let (fps, cps) = p.rates();
+                let mut parts = Vec::new();
+                match p.fraction() {
+                    Some(f) => parts.push(format!("{:.1}%", f * 100.0)),
+                    None => parts.push("폴더 탐색 중".to_string()),
+                }
+                parts.push(format!("{} / {}", fmt_num(p.processed), fmt_num(p.discovered)));
+                match p.eta() {
+                    Some(eta) => parts.push(format!("남은 시간 약 {}", fmt_dur(eta))),
+                    None if p.scanning => parts.push("남은 시간은 탐색이 끝나면 계산".to_string()),
+                    None => {}
+                }
+                parts.push(format!("{fps:.1} 파일/초 · {cps:.1} 벡터/초"));
+                parts.push(format!("경과 {}", fmt_dur(p.elapsed())));
+                ui.label(parts.join(" · "));
+                if !p.current.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&p.current).monospace().weak()).truncate())
+                        .on_hover_text(&p.current);
+                }
+            } else {
+                widgets::help(ui, "폴더의 파일을 읽어 검색할 수 있게 준비합니다. 한 번 한 뒤에는 새 파일과 바뀐 파일만 처리합니다.");
+            }
+
+            // 시작할 수 없는 이유와 해결 방법
+            if waiting {
+                ui.add_space(space::XS);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("서버가 준비되면 바로 시작합니다…");
+                });
+            } else if !p.state.is_active() && no_roots {
+                ui.add_space(space::XS);
+                widgets::callout_ui(ui, Tone::Warn, "검색할 폴더가 없습니다", |ui| {
+                    if widgets::button(ui, Btn::Secondary, "설정에서 폴더 추가").clicked() {
+                        act = Act::Settings;
+                    }
+                });
+            } else if !p.state.is_active() && loading {
+                ui.add_space(space::XS);
+                widgets::callout(ui, Tone::Info, "인덱스를 불러오는 중입니다", "끝나면 시작할 수 있습니다.");
+            }
+            if p.state == RunState::Failed && !p.message.is_empty() {
+                ui.add_space(space::XS);
+                widgets::callout(ui, Tone::Danger, "인덱싱이 실패했습니다", &p.message);
+            }
+            if self.recover_attempts > 0 {
+                ui.add_space(space::XS);
+                widgets::callout(
+                    ui,
+                    Tone::Warn,
+                    &format!("서버 자동 복구 {}/{}회", self.recover_attempts, crate::app::MAX_RECOVER_ATTEMPTS),
+                    "llama-server가 비정상 종료되어 다시 띄우고 이어서 인덱싱했습니다.",
+                );
+            }
+        });
+
+        match act {
+            Act::None => {}
+            Act::Start => {
+                self.recover_attempts = 0;
+                self.start_index_when_ready();
+            }
+            Act::Pause => self.indexer.pause(),
+            Act::Resume => self.indexer.resume(),
+            Act::Stop => self.indexer.stop(),
+            Act::Settings => self.tab = crate::app::Tab::Settings,
+        }
+    }
+
+    /// 이번 실행의 통계 카드 (한 번도 돌리지 않았으면 그리지 않는다)
+    fn index_run_stats(&mut self, ui: &mut egui::Ui) {
+        let p = self.indexer.progress.lock().clone();
+        if p.state == RunState::Idle {
+            return;
+        }
+        ui.add_space(space::S);
+        widgets::section_title(ui, "이번 실행");
         ui.horizontal_wrapped(|ui| {
-            widgets::stat_card(ui, "발견한 파일", &fmt_num(p.discovered), ui.visuals().text_color());
-            widgets::stat_card(ui, "처리 완료", &fmt_num(p.processed), widgets::GREEN);
-            widgets::stat_card(ui, "변경 없음(건너뜀)", &fmt_num(p.unchanged), widgets::GRAY);
-            widgets::stat_card(ui, "이름만 인덱싱", &fmt_num(p.name_only), widgets::GRAY);
-            widgets::stat_card(
-                ui,
-                "오류",
-                &fmt_num(p.errors),
-                if p.errors > 0 { widgets::RED } else { widgets::GRAY },
-            );
-            widgets::stat_card(ui, "벡터(청크)", &fmt_num(p.chunks), widgets::BLUE);
+            let v = ui.visuals().clone();
+            let muted = Tone::Muted.fg(&v);
+            widgets::stat_card(ui, "발견한 파일", &fmt_num(p.discovered), Tone::Neutral.fg(&v));
+            widgets::stat_card(ui, "처리 완료", &fmt_num(p.processed), Tone::Ok.fg(&v));
+            widgets::stat_card(ui, "변경 없음(건너뜀)", &fmt_num(p.unchanged), muted);
+            widgets::stat_card(ui, "이름만 인덱싱", &fmt_num(p.name_only), muted);
+            widgets::stat_card(ui, "오류", &fmt_num(p.errors), if p.errors > 0 { Tone::Danger.fg(&v) } else { muted });
+            widgets::stat_card(ui, "벡터(청크)", &fmt_num(p.chunks), Tone::Info.fg(&v));
             if p.removed > 0 {
-                widgets::stat_card(ui, "삭제 반영", &fmt_num(p.removed), widgets::ORANGE);
+                widgets::stat_card(ui, "삭제 반영", &fmt_num(p.removed), Tone::Warn.fg(&v));
             }
             if p.inaccessible > 0 {
-                widgets::stat_card(ui, "접근 불가", &fmt_num(p.inaccessible), widgets::ORANGE);
+                widgets::stat_card(ui, "접근 불가", &fmt_num(p.inaccessible), Tone::Warn.fg(&v));
             }
         });
+    }
 
-        // ── 속도 / 시간 ──
-        ui.add_space(6.0);
-        let (fps, cps) = p.rates();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("경과 {}", fmt_dur(p.elapsed())));
-            ui.separator();
-            ui.label(format!("{fps:.1} 파일/초 · {cps:.1} 벡터/초"));
-            ui.separator();
-            match p.eta() {
-                Some(eta) => ui.label(format!("남은 시간 약 {}", fmt_dur(eta))),
-                None if p.scanning => ui.label("남은 시간: 탐색이 끝나면 계산"),
-                None => ui.label("남은 시간 -"),
-            };
-        });
-        if !p.current.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("현재:").weak());
-                ui.add(egui::Label::new(RichText::new(&p.current).monospace().size(12.0)).truncate());
-            });
-        }
-
-        // ── 종류별 ──
-        ui.add_space(8.0);
+    /// 종류별 표: 이번 실행과 전체 인덱스, 내용까지 인덱싱하는지
+    fn index_kinds(&mut self, ui: &mut egui::Ui) {
+        let p = self.indexer.progress.lock().clone();
         let caps = self.server.capabilities();
         let media_ok = self.cfg.ffmpeg().is_some() && self.cfg.ffprobe().is_some();
-        widgets::section_frame(ui, |ui| {
-            egui::Grid::new("kinds").num_columns(5).spacing([22.0, 6.0]).striped(true).show(ui, |ui| {
-                ui.label(RichText::new("종류").strong());
-                ui.label(RichText::new("이번 실행: 발견").strong());
-                ui.label(RichText::new("인덱싱됨").strong());
-                ui.label(RichText::new("전체 인덱스").strong());
-                ui.label(RichText::new("내용 인덱싱").strong());
+        let stats = self.db_stats.lock().clone();
+        widgets::section(ui, "종류별", None, |ui| {
+            egui::Grid::new("kinds").num_columns(5).spacing([18.0, 8.0]).striped(true).show(ui, |ui| {
+                for head in ["종류", "발견", "인덱싱됨", "전체", "내용 인덱싱"] {
+                    ui.label(RichText::new(head).text_style(theme::ts_strong()).strong());
+                }
                 ui.end_row();
-                let stats = self.db_stats.lock().clone();
                 for k in Kind::ALL {
                     ui.label(k.label());
                     ui.label(fmt_num(p.discovered_by_kind[k.idx()]));
                     ui.label(fmt_num(p.indexed_by_kind[k.idx()]));
                     ui.label(fmt_num(stats.files_by_kind[k.idx()]));
                     let (ok, why) = content_status(self, k, caps.as_ref(), media_ok);
-                    if ok {
-                        ui.colored_label(widgets::GREEN, why);
-                    } else {
-                        ui.colored_label(widgets::GRAY, why);
-                    }
+                    widgets::tone_label(ui, if ok { Tone::Ok } else { Tone::Muted }, why);
                     ui.end_row();
                 }
             });
+            widgets::caption(ui, "발견·인덱싱됨은 이번 실행, 전체는 지금 인덱스에 들어 있는 파일 수입니다.");
         });
+    }
 
-        // ── 전체 인덱스 요약 ──
+    /// 전체 인덱스 요약과 대상 폴더
+    fn index_totals(&mut self, ui: &mut egui::Ui) {
         let stats = self.db_stats.lock().clone();
         let mem = self.store.read().memory_mb();
-        ui.label(
-            RichText::new(format!(
-                "전체 인덱스: 파일 {}개 · 벡터 {}개 · 오류 {}개 · DB {:.1}MB (벡터 {}) · 검색용 메모리 {:.1}MB",
-                fmt_num(stats.files),
-                fmt_num(stats.chunks),
-                fmt_num(stats.errors),
-                stats.file_bytes as f64 / 1048576.0,
-                if stats.f16 { "FP16" } else { "FP32" },
-                mem
-            ))
-            .weak(),
-        );
+        let mut go_settings = false;
+        widgets::section(ui, "전체 인덱스", None, |ui| {
+            egui::Grid::new("index_totals").num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
+                kv(ui, "파일", &format!("{}개", fmt_num(stats.files)));
+                kv(ui, "벡터", &format!("{}개", fmt_num(stats.chunks)));
+                kv(ui, "오류", &format!("{}개", fmt_num(stats.errors)));
+                kv(
+                    ui,
+                    "DB 크기",
+                    &format!(
+                        "{:.1}MB (벡터 {})",
+                        stats.file_bytes as f64 / 1048576.0,
+                        if stats.f16 { "FP16" } else { "FP32" }
+                    ),
+                );
+                kv(ui, "검색용 메모리", &format!("{mem:.1}MB"));
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                widgets::subheading(ui, "대상 폴더");
+                if ui.link("설정에서 변경").clicked() {
+                    go_settings = true;
+                }
+            });
+            if self.cfg.roots.is_empty() {
+                widgets::tone_label(ui, Tone::Warn, "없음");
+            }
+            for root in &self.cfg.roots {
+                ui.add(egui::Label::new(root).truncate()).on_hover_text(root);
+            }
+        });
+        if go_settings {
+            self.tab = crate::app::Tab::Settings;
+        }
+    }
 
-        // ── 폴더별 ──
+    /// 접어 두는 목록: 폴더별 인덱스, 오류·경고
+    fn index_lists(&mut self, ui: &mut egui::Ui) {
         let folders = self.folders.lock().clone();
         if !folders.list.is_empty() {
-            ui.add_space(4.0);
-            egui::CollapsingHeader::new(format!("폴더별 인덱스 ({}개 폴더)", folders.list.len()))
-                .default_open(folders.list.len() > 1)
-                .show(ui, |ui| {
-                    egui::Grid::new("folders").num_columns(3).spacing([22.0, 4.0]).striped(true).show(ui, |ui| {
+            ui.add_space(space::S);
+            widgets::collapsing_section(
+                ui,
+                "index_folders",
+                format!("폴더별 인덱스 ({}개 폴더)", folders.list.len()),
+                folders.list.len() > 1,
+                |ui| {
+                    egui::Grid::new("folders").num_columns(3).spacing([18.0, 6.0]).striped(true).show(ui, |ui| {
                         for f in &folders.list {
                             ui.label(&f.path);
                             ui.label(format!("{}개", fmt_num(f.files)));
                             if f.current {
-                                ui.colored_label(widgets::GREEN, "인덱싱 대상");
+                                widgets::tone_label(ui, Tone::Ok, "인덱싱 대상");
                             } else {
-                                ui.colored_label(widgets::GRAY, "예전 대상 (결과 유지)");
+                                widgets::tone_label(ui, Tone::Muted, "예전 대상 (결과 유지)");
                             }
                             ui.end_row();
                         }
                         if folders.other > 0 {
                             ui.label(RichText::new("기타 위치").italics());
                             ui.label(format!("{}개", fmt_num(folders.other)));
-                            ui.colored_label(widgets::GRAY, "폴더 기록 이전 항목");
+                            widgets::tone_label(ui, Tone::Muted, "폴더 기록 이전 항목");
                             ui.end_row();
                         }
                     });
-                });
+                },
+            );
         }
 
-        // ── 오류 목록 ──
+        let p = self.indexer.progress.lock().clone();
         if !p.error_list.is_empty() {
-            ui.add_space(6.0);
-            egui::CollapsingHeader::new(
-                RichText::new(format!(
-                    "오류 {}개 · 경고 {}개 (목록)",
-                    fmt_num(p.errors),
-                    fmt_num(p.warnings)
-                ))
-                .color(if p.errors > 0 { widgets::RED } else { widgets::ORANGE }),
-            )
-            .default_open(false)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                    for (path, msg) in &p.error_list {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(path).monospace().size(12.0));
-                            ui.label(RichText::new(msg).color(widgets::RED).size(12.0));
-                        });
-                    }
-                });
+            ui.add_space(space::XS);
+            let tone = if p.errors > 0 { Tone::Danger } else { Tone::Warn };
+            let title = RichText::new(format!("오류 {}개 · 경고 {}개", fmt_num(p.errors), fmt_num(p.warnings)))
+                .color(tone.fg(ui.visuals()));
+            widgets::collapsing_section(ui, "index_errors", title, false, |ui| {
+                let danger = Tone::Danger.fg(ui.visuals());
+                egui::ScrollArea::vertical()
+                    .id_salt("index_error_list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (path, msg) in &p.error_list {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(path).monospace());
+                                ui.label(RichText::new(msg).color(danger));
+                            });
+                        }
+                    });
             });
         }
+    }
+
+    /// 전체 재구축: 되돌릴 수 없는 동작이라 맨 아래에 따로 둔다
+    fn index_rebuild(&mut self, ui: &mut egui::Ui) {
+        let blocker = self.index_blocker();
+        widgets::section(ui, "인덱스 다시 만들기", None, |ui| {
+            widgets::help(
+                ui,
+                "인덱스를 지우고 처음부터 다시 만듭니다. 모델을 바꿨거나 인덱싱 설정을 기존 파일에도 적용하려는 경우에만 필요합니다.",
+            );
+            ui.add_space(space::XS);
+            let r = widgets::button_enabled(ui, Btn::Danger, blocker.is_none(), "전체 재구축…");
+            let r = match &blocker {
+                Some(b) => r.on_disabled_hover_text(b),
+                None => r,
+            };
+            if r.clicked() {
+                self.confirm_rebuild = true;
+            }
+        });
     }
 }
 

@@ -43,6 +43,17 @@ impl Pack {
         }
     }
 
+    /// 쉬운 말로 된 이름 (일반 설정, 처음 설정)
+    pub fn plain_label(self) -> &'static str {
+        match self {
+            Pack::Model => "AI 모델 (865MB)",
+            Pack::LlamaCuda13 => "llama.cpp · NVIDIA 그래픽카드용 (597MB)",
+            Pack::LlamaCuda12 => "llama.cpp · NVIDIA 그래픽카드용, 예전 드라이버 (680MB)",
+            Pack::LlamaVulkan => "llama.cpp · AMD·Intel 그래픽카드용 (38MB)",
+            Pack::LlamaCpu => "llama.cpp · 그래픽카드 없이 (25MB, 느림)",
+        }
+    }
+
     /// 받을 폴더 (프로그램 폴더 기준)
     pub fn dest(self, app_dir: &Path) -> PathBuf {
         match self {

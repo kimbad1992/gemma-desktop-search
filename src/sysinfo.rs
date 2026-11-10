@@ -53,6 +53,24 @@ pub struct Plan {
     /// (수준, 항목, 설명)
     pub checks: Vec<(Level, String, String)>,
     pub summary: String,
+    /// 임베딩에 쓰는 장치: 그래픽카드 이름 또는 "CPU"
+    pub device: String,
+}
+
+impl Plan {
+    /// 쉬운 말로 된 한 줄 요약 (일반 설정)
+    pub fn plain_summary(&self) -> String {
+        if self.n_gpu_layers == 0 {
+            "그래픽카드 없이 처리합니다. 사진·영상이 많으면 오래 걸립니다.".to_string()
+        } else if self.ubatch_size >= 8192 {
+            format!("{} 그래픽카드로 빠르게 처리합니다.", self.device)
+        } else {
+            format!(
+                "{} 그래픽카드로 처리합니다. 그래픽 메모리가 적어 영상은 짧게 나눠 살펴봅니다.",
+                self.device
+            )
+        }
+    }
 }
 
 fn vendor_of(name: &str) -> Vendor {
@@ -326,6 +344,7 @@ pub fn recommend(info: &SysInfo) -> Plan {
         workers: if ngl == 0 { 2 } else { 4 },
         checks,
         summary,
+        device: gpu_line,
     }
 }
 
@@ -360,6 +379,11 @@ mod tests {
         assert_eq!(recommend(&info(vec![amd])).llama, Pack::LlamaVulkan);
         let p = recommend(&info(vec![]));
         assert_eq!((p.llama, p.n_gpu_layers), (Pack::LlamaCpu, 0));
+        // 쉬운 말 요약: 장치 이름이 들어가고, 그래픽카드가 없으면 그렇게 말한다
+        assert!(p.plain_summary().contains("그래픽카드 없이"));
+        let p = recommend(&info(vec![nv(24564, "621.14")]));
+        assert!(p.plain_summary().starts_with("NVIDIA GeForce RTX 그래픽카드로 빠르게"));
+        assert!(recommend(&info(vec![nv(4096, "560.94")])).plain_summary().contains("짧게 나눠"));
         assert_eq!(driver_major("621.14"), Some(621));
         assert_eq!(vendor_of("Intel(R) Arc(TM) A770"), Vendor::Intel);
     }

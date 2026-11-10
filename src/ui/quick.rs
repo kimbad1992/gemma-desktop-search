@@ -15,9 +15,10 @@ const ROW_H: f32 = 52.0;
 impl GemmaApp {
     pub fn quick_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let accent = crate::ui::theme::palette(ui.visuals()).accent;
         let frame = egui::Frame::new()
             .fill(ui.visuals().panel_fill)
-            .stroke(egui::Stroke::new(1.0, widgets::BLUE.gamma_multiply(0.6)))
+            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.7)))
             .inner_margin(12);
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             // ── 입력 ──
@@ -27,7 +28,7 @@ impl GemmaApp {
                     egui::TextEdit::singleline(&mut self.query)
                         .id(egui::Id::unique(SEARCH_BOX))
                         .hint_text("찾고 싶은 내용을 설명하세요 (사진, 영상, 문서, 소리)")
-                        .font(egui::FontId::proportional(20.0))
+                        .font(crate::ui::theme::query_font())
                         .desired_width(ui.available_width() - 120.0)
                         .frame(egui::Frame::NONE),
                 );
@@ -79,11 +80,15 @@ impl GemmaApp {
                 });
             });
             ui.separator();
+            // 아래에 늘 보이는 단축키 안내
+            egui::Panel::bottom("quick_hint").show(ui, |ui| {
+                widgets::caption(ui, "↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Ctrl+O 큰 창 · Esc 닫기");
+            });
 
             // ── 결과 ──
             let Some(outcome) = self.outcome.take() else {
                 ui.add_space(12.0);
-                ui.label(RichText::new("입력하는 대로 찾습니다. ↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Esc 닫기").weak());
+                ui.label(RichText::new("입력하는 대로 찾습니다.").weak());
                 return;
             };
             let min = self.cfg.min_relevance;
@@ -133,8 +138,9 @@ impl GemmaApp {
 
     fn quick_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sec: Section, hv: &HitView) {
         let is_sel = self.selected == Some((sec, hv.hit.file_id));
+        let p = crate::ui::theme::palette(ui.visuals());
         let resp = egui::Frame::new()
-            .fill(if is_sel { widgets::BLUE.gamma_multiply(0.25) } else { egui::Color32::TRANSPARENT })
+            .fill(if is_sel { p.accent_soft } else { egui::Color32::TRANSPARENT })
             .corner_radius(6)
             .inner_margin(egui::Margin::symmetric(6, 4))
             .show(ui, |ui| {
@@ -148,7 +154,7 @@ impl GemmaApp {
                             egui::Image::new(&t).corner_radius(4).paint_at(ui, rect);
                         }
                         None => {
-                            ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+                            ui.painter().rect_filled(rect, 4.0, p.inset_fill);
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -159,21 +165,21 @@ impl GemmaApp {
                         }
                     }
                     ui.vertical(|ui| {
+                        use crate::ui::theme::{self, Tone};
                         ui.horizontal(|ui| {
-                            ui.add(egui::Label::new(RichText::new(&hv.file_name).strong()).truncate());
+                            ui.add(
+                                egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_strong()).strong())
+                                    .truncate(),
+                            );
                         });
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("관련도 {:.1}", hv.hit.score))
-                                    .small()
-                                    .color(crate::ui::search_panel::score_color(hv.hit.score)),
-                            );
+                            widgets::score_bar(ui, hv.hit.score, widgets::ScoreStyle::Compact);
                             ui.label(RichText::new(sec.label()).small().weak());
                             if let Some(l) = locator_label(hv) {
-                                ui.label(RichText::new(l).small().color(widgets::BLUE));
+                                ui.label(RichText::new(l).small().color(Tone::Info.fg(ui.visuals())));
                             }
                             if hv.keyword_match() {
-                                ui.label(RichText::new("검색어 포함").small().color(widgets::GREEN));
+                                ui.label(RichText::new("검색어 포함").small().color(Tone::Ok.fg(ui.visuals())));
                             }
                         });
                     });

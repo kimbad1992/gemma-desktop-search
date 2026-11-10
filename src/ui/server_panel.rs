@@ -1,150 +1,163 @@
-//! 서버 탭: 시작/중지, 상태, 자가진단, 로그
+//! 서버 탭: 상태와 시작/중지, 기능 점검(자가진단), 상세 정보, 로그
 
 use crate::app::GemmaApp;
+use crate::embed::selftest::Check;
 use crate::server::{SelfTest, ServerState};
-use crate::ui::widgets;
+use crate::ui::theme::{self, palette, space, Tone};
+use crate::ui::widgets::{self, Btn};
 use crate::util::fmt_dur;
 use eframe::egui::{self, RichText};
 
+/// 머리 카드에서 누른 버튼
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Act {
+    None,
+    Start,
+    Stop,
+    Restart,
+    Connect,
+}
+
+/// 상세 정보의 한 줄: 이름 | 값 (길면 잘리고, 마우스를 올리면 전체가 보인다)
+fn detail_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    const KEY_W: f32 = 76.0;
+    ui.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(KEY_W, ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.set_min_width(KEY_W);
+                ui.label(RichText::new(key).weak());
+            },
+        );
+        ui.add(egui::Label::new(value).truncate()).on_hover_text(value);
+    });
+}
+
+fn check_tone(c: &Check) -> (Tone, &'static str) {
+    match c {
+        Check::Ok(_) => (Tone::Ok, "사용 가능"),
+        Check::Warn(_) => (Tone::Warn, "주의"),
+        Check::Fail(_) => (Tone::Danger, "사용 불가"),
+        Check::Skipped(_) => (Tone::Muted, "건너뜀"),
+    }
+}
+
 impl GemmaApp {
     pub fn server_tab(&mut self, ui: &mut egui::Ui) {
-        let (state, pid, started, ready, port, cmdline, selftest) = {
-            let s = self.server.shared.lock();
-            (
-                s.state.clone(),
-                s.pid,
-                s.started_at,
-                s.ready_at,
-                s.port,
-                s.command_line.clone(),
-                s.selftest.clone(),
-            )
-        };
-
-        ui.horizontal(|ui| {
-            let pulse = matches!(state, ServerState::Starting | ServerState::Loading);
-            widgets::badge(ui, widgets::server_color(&state), state.label(), true, pulse);
-            if pulse {
-                ui.spinner();
+        // 로그 영역 높이: 화면이 스크롤되므로 창 높이에 맞춰 제한한다
+        let log_h = (ui.available_height() * 0.45).clamp(220.0, 520.0);
+        widgets::page(ui, "server_page", theme::DASH_W, |ui| {
+            self.server_header(ui);
+            if ui.available_width() >= 900.0 {
+                ui.columns(2, |cols| {
+                    self.server_checks(&mut cols[0]);
+                    self.server_details(&mut cols[1]);
+                });
+            } else {
+                self.server_checks(ui);
+                self.server_details(ui);
             }
-            ui.add_space(16.0);
-            let running = state.is_running();
-            if ui
-                .add_enabled(!running && state != ServerState::External, egui::Button::new(RichText::new("▶ 서버 시작").size(15.0)))
-                .clicked()
-            {
-                self.start_server_manual();
-            }
-            if ui
-                .add_enabled(running || state == ServerState::External, egui::Button::new(RichText::new("■ 중지").size(15.0)))
-                .on_hover_text("llama-server 프로세스를 종료합니다 (외부 서버는 연결만 해제)")
-                .clicked()
-            {
-                self.stop_server();
-            }
-            if ui
-                .add_enabled(running, egui::Button::new(RichText::new("⟳ 재시작").size(15.0)))
-                .clicked()
-            {
-                self.stop_server();
-                self.start_server_manual();
-            }
-            if ui
-                .add_enabled(!running && state != ServerState::External, egui::Button::new("외부 서버 연결"))
-                .on_hover_text("이미 같은 포트에서 실행 중인 llama-server를 그대로 사용")
-                .clicked()
-            {
-                match self.server.connect_external(&self.cfg) {
-                    Ok(()) => self.notify("외부 서버에 연결했습니다", false),
-                    Err(e) => self.notify(e.to_string(), true),
-                }
-            }
+            self.server_log(ui, log_h);
         });
+    }
 
-        if let ServerState::Failed(msg) = &state {
-            ui.add_space(6.0);
-            egui::Frame::new()
-                .fill(widgets::RED.gamma_multiply(0.12))
-                .stroke(egui::Stroke::new(1.0, widgets::RED))
-                .corner_radius(6)
-                .inner_margin(8)
-                .show(ui, |ui| {
-                    ui.colored_label(widgets::RED, RichText::new(msg).strong());
-                });
-        }
+    /// 상태 배지, 한 줄 설명, 상황에 맞는 버튼
+    fn server_header(&mut self, ui: &mut egui::Ui) {
+        let (state, started, ready, port) = {
+            let s = self.server.shared.lock();
+            (s.state.clone(), s.started_at, s.ready_at, s.port)
+        };
+        let running = state.is_running();
+        let external = state == ServerState::External;
+        let busy = matches!(state, ServerState::Starting | ServerState::Loading);
+        let mut act = Act::None;
 
-        ui.add_space(8.0);
-        widgets::section_frame(ui, |ui| {
-            egui::Grid::new("server_info").num_columns(2).spacing([16.0, 6.0]).show(ui, |ui| {
-                ui.label(RichText::new("실행 파일").weak());
-                match crate::server::resolve_binary(&self.cfg.llama_path) {
-                    Ok((p, serve)) => ui.label(format!(
-                        "{}{}",
-                        p.display(),
-                        if serve { "  (llama serve 모드)" } else { "" }
-                    )),
-                    Err(e) => ui.colored_label(widgets::RED, e.to_string()),
-                };
-                ui.end_row();
-                ui.label(RichText::new("모델").weak());
-                ui.label(&self.cfg.model_path);
-                ui.end_row();
-                ui.label(RichText::new("mmproj").weak());
-                ui.label(if self.cfg.has_mmproj() {
-                    self.cfg.mmproj_path.as_str()
-                } else {
-                    "(없음 — 텍스트 전용)"
-                });
-                ui.end_row();
-                ui.label(RichText::new("주소").weak());
-                ui.label(format!(
-                    "http://127.0.0.1:{}",
-                    if port != 0 { port } else { self.cfg.port }
-                ));
-                ui.end_row();
-                ui.label(RichText::new("PID").weak());
-                ui.label(pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()));
-                ui.end_row();
-                ui.label(RichText::new("가동 시간").weak());
-                ui.label(match (started, state.is_ready() || state.is_running()) {
-                    (Some(t), true) => fmt_dur(t.elapsed()),
-                    _ => "-".into(),
-                });
-                ui.end_row();
-                ui.label(RichText::new("준비까지").weak());
-                ui.label(match (started, ready) {
-                    (Some(s), Some(r)) => format!("{:.1}초", (r - s).as_secs_f32()),
-                    _ => "-".into(),
-                });
-                ui.end_row();
-            });
-            if !cmdline.is_empty() {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("명령줄").weak());
-                    if ui.small_button("복사").clicked() {
-                        ui.ctx().copy_text(cmdline.clone());
+        widgets::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                widgets::tone_badge(ui, widgets::server_tone(&state), state.label(), true, busy);
+                if busy {
+                    ui.spinner();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 오른쪽부터 놓인다: 가장 중요한 버튼을 먼저
+                    if external {
+                        if widgets::button(ui, Btn::Secondary, "연결 해제")
+                            .on_hover_text("외부 서버는 그대로 두고 연결만 끊습니다")
+                            .clicked()
+                        {
+                            act = Act::Stop;
+                        }
+                    } else if running {
+                        if widgets::button(ui, Btn::Secondary, "■ 중지")
+                            .on_hover_text("llama-server 프로세스를 종료합니다")
+                            .clicked()
+                        {
+                            act = Act::Stop;
+                        }
+                        if widgets::button(ui, Btn::Secondary, "⟳ 재시작").clicked() {
+                            act = Act::Restart;
+                        }
+                    } else {
+                        if widgets::button(ui, Btn::Primary, "▶ 서버 시작").clicked() {
+                            act = Act::Start;
+                        }
+                        if widgets::button(ui, Btn::Ghost, "외부 서버 연결")
+                            .on_hover_text("이미 같은 포트에서 실행 중인 llama-server를 그대로 사용합니다")
+                            .clicked()
+                        {
+                            act = Act::Connect;
+                        }
                     }
                 });
-                ui.add(egui::Label::new(RichText::new(&cmdline).monospace().size(11.0)).wrap());
+            });
+            widgets::help(ui, "AI 모델을 돌리는 llama.cpp 서버입니다. 검색·인덱싱할 때 자동으로 켜집니다.");
+            let mut line = format!("http://127.0.0.1:{}", if port != 0 { port } else { self.cfg.port });
+            if let (Some(t), true) = (started, running) {
+                line += &format!(" · 가동 {}", fmt_dur(t.elapsed()));
+            }
+            if let (Some(s), Some(r)) = (started, ready) {
+                line += &format!(" · 준비까지 {:.1}초", (r - s).as_secs_f32());
+            }
+            widgets::caption(ui, &line);
+
+            if let ServerState::Failed(msg) = &state {
+                ui.add_space(space::XS);
+                widgets::callout(ui, Tone::Danger, "서버를 시작하지 못했습니다", msg);
             }
         });
 
-        ui.add_space(8.0);
-        widgets::section_frame(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("모달리티 자가진단").strong().size(15.0));
-                if ui
-                    .add_enabled(state.is_ready(), egui::Button::new("다시 진단"))
+        match act {
+            Act::None => {}
+            Act::Start => self.start_server_manual(),
+            Act::Stop => self.stop_server(),
+            Act::Restart => {
+                self.stop_server();
+                self.start_server_manual();
+            }
+            Act::Connect => match self.server.connect_external(&self.cfg) {
+                Ok(()) => self.notify("외부 서버에 연결했습니다", false),
+                Err(e) => self.notify(e.to_string(), true),
+            },
+        }
+    }
+
+    /// 기능 점검: 서버가 글·이미지·오디오를 실제로 처리하는지 (자가진단)
+    fn server_checks(&mut self, ui: &mut egui::Ui) {
+        let (state, selftest) = {
+            let s = self.server.shared.lock();
+            (s.state.clone(), s.selftest.clone())
+        };
+        let (rerun, ()) = widgets::section_with(
+            ui,
+            "기능 점검",
+            |ui| {
+                ui.add_enabled(state.is_ready(), egui::Button::new("다시 점검"))
+                    .on_hover_text("텍스트·이미지·오디오 임베딩을 다시 시험합니다")
                     .clicked()
-                {
-                    self.server.rerun_selftest();
-                }
-            });
-            match &selftest {
-                SelfTest::NotRun => {
-                    ui.label(RichText::new("서버가 준비되면 자동으로 실행됩니다").weak());
-                }
+            },
+            |ui| match &selftest {
+                SelfTest::NotRun => widgets::help(ui, "서버가 준비되면 자동으로 확인합니다."),
                 SelfTest::Running => {
                     ui.horizontal(|ui| {
                         ui.spinner();
@@ -152,62 +165,124 @@ impl GemmaApp {
                     });
                 }
                 SelfTest::Done(c) => {
-                    egui::Grid::new("caps").num_columns(3).spacing([16.0, 6.0]).show(ui, |ui| {
-                        for (name, chk) in [("텍스트", &c.text), ("이미지", &c.image), ("오디오", &c.audio)] {
-                            let (color, label) = widgets::check_style(chk);
-                            ui.label(RichText::new(name).strong());
-                            ui.colored_label(color, label);
-                            ui.label(RichText::new(chk.detail()).small());
-                            ui.end_row();
-                        }
-                    });
-                    ui.label(
-                        RichText::new(format!("임베딩 차원 {} · 진단 {}ms", c.dim, c.elapsed_ms))
-                            .small()
-                            .weak(),
-                    );
+                    for (name, chk) in [("텍스트", &c.text), ("이미지", &c.image), ("오디오", &c.audio)] {
+                        let (tone, label) = check_tone(chk);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(tone.fg(ui.visuals()), tone.icon());
+                            ui.label(RichText::new(name).text_style(theme::ts_strong()).strong());
+                            widgets::tone_label(ui, tone, label);
+                        });
+                        widgets::caption(ui, &chk.detail());
+                    }
+                    ui.add_space(space::XS);
+                    widgets::caption(ui, &format!("임베딩 차원 {} · 점검 {}ms", c.dim, c.elapsed_ms));
                 }
-            }
-        });
+            },
+        );
+        if rerun {
+            self.server.rerun_selftest();
+        }
+    }
 
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("서버 로그").strong());
-            if ui.small_button("복사").clicked() {
-                let all: Vec<String> = self.server.logs.lock().iter().cloned().collect();
-                ui.ctx().copy_text(all.join("\n"));
+    /// 상세 정보: 경로, 주소, 프로세스, 명령줄
+    fn server_details(&mut self, ui: &mut egui::Ui) {
+        let (state, pid, started, cmdline) = {
+            let s = self.server.shared.lock();
+            (s.state.clone(), s.pid, s.started_at, s.command_line.clone())
+        };
+        widgets::section(ui, "상세 정보", None, |ui| {
+            match crate::server::resolve_binary(&self.cfg.llama_path) {
+                Ok((p, serve)) => detail_row(
+                    ui,
+                    "실행 파일",
+                    &format!("{}{}", p.display(), if serve { "  (llama serve 모드)" } else { "" }),
+                ),
+                Err(e) => detail_row(ui, "실행 파일", &format!("✖ {e}")),
             }
-            if ui.small_button("지우기").clicked() {
-                self.server.logs.lock().clear();
+            detail_row(ui, "모델", &self.cfg.model_path);
+            detail_row(
+                ui,
+                "mmproj",
+                if self.cfg.has_mmproj() {
+                    self.cfg.mmproj_path.as_str()
+                } else {
+                    "(없음: 텍스트 전용)"
+                },
+            );
+            detail_row(ui, "PID", &pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()));
+            detail_row(
+                ui,
+                "가동 시간",
+                &match (started, state.is_ready() || state.is_running()) {
+                    (Some(t), true) => fmt_dur(t.elapsed()),
+                    _ => "-".into(),
+                },
+            );
+            if !cmdline.is_empty() {
+                widgets::collapsing_section(ui, "server_cmdline", "명령줄", false, |ui| {
+                    if ui.small_button("복사").clicked() {
+                        ui.ctx().copy_text(cmdline.clone());
+                    }
+                    ui.add(egui::Label::new(RichText::new(&cmdline).monospace()).wrap());
+                });
             }
         });
+    }
+
+    /// 서버 로그 (높이 제한, 아래에 붙어 따라간다)
+    fn server_log(&mut self, ui: &mut egui::Ui, height: f32) {
         let lines: Vec<String> = self.server.logs.lock().iter().cloned().collect();
-        let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
-            .corner_radius(6)
-            .inner_margin(6)
-            .show(ui, |ui| {
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show_rows(ui, row_h, lines.len(), |ui, range| {
-                        for line in &lines[range] {
-                            let color = if line.starts_with("[앱]") {
-                                widgets::BLUE
-                            } else if line.contains(" E ") || line.to_lowercase().contains("error") {
-                                widgets::RED
-                            } else if line.contains(" W ") {
-                                widgets::ORANGE
-                            } else {
-                                ui.visuals().text_color()
-                            };
-                            ui.add(
-                                egui::Label::new(RichText::new(line).monospace().size(11.5).color(color))
-                                    .extend(),
-                            );
-                        }
+        let ((copy, clear), ()) = widgets::section_with(
+            ui,
+            "서버 로그",
+            |ui| {
+                // 오른쪽부터 놓인다
+                let clear = ui.small_button("지우기").clicked();
+                let copy = ui.small_button("복사").clicked();
+                (copy, clear)
+            },
+            |ui| {
+                let p = palette(ui.visuals());
+                let (accent, danger, warn, text) = (
+                    p.accent,
+                    Tone::Danger.fg(ui.visuals()),
+                    Tone::Warn.fg(ui.visuals()),
+                    ui.visuals().text_color(),
+                );
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                egui::Frame::new()
+                    .fill(p.inset_fill)
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_SM))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        // 바깥 화면이 스크롤되므로 높이를 고정해 준다 (안 그러면 내용 높이만큼만 잡힌다)
+                        ui.set_height(height);
+                        egui::ScrollArea::both()
+                            .id_salt("server_log")
+                            .auto_shrink([false, false])
+                            .stick_to_bottom(true)
+                            .show_rows(ui, row_h, lines.len(), |ui, range| {
+                                for line in &lines[range] {
+                                    let color = if line.starts_with("[앱]") {
+                                        accent
+                                    } else if line.contains(" E ") || line.to_lowercase().contains("error") {
+                                        danger
+                                    } else if line.contains(" W ") {
+                                        warn
+                                    } else {
+                                        text
+                                    };
+                                    ui.add(egui::Label::new(RichText::new(line).monospace().color(color)).extend());
+                                }
+                            });
                     });
-            });
+            },
+        );
+        if copy {
+            ui.ctx().copy_text(lines.join("\n"));
+        }
+        if clear {
+            self.server.logs.lock().clear();
+        }
     }
 }
