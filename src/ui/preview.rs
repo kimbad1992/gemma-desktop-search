@@ -84,7 +84,11 @@ impl GemmaApp {
             if widgets::button(ui, Btn::Secondary, "파일 복사").on_hover_text("Ctrl+C").clicked() {
                 self.copy_file(&hv.hit.path);
             }
-            if widgets::button(ui, Btn::Ghost, "✕").on_hover_text("미리보기 닫기").clicked() {
+            // 빠른 검색창은 고른 줄의 미리보기를 늘 보여 주므로 닫기 버튼을 두지 않는다
+            // (선택을 풀어도 바로 첫 줄이 다시 선택돼 아무 일도 일어나지 않는다). 큰 창에서만 보인다.
+            if self.quick.is_none()
+                && widgets::button(ui, Btn::Ghost, "✕").on_hover_text("미리보기 닫기").clicked()
+            {
                 self.selected = None;
             }
         });

@@ -1,6 +1,6 @@
 [package]
 name = "gemma-search"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
