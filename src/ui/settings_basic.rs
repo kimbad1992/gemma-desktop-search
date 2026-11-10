@@ -452,6 +452,43 @@ impl GemmaApp {
             );
             widgets::toggle_row(
                 ui,
+                &mut c.watch_folders,
+                "폴더 감시",
+                "검색 폴더의 파일이 생기거나 바뀌거나 지워지면 그 파일만 자동으로 검색 자료에 반영합니다",
+            );
+            if c.watch_folders {
+                // 네트워크 폴더는 바로 반영된다고 약속할 수 없다: 한계를 늘 보이게 둔다
+                let network = c.roots.iter().filter(|r| crate::watch::is_network(r)).count();
+                if network > 0 {
+                    let every = if c.watch_rescan_hours > 0 {
+                        format!("{}시간마다", c.watch_rescan_hours)
+                    } else {
+                        "앱을 켤 때".to_string()
+                    };
+                    widgets::callout(
+                        ui,
+                        Tone::Warn,
+                        &format!("네트워크 폴더 {network}개는 바로 반영되지 않을 수 있습니다"),
+                        &format!(
+                            "NAS에 따라 변경 알림이 오지 않거나 일부가 빠집니다. 그래서 {every} 폴더를 훑어 바뀐 파일을 찾습니다. \
+                             반영이 그만큼 늦을 수 있고, 훑는 동안 NAS를 읽습니다. 급하면 인덱스 화면의 '지금 확인'을 누르세요."
+                        ),
+                    );
+                }
+                widgets::collapsing_section(ui, "basic_watch_notes", "폴더 감시에서 알아 둘 점", false, |ui| {
+                    for line in [
+                        "파일이 바뀌면 서버가 자동으로 켜지고 그래픽카드를 씁니다. 전체 화면 앱(게임·영상·발표)을 쓰는 동안은 미룹니다.",
+                        "복사나 다운로드가 끝나 15초쯤 조용해진 뒤에 반영합니다. 계속 쓰이는 파일은 10분에 한 번만 반영합니다.",
+                        "앱이 꺼져 있던 동안 바뀐 파일은 다음에 켰을 때 폴더를 훑어서 찾습니다.",
+                        "옮기거나 이름만 바꾼 파일은 내용을 다시 읽지 않고 경로만 고칩니다.",
+                        "저장한 뒤에 적용됩니다.",
+                    ] {
+                        widgets::status_line(ui, Tone::Info, line);
+                    }
+                });
+            }
+            widgets::toggle_row(
+                ui,
                 &mut c.index_overlay,
                 "작업 중 작은 알림 창",
                 "검색 준비를 하는 동안 화면 오른쪽 아래에 진행 상황을 보여 줍니다",

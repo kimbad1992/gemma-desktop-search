@@ -94,6 +94,11 @@ pub struct Config {
     pub setup_done: bool,
     /// 인덱싱 중 앱 창을 보고 있지 않으면 화면 오른쪽 아래에 상태 창
     pub index_overlay: bool,
+    /// 폴더 감시: 검색 폴더의 파일이 생기거나 바뀌거나 지워지면 그 파일만 자동으로 인덱싱
+    pub watch_folders: bool,
+    /// 폴더를 훑어 인덱스와 비교하는 주기(시간). 변경 알림이 오지 않는 네트워크 폴더와 놓친 알림을 찾는다.
+    /// 0 = 켤 때 한 번만
+    pub watch_rescan_hours: u32,
 }
 
 impl Default for Config {
@@ -190,6 +195,8 @@ impl Default for Config {
             last_update_check: 0,
             setup_done: false,
             index_overlay: true,
+            watch_folders: false,
+            watch_rescan_hours: 6,
         }
     }
 }

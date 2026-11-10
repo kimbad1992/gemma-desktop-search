@@ -428,6 +428,16 @@ impl GemmaApp {
                 });
 
                 ui.add_space(space::S);
+                ui.checkbox(&mut c.watch_folders, "폴더 감시: 파일이 바뀌면 그 파일만 자동으로 인덱싱");
+                ui.horizontal(|ui| {
+                    ui.label("폴더를 훑어 확인하는 주기");
+                    ui.add(egui::DragValue::new(&mut c.watch_rescan_hours).range(0..=168).suffix("시간"));
+                    ui.label("(0 = 켤 때 한 번만)");
+                })
+                .response
+                .on_hover_text("변경 알림이 오지 않는 네트워크 폴더와 놓친 알림을 찾으려고, 폴더를 훑어 인덱스와 비교합니다. 서버 없이 크기와 수정 시각만 봅니다.");
+
+                ui.add_space(space::S);
                 widgets::subheading(ui, "제외할 폴더 이름");
                 widgets::caption(ui, "한 줄에 하나, 대소문자 무시. 이름이 같은 폴더는 어디에 있든 건너뜁니다.");
                 if ui

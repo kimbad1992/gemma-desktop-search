@@ -31,6 +31,7 @@ impl GemmaApp {
         widgets::page(ui, "index_page", theme::DASH_W, |ui| {
             self.index_header(ui);
             self.index_run_stats(ui);
+            self.index_watch(ui);
             if ui.available_width() >= 900.0 {
                 ui.columns(2, |cols| {
                     self.index_kinds(&mut cols[0]);
@@ -56,6 +57,7 @@ impl GemmaApp {
         widgets::card(ui, |ui| {
             ui.horizontal(|ui| {
                 let label = match p.state {
+                    RunState::Running if p.targeted => "바뀐 파일 반영 중",
                     RunState::Running if p.full_rebuild && p.scanning => "전체 재구축 중 (폴더 탐색 중)",
                     RunState::Running if p.full_rebuild => "전체 재구축 중",
                     RunState::Running if p.scanning => "인덱싱 진행 중 (폴더 탐색 중)",
@@ -200,6 +202,9 @@ impl GemmaApp {
             widgets::stat_card(ui, "이름만 인덱싱", &fmt_num(p.name_only), muted);
             widgets::stat_card(ui, "오류", &fmt_num(p.errors), if p.errors > 0 { Tone::Danger.fg(&v) } else { muted });
             widgets::stat_card(ui, "벡터(청크)", &fmt_num(p.chunks), Tone::Info.fg(&v));
+            if p.moved > 0 {
+                widgets::stat_card(ui, "옮김 반영", &fmt_num(p.moved), Tone::Info.fg(&v));
+            }
             if p.removed > 0 {
                 widgets::stat_card(ui, "삭제 반영", &fmt_num(p.removed), Tone::Warn.fg(&v));
             }
@@ -237,6 +242,72 @@ impl GemmaApp {
             });
             widgets::caption(ui, "발견·인덱싱됨은 이번 실행, 전체는 지금 인덱스에 들어 있는 파일 수입니다.");
         });
+    }
+
+    /// 폴더 감시 상태: 폴더별로 변경 알림을 받는지, 네트워크 폴더의 한계, 대기 중인 변경, 다음 확인 시각
+    fn index_watch(&mut self, ui: &mut egui::Ui) {
+        let Some(w) = &self.watcher else { return };
+        let snap = w.snapshot();
+        let hours = self.saved_cfg.watch_rescan_hours;
+        let (scan_now, ()) = widgets::section_with(
+            ui,
+            "폴더 감시",
+            |ui| {
+                widgets::small_button(ui, Btn::Secondary, "지금 확인")
+                    .on_hover_text("폴더를 훑어 인덱스와 비교하고, 바뀐 파일이 있으면 반영합니다. 서버 없이 크기와 수정 시각만 봅니다.")
+                    .clicked()
+            },
+            |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if snap.scanning {
+                        widgets::spinner(ui);
+                        ui.label("폴더를 훑어 바뀐 파일을 찾는 중…");
+                    } else if snap.pending > 0 {
+                        widgets::tone_badge(ui, Tone::Info, &format!("바뀐 경로 {}개 대기", fmt_num(snap.pending as u64)), false, false);
+                        widgets::caption(ui, "조용해지면 반영합니다 (전체 화면 앱을 쓰는 동안은 미룹니다)");
+                    } else {
+                        widgets::tone_badge(ui, Tone::Ok, "감시 중", false, false);
+                    }
+                    if let Some((at, n)) = snap.last_scan {
+                        widgets::caption(ui, &format!("마지막 확인 {} 전 · 바뀐 것 {}개", fmt_dur(at.elapsed()), fmt_num(n as u64)));
+                    }
+                    if let (Some(t), false) = (snap.next_scan, snap.scanning) {
+                        let left = t.saturating_duration_since(std::time::Instant::now());
+                        widgets::caption(ui, &format!("다음 확인 {} 뒤", fmt_dur(left)));
+                    }
+                });
+                ui.add_space(space::XS);
+                for r in &snap.roots {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = 22.0;
+                        let (tone, text) = match (&r.error, r.network) {
+                            _ if r.registering => (Tone::Muted, "확인 중…"),
+                            (Some(_), _) => (Tone::Danger, "변경 알림 없음 · 주기적으로만 확인"),
+                            (None, true) => (Tone::Warn, "네트워크 · 늦게 반영될 수 있음"),
+                            (None, false) => (Tone::Ok, "바로 반영"),
+                        };
+                        let tag = widgets::tone_tag(ui, tone, text);
+                        if let Some(e) = &r.error {
+                            tag.on_hover_text(e);
+                        }
+                        ui.add(egui::Label::new(&r.path).truncate());
+                    });
+                }
+                if let Some(note) = &snap.scan_note {
+                    widgets::tone_note(ui, Tone::Warn, note);
+                }
+                if snap.roots.iter().any(|r| r.network || r.error.is_some()) {
+                    let every = if hours > 0 { format!("{hours}시간마다") } else { "앱을 켤 때".to_string() };
+                    widgets::caption(
+                        ui,
+                        &format!("네트워크 폴더는 NAS에 따라 변경 알림이 오지 않거나 빠집니다. {every} 폴더를 훑어 확인하므로, 반영이 그만큼 늦을 수 있습니다."),
+                    );
+                }
+            },
+        );
+        if scan_now {
+            w.scan_now();
+        }
     }
 
     /// 전체 인덱스 요약과 대상 폴더

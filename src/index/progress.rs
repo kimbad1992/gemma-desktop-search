@@ -39,6 +39,8 @@ pub struct Progress {
     /// 폴더 탐색이 아직 진행 중 (전체 개수 미확정)
     pub scanning: bool,
     pub full_rebuild: bool,
+    /// 폴더 감시가 알려 준 바뀐 파일만 처리하는 실행
+    pub targeted: bool,
     pub discovered: u64,
     pub discovered_by_kind: [u64; 6],
     /// 결과와 상관없이 처리가 끝난 파일 수
@@ -51,6 +53,8 @@ pub struct Progress {
     pub inaccessible: u64,
     pub chunks: u64,
     pub removed: u64,
+    /// 옮기거나 이름만 바꿔서, 내용은 다시 읽지 않고 경로만 고친 파일 수
+    pub moved: u64,
     pub current: String,
     pub started: Option<Instant>,
     pub finished: Option<Instant>,
@@ -67,6 +71,7 @@ impl Default for Progress {
             state: RunState::Idle,
             scanning: false,
             full_rebuild: false,
+            targeted: false,
             discovered: 0,
             discovered_by_kind: [0; 6],
             processed: 0,
@@ -78,6 +83,7 @@ impl Default for Progress {
             inaccessible: 0,
             chunks: 0,
             removed: 0,
+            moved: 0,
             current: String::new(),
             started: None,
             finished: None,

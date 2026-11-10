@@ -68,6 +68,7 @@ pub fn stress(args: &[String]) -> i32 {
                 data_dir: data_dir.clone(),
                 store: store.clone(),
                 full_rebuild: true,
+                only: None,
             })
             .unwrap();
         while indexer.is_active() {
@@ -149,6 +150,7 @@ pub fn index_once() -> i32 {
             data_dir: data_dir.clone(),
             store,
             full_rebuild: false,
+            only: None,
         })
         .unwrap();
     let mut last = Instant::now();
@@ -558,6 +560,7 @@ pub fn run(args: &[String]) -> i32 {
         data_dir: data_dir.clone(),
         store: store.clone(),
         full_rebuild: full,
+        only: None,
     };
 
     // 1회차: 일시정지/재개 확인 포함

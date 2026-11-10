@@ -72,6 +72,9 @@ pub struct IndexParams {
     pub data_dir: PathBuf,
     pub store: Arc<RwLock<VectorStore>>,
     pub full_rebuild: bool,
+    /// 바뀐 경로만 처리한다 (폴더 감시). 파일이면 그 파일, 폴더면 그 아래 전체, 없는 경로면 지워진 것으로 본다.
+    /// None이면 대상 폴더 전체를 훑는다.
+    pub only: Option<Vec<String>>,
 }
 
 pub struct Indexer {
@@ -105,7 +108,11 @@ impl Indexer {
         if !p.caps.text.usable() {
             bail!("서버 자가진단(텍스트)이 통과하지 않았습니다");
         }
-        self.progress.lock().reset_for_run(p.full_rebuild);
+        {
+            let mut g = self.progress.lock();
+            g.reset_for_run(p.full_rebuild);
+            g.targeted = p.only.is_some();
+        }
         self.control.set(RUN);
         let prog = self.progress.clone();
         let ctl = self.control.clone();
@@ -179,12 +186,40 @@ struct FileJob {
     size: i64,
     mtime: i64,
     kind: Kind,
+    /// 옮기거나 이름을 바꾼 파일로 보이면: 인덱스에 있던 항목의 (id, 옛 경로)
+    moved_from: Option<(i64, String)>,
 }
 
 struct WalkOutcome {
     seen: HashSet<String>,
     complete: bool,
     error_dirs: Vec<String>,
+    /// 바뀐 경로만 처리할 때: 지금은 없는 경로 (지워졌거나 옮겨 감). 소문자.
+    missing: Vec<String>,
+    /// 바뀐 경로만 처리할 때: 아래를 전부 훑은 폴더. 소문자.
+    walked_dirs: Vec<String>,
+}
+
+/// 워커가 기록 스레드로 넘기는 결과
+enum Done {
+    File(FileRecord),
+    /// 옮기거나 이름을 바꾼 파일: 내용 벡터는 그대로 두고 경로와 이름 벡터만 바꾼다
+    Moved {
+        id: i64,
+        path: String,
+        kind: Kind,
+        name: ChunkRecord,
+    },
+}
+
+/// `path`가 `base` 폴더 아래인지 (둘 다 소문자, base는 끝에 \ 없음)
+fn under(path: &str, base: &str) -> bool {
+    path.starts_with(base) && path[base.len()..].starts_with('\\')
+}
+
+/// 경로 비교용: 끝의 \를 떼고 소문자로
+fn norm(path: &str) -> String {
+    path.trim().trim_end_matches('\\').to_lowercase()
 }
 
 struct WorkerCtx {
@@ -300,8 +335,9 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     } else {
         HashSet::new()
     };
-    let reindex_text = db.meta_get("text_index_version").as_deref() != Some(TEXT_INDEX_VERSION)
-        && db.chunk_count()? > 0;
+    // 빈 인덱스에서 시작했으면, 이번에 넣는 것은 모두 새 방식이다 (바뀐 경로만 처리하는 실행이어도)
+    let was_empty = db.chunk_count()? == 0;
+    let reindex_text = db.meta_get("text_index_version").as_deref() != Some(TEXT_INDEX_VERSION) && !was_empty;
 
     let ctx = Arc::new(WorkerCtx {
         cfg: p.cfg.clone(),
@@ -326,17 +362,21 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     });
 
     let (job_tx, job_rx) = bounded::<FileJob>(512);
-    let (res_tx, res_rx) = bounded::<FileRecord>(32);
+    let (res_tx, res_rx) = bounded::<Done>(32);
 
     let walker = {
         let roots = p.cfg.roots.clone();
         let exclude = p.cfg.exclude_dirs.clone();
         let data_dir = p.data_dir.clone();
+        let only = p.only.clone();
+        let file_map = file_map.clone();
+        // 다시 처리해야 하는 실행에서는 옮긴 파일로 보지 않고 새로 처리한다
+        let allow_moves = !p.full_rebuild && !reindex_video && !reindex_text;
         let prog = prog.clone();
         let ctl = ctl.clone();
-        std::thread::Builder::new()
-            .name("walker".into())
-            .spawn(move || walk(&roots, &exclude, &data_dir, job_tx, &prog, &ctl))?
+        std::thread::Builder::new().name("walker".into()).spawn(move || {
+            walk(&roots, &exclude, &data_dir, only.as_deref(), &file_map, allow_moves, job_tx, &prog, &ctl)
+        })?
     };
 
     let n_workers = p.cfg.workers.clamp(1, 16);
@@ -355,8 +395,11 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     drop(job_rx);
 
     // 기록 루프: 모든 워커가 끝나면 채널이 닫힌다
-    for rec in res_rx.iter() {
-        write_record(&mut db, &p.store, prog, rec);
+    for done in res_rx.iter() {
+        match done {
+            Done::File(rec) => write_record(&mut db, &p.store, prog, rec),
+            Done::Moved { id, path, kind, name } => write_move(&mut db, &p.store, prog, id, path, kind, &name),
+        }
     }
     for w in workers {
         let _ = w.join();
@@ -384,13 +427,20 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
             .filter(|r| !r.is_empty())
             .collect();
         let err_dirs: Vec<String> = walk.error_dirs.iter().map(|d| d.to_lowercase()).collect();
-        let under = |pl: &str, base: &str| pl.starts_with(base) && pl[base.len()..].starts_with('\\');
+        let targeted = p.only.is_some();
         let stale: Vec<i64> = file_map
             .iter()
             .filter(|(path, _)| !walk.seen.contains(*path))
             .filter(|(path, _)| {
                 let pl = path.to_lowercase();
-                roots.iter().any(|r| under(&pl, r)) && !err_dirs.iter().any(|d| under(&pl, d))
+                // 바뀐 경로만 처리했으면: 없어진 경로(와 그 아래), 다시 훑은 폴더 아래에서 사라진 것만 지운다
+                let in_scope = if targeted {
+                    walk.missing.iter().any(|m| pl == *m || under(&pl, m))
+                        || walk.walked_dirs.iter().any(|d| under(&pl, d))
+                } else {
+                    true
+                };
+                in_scope && roots.iter().any(|r| under(&pl, r)) && !err_dirs.iter().any(|d| under(&pl, d))
             })
             .map(|(_, row)| row.id)
             .collect();
@@ -403,10 +453,13 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         }
         prog.lock().removed = stale.len() as u64;
     }
-    if ctx.video_native && walk.complete {
+    // "인덱스 전체가 새 방식이다"라는 표시는 대상 폴더 전체를 훑었거나 빈 인덱스에서 시작한 실행에서만 남긴다.
+    // (바뀐 경로만 처리한 실행은 나머지 파일이 예전 방식일 수 있다)
+    let all_new = p.only.is_none() || was_empty;
+    if ctx.video_native && walk.complete && all_new {
         db.meta_set("video_index_version", VIDEO_INDEX_VERSION)?;
     }
-    if walk.complete {
+    if walk.complete && all_new {
         db.meta_set("text_index_version", TEXT_INDEX_VERSION)?;
     }
     Ok(Outcome::Completed)
@@ -457,36 +510,144 @@ fn write_record(db: &mut Db, store: &RwLock<VectorStore>, prog: &Mutex<Progress>
     }
 }
 
-fn walk(
-    roots: &[String],
-    exclude: &[String],
-    data_dir: &Path,
-    tx: Sender<FileJob>,
+/// 옮기거나 이름을 바꾼 파일을 기록한다: DB의 경로와 이름 청크를 바꾸고, 검색용 저장소의 그 파일 항목을 다시 채운다
+fn write_move(
+    db: &mut Db,
+    store: &RwLock<VectorStore>,
     prog: &Mutex<Progress>,
-    ctl: &Control,
-) -> WalkOutcome {
-    let mut out = WalkOutcome {
-        seen: HashSet::new(),
-        complete: true,
-        error_dirs: Vec::new(),
-    };
-    let excl: Vec<String> = exclude
-        .iter()
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let data_lower = data_dir.to_string_lossy().to_lowercase();
-    'roots: for root in roots {
-        let root = root.trim();
-        if root.is_empty() {
-            continue;
+    id: i64,
+    path: String,
+    kind: Kind,
+    name: &ChunkRecord,
+) {
+    let result = db.move_file(id, &path, name).and_then(|_| db.file_vectors(id));
+    let mut g = prog.lock();
+    g.processed += 1;
+    match result {
+        Ok(rows) => {
+            g.moved += 1;
+            g.sample();
+            drop(g);
+            let entries = rows
+                .into_iter()
+                .map(|(chunk_id, modality, locator, vec)| {
+                    (
+                        Entry {
+                            chunk_id,
+                            file_id: id,
+                            modality,
+                            locator,
+                        },
+                        vec,
+                    )
+                })
+                .collect();
+            store.write().replace_file(id, FileInfo::new(path, kind), entries);
         }
-        if !Path::new(root).is_dir() {
-            prog.lock().add_error(root, "폴더가 존재하지 않습니다");
-            out.error_dirs.push(root.to_string());
-            continue;
+        Err(e) => g.add_error(&path, format!("옮긴 파일 기록 실패: {e}")),
+    }
+}
+
+/// 탐색 상태: 파일을 찾아 작업으로 보낸다
+struct Walker<'a> {
+    /// 대상 폴더 (소문자, 끝에 \ 없음)
+    roots: Vec<String>,
+    excl: Vec<String>,
+    data_lower: String,
+    tx: Sender<FileJob>,
+    prog: &'a Mutex<Progress>,
+    ctl: &'a Control,
+    file_map: &'a HashMap<String, FileRow>,
+    allow_moves: bool,
+    /// (크기, 수정 시각) → 인덱스에 있는 파일들 (경로, id). 새 파일이 처음 나왔을 때 만든다.
+    by_sig: Option<HashMap<(i64, i64), Vec<(String, i64)>>>,
+    /// 이미 옮긴 것으로 짝지은 항목
+    claimed: HashSet<i64>,
+    out: WalkOutcome,
+}
+
+impl Walker<'_> {
+    /// 파일 하나를 작업으로 보낸다. 받는 쪽이 닫혔으면 false.
+    fn emit(&mut self, path: &Path, md: &std::fs::Metadata) -> bool {
+        let path_s = path.to_string_lossy().to_string();
+        let size = md.len() as i64;
+        let mtime = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let kind = extract::classify(path);
+        {
+            let mut g = self.prog.lock();
+            g.discovered += 1;
+            g.discovered_by_kind[kind.idx()] += 1;
         }
-        let it = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+        let moved_from = if self.allow_moves && !self.file_map.contains_key(&path_s) {
+            self.find_move(path, size, mtime)
+        } else {
+            None
+        };
+        if let Some((_, old)) = &moved_from {
+            // 옛 경로의 항목은 지우지 않는다 (그 항목을 새 경로로 옮겨 쓴다)
+            self.out.seen.insert(old.clone());
+        }
+        self.out.seen.insert(path_s.clone());
+        self.tx
+            .send(FileJob {
+                path: path_s,
+                size,
+                mtime,
+                kind,
+                moved_from,
+            })
+            .is_ok()
+    }
+
+    /// 인덱스에 없는 새 경로가 옮기거나 이름을 바꾼 파일인지 본다. 크기와 수정 시각이 같고 옛 자리에는 더 없는
+    /// 항목 가운데, 이름이 같거나(다른 폴더로 옮김 · 폴더 이름 변경) 같은 폴더에서 확장자가 같은 것(이름 변경)을 고른다.
+    /// 복사한 파일은 옛 자리에 그대로 있으므로 해당하지 않는다.
+    fn find_move(&mut self, path: &Path, size: i64, mtime: i64) -> Option<(i64, String)> {
+        let name = path.file_name()?.to_string_lossy().to_lowercase();
+        let dir = path.parent().map(|d| d.to_string_lossy().to_lowercase());
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+        let file_map = self.file_map;
+        let by_sig = self.by_sig.get_or_insert_with(|| {
+            let mut m: HashMap<(i64, i64), Vec<(String, i64)>> = HashMap::new();
+            for (p, row) in file_map {
+                m.entry((row.size, row.mtime)).or_default().push((p.clone(), row.id));
+            }
+            m
+        });
+        let claimed = &self.claimed;
+        let cands = by_sig.get(&(size, mtime))?;
+        let free = |old: &str, id: &i64| !claimed.contains(id) && !Path::new(old).exists();
+        let same_name = |old: &str| {
+            Path::new(old)
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().to_lowercase() == name)
+        };
+        // 같은 폴더에서 이름만 바꾼 것: 빈 파일은 크기·시각이 우연히 같기 쉬우므로 뺀다
+        let renamed_here = |old: &str| {
+            let o = Path::new(old);
+            size > 0
+                && o.parent().map(|d| d.to_string_lossy().to_lowercase()) == dir
+                && o.extension().map(|e| e.to_string_lossy().to_lowercase()) == ext
+        };
+        let (old, id) = cands
+            .iter()
+            .find(|(old, id)| same_name(old) && free(old, id))
+            .or_else(|| cands.iter().find(|(old, id)| renamed_here(old) && free(old, id)))?
+            .clone();
+        self.claimed.insert(id);
+        Some((id, old))
+    }
+
+    /// 폴더 아래를 모두 훑는다. 중지됐거나 받는 쪽이 닫혔으면 false.
+    fn walk_dir(&mut self, dir: &Path) -> bool {
+        let excl = self.excl.clone();
+        let data_lower = self.data_lower.clone();
+        let it = WalkDir::new(dir).follow_links(false).into_iter().filter_entry(move |e| {
             if e.depth() == 0 || !e.file_type().is_dir() {
                 return true;
             }
@@ -497,16 +658,16 @@ fn walk(
             !e.path().to_string_lossy().to_lowercase().starts_with(&data_lower)
         });
         for entry in it {
-            if !ctl.checkpoint() {
-                out.complete = false;
-                break 'roots;
+            if !self.ctl.checkpoint() {
+                self.out.complete = false;
+                return false;
             }
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    prog.lock().inaccessible += 1;
+                    self.prog.lock().inaccessible += 1;
                     if let Some(p) = e.path() {
-                        out.error_dirs.push(p.to_string_lossy().to_string());
+                        self.out.error_dirs.push(p.to_string_lossy().to_string());
                     }
                     continue;
                 }
@@ -517,38 +678,128 @@ fn walk(
             let md = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => {
-                    prog.lock().inaccessible += 1;
+                    self.prog.lock().inaccessible += 1;
                     continue;
                 }
             };
-            let path = entry.path().to_string_lossy().to_string();
-            let mtime = md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let kind = extract::classify(entry.path());
-            {
-                let mut g = prog.lock();
-                g.discovered += 1;
-                g.discovered_by_kind[kind.idx()] += 1;
+            if !self.emit(entry.path(), &md) {
+                self.out.complete = false;
+                return false;
             }
-            out.seen.insert(path.clone());
-            let job = FileJob {
-                path,
-                size: md.len() as i64,
-                mtime,
-                kind,
-            };
-            if tx.send(job).is_err() {
-                out.complete = false;
-                break 'roots;
+        }
+        true
+    }
+
+    /// 바뀐 경로 하나: 대상 폴더 밖이거나 제외 폴더·데이터 폴더 아래면 건너뛴다.
+    /// 파일이면 그 파일, 폴더면 그 아래 전체, 없으면 지워진 것으로 적어 둔다. 중지됐으면 false.
+    fn target(&mut self, t: &str) -> bool {
+        if !self.ctl.checkpoint() {
+            self.out.complete = false;
+            return false;
+        }
+        let lower = norm(t);
+        if lower.starts_with(&self.data_lower) {
+            return true;
+        }
+        let Some(root) = self.roots.iter().find(|r| lower == **r || under(&lower, r)) else {
+            return true;
+        };
+        // 대상 폴더 아래의 폴더 이름 가운데 제외 목록에 있는 것이 있는지 (마지막 이름은 폴더일 때만 본다)
+        let parts: Vec<&str> = lower[root.len()..].split('\\').filter(|s| !s.is_empty()).collect();
+        let (last, dirs) = match parts.split_last() {
+            Some((last, dirs)) => (Some(*last), dirs),
+            None => (None, &parts[..]),
+        };
+        if dirs.iter().any(|d| self.excl.iter().any(|e| e == d)) {
+            return true;
+        }
+        let path = Path::new(t.trim());
+        match std::fs::metadata(path) {
+            Ok(md) if md.is_file() => {
+                if !self.emit(path, &md) {
+                    self.out.complete = false;
+                    return false;
+                }
+                true
+            }
+            Ok(md) if md.is_dir() => {
+                if last.is_some_and(|l| self.excl.iter().any(|e| e == l)) {
+                    return true;
+                }
+                self.out.walked_dirs.push(lower);
+                self.walk_dir(path)
+            }
+            _ => {
+                self.out.missing.push(lower);
+                true
+            }
+        }
+    }
+}
+
+/// 탐색: 대상 폴더 전체(`only`가 None) 또는 바뀐 경로들만(`only`) 훑어 작업으로 보낸다.
+#[allow(clippy::too_many_arguments)]
+fn walk(
+    roots: &[String],
+    exclude: &[String],
+    data_dir: &Path,
+    only: Option<&[String]>,
+    file_map: &HashMap<String, FileRow>,
+    allow_moves: bool,
+    tx: Sender<FileJob>,
+    prog: &Mutex<Progress>,
+    ctl: &Control,
+) -> WalkOutcome {
+    let mut w = Walker {
+        roots: roots.iter().map(|r| norm(r)).filter(|r| !r.is_empty()).collect(),
+        excl: exclude
+            .iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        data_lower: data_dir.to_string_lossy().to_lowercase(),
+        tx,
+        prog,
+        ctl,
+        file_map,
+        allow_moves,
+        by_sig: None,
+        claimed: HashSet::new(),
+        out: WalkOutcome {
+            seen: HashSet::new(),
+            complete: true,
+            error_dirs: Vec::new(),
+            missing: Vec::new(),
+            walked_dirs: Vec::new(),
+        },
+    };
+    match only {
+        Some(targets) => {
+            for t in targets {
+                if !w.target(t) {
+                    break;
+                }
+            }
+        }
+        None => {
+            for root in roots {
+                let root = root.trim();
+                if root.is_empty() {
+                    continue;
+                }
+                if !Path::new(root).is_dir() {
+                    prog.lock().add_error(root, "폴더가 존재하지 않습니다");
+                    w.out.error_dirs.push(root.to_string());
+                    continue;
+                }
+                if !w.walk_dir(Path::new(root)) {
+                    break;
+                }
             }
         }
     }
     prog.lock().scanning = false;
-    out
+    w.out
 }
 
 enum WorkErr {
@@ -558,7 +809,7 @@ enum WorkErr {
     Stopped,
 }
 
-fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
+fn worker(rx: Receiver<FileJob>, tx: Sender<Done>, ctx: Arc<WorkerCtx>) {
     while let Ok(job) = rx.recv() {
         if !ctx.ctl.checkpoint() {
             break;
@@ -595,7 +846,11 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<FileRecord>, ctx: Arc<WorkerCtx>) {
         }
         ctx.prog.lock().current = job.path.clone();
         ctx.inflight.lock().insert(job.path.clone());
-        let result = process_file(&ctx, &job);
+        // 옮기거나 이름만 바꾼 파일은 내용을 다시 읽지 않는다 (다시 처리해야 하는 종류는 새로 처리)
+        let result = match &job.moved_from {
+            Some((id, _)) if !ctx.full_rebuild && !force => process_move(&ctx, &job, *id),
+            _ => process_file(&ctx, &job).map(Done::File),
+        };
         if let Err(WorkErr::Fatal(_)) = &result {
             // 서버가 죽은 시점에 처리 중이던 파일들을 의심 파일로 남긴다 (자기 자신 포함)
             let snapshot: Vec<String> = ctx.inflight.lock().iter().cloned().collect();
@@ -649,6 +904,37 @@ fn disabled_reason(ctx: &WorkerCtx, kind: Kind) -> String {
     }
 }
 
+/// 파일 이름(과 폴더 이름)으로 찾기 위한 조각
+fn name_piece(path: &str) -> Piece {
+    let file_name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    Piece {
+        modality: Modality::Name,
+        locator: -1,
+        snippet: String::new(),
+        input: EmbedInput::Text(prompt::document(&file_name, path)),
+        thumb: None,
+        text: Some(keyword::name_body(path)),
+    }
+}
+
+/// 옮기거나 이름을 바꾼 파일: 이름 벡터만 새로 만든다 (내용 벡터는 그대로 쓴다)
+fn process_move(ctx: &WorkerCtx, job: &FileJob, id: i64) -> Result<Done, WorkErr> {
+    let (mut chunks, _failures) = embed_pieces(ctx, vec![name_piece(&job.path)])?;
+    match chunks.pop() {
+        Some(name) => Ok(Done::Moved {
+            id,
+            path: job.path.clone(),
+            kind: job.kind,
+            name,
+        }),
+        // 이름 벡터를 만들지 못했으면 새 파일로 처리한다 (옛 항목은 다음에 전체를 훑을 때 정리된다)
+        None => process_file(ctx, job).map(Done::File),
+    }
+}
+
 fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
     let path = Path::new(&job.path);
     let file_name = path
@@ -656,14 +942,7 @@ fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| job.path.clone());
 
-    let mut pieces = vec![Piece {
-        modality: Modality::Name,
-        locator: -1,
-        snippet: String::new(),
-        input: EmbedInput::Text(prompt::document(&file_name, &job.path)),
-        thumb: None,
-        text: Some(keyword::name_body(&job.path)),
-    }];
+    let mut pieces = vec![name_piece(&job.path)];
     let mut status = db::ST_OK;
     let mut error: Option<String> = None;
     let crash_count = ctx.suspects.get(&job.path).copied().unwrap_or(0);

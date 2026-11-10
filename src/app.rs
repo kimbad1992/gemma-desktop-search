@@ -261,6 +261,12 @@ pub struct GemmaApp {
     pub quick: Option<QuickState>,
     /// 화면 확인용 실행 (`--shot`)
     pub shot: Option<Shot>,
+    /// 폴더 감시 (설정에서 켰을 때만)
+    pub watcher: Option<crate::watch::Watcher>,
+    /// 감시가 알려 준 바뀐 경로 가운데, 서버가 준비되기를 기다리는 것
+    watch_batch: Vec<String>,
+    /// 감시 때문에 서버를 켜려고 한 마지막 시각 (서버가 뜨지 않을 때 계속 다시 켜지 않게)
+    watch_server_try: Option<Instant>,
     /// 업데이트 진행 상태 (받기·교체는 백그라운드 스레드가 한다)
     pub updater: crate::update::Shared,
     /// 마지막으로 처리한 업데이트 단계 (바뀌었을 때 한 번만 알리려고)
@@ -408,6 +414,9 @@ impl GemmaApp {
             keep_hidden_frames: if starts_hidden() { 4 } else { 0 },
             hidden_flag: Arc::new(AtomicBool::new(starts_hidden())),
             shot: Shot::from_args(),
+            watcher: None,
+            watch_batch: Vec::new(),
+            watch_server_try: None,
             updater: Default::default(),
             update_seen: Default::default(),
             shot_view: None,
@@ -1488,11 +1497,25 @@ impl GemmaApp {
     }
 
     pub fn start_index(&mut self, full_rebuild: bool) {
-        if let Some(why) = self.index_blocker() {
+        if let Err(why) = self.start_index_run(full_rebuild, None) {
             self.notify(why, true);
             return;
         }
-        let caps = self.server.capabilities().expect("checked");
+        if full_rebuild {
+            self.thumbs.clear();
+            self.outcome = None;
+        }
+        self.tab = Tab::Index;
+    }
+
+    /// 인덱싱을 시작한다. `only`가 있으면 그 경로만 처리한다 (폴더 감시). 시작할 수 없으면 이유를 돌려준다.
+    fn start_index_run(&mut self, full_rebuild: bool, only: Option<Vec<String>>) -> Result<(), String> {
+        if let Some(why) = self.index_blocker() {
+            return Err(why);
+        }
+        let Some(caps) = self.server.capabilities() else {
+            return Err("서버 자가진단이 끝나기를 기다리는 중".to_string());
+        };
         let params = IndexParams {
             cfg: self.cfg.clone(),
             caps,
@@ -1501,21 +1524,85 @@ impl GemmaApp {
             data_dir: self.data_dir.clone(),
             store: self.store.clone(),
             full_rebuild,
+            only,
         };
-        match self.indexer.start(params) {
-            Ok(()) => {
-                if full_rebuild {
-                    self.thumbs.clear();
-                    self.outcome = None;
-                }
-                self.tab = Tab::Index;
+        self.indexer.start(params).map_err(|e| format!("인덱싱 시작 실패: {e}"))
+    }
+
+    /// 폴더 감시: 설정에 맞춰 켜고 끄고, 바뀐 파일이 조용해지면 그 파일만 인덱싱한다.
+    /// 숨겨져 있을 때도 돈다 (`logic` → `poll`).
+    fn watch_tick(&mut self, ctx: &egui::Context) {
+        use crate::watch::{WatchKey, Watcher};
+        // 저장된 설정을 따른다 (설정 화면에서 고치는 중인 값은 저장한 뒤에 적용)
+        let c = &self.saved_cfg;
+        if !c.watch_folders || !c.setup_done || c.roots.is_empty() {
+            if self.watcher.take().is_some() {
+                self.watch_batch.clear();
+                self.server.log("[감시] 폴더 감시를 껐습니다");
             }
-            Err(e) => self.notify(format!("인덱싱 시작 실패: {e}"), true),
+            return;
+        }
+        let key = WatchKey::new(&c.roots, &c.exclude_dirs, c.watch_rescan_hours);
+        if self.watcher.as_ref().is_none_or(|w| w.key() != &key) {
+            let w = Watcher::start(key, &self.data_dir);
+            let snap = w.snapshot();
+            let network = snap.roots.iter().filter(|r| r.network).count();
+            self.server.log(format!(
+                "[감시] 폴더 {}개 감시 시작 (네트워크 {network}개)",
+                snap.roots.len()
+            ));
+            self.watcher = Some(w);
+            self.watch_batch.clear();
+        }
+        // 창이 그려지지 않는 동안에도 가끔 깨어나 확인한다
+        ctx.request_repaint_after(Duration::from_secs(2));
+        // 다른 인덱싱이 돌거나 준비가 안 됐으면 모아 두기만 한다
+        if self.indexer.is_active()
+            || self.auto_index
+            || self.setup_open
+            || self.pending_recover.is_some()
+            || self.store_loading.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        // 전체 화면 앱(게임·영상·발표)을 쓰는 동안은 그래픽카드를 쓰지 않게 미룬다
+        if self.overlay_user_busy() {
+            return;
+        }
+        let Some(w) = &self.watcher else { return };
+        if w.scan_due() {
+            w.start_scan(self.db_path.clone(), ctx.clone());
+        }
+        if self.watch_batch.is_empty() {
+            let ready = w.take_ready();
+            if !ready.is_empty() {
+                self.server
+                    .log(format!("[감시] 바뀐 경로 {}개를 반영합니다", ready.len()));
+                self.watch_batch = ready;
+            }
+        }
+        if self.watch_batch.is_empty() {
+            return;
+        }
+        let state = self.server.state();
+        if state.is_ready() {
+            if self.server.capabilities().is_none() {
+                return; // 자가진단이 끝나면 다음에
+            }
+            let batch = std::mem::take(&mut self.watch_batch);
+            if let Err(why) = self.start_index_run(false, Some(batch.clone())) {
+                self.server.log(format!("[감시] 시작하지 못해 다음에 다시 합니다: {why}"));
+                if let Some(w) = &self.watcher {
+                    w.requeue(batch);
+                }
+            }
+        } else if !state.is_running() && self.watch_server_try.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+            // 서버가 꺼져 있으면 켠다. 이렇게 켠 서버는 한동안 쓰지 않으면 다시 꺼진다 (설정의 자동 끄기).
+            self.watch_server_try = Some(Instant::now());
+            self.start_server_auto();
         }
     }
 
-    /// 인덱싱이 서버 충돌로 끝났으면 서버를 다시 띄우고 변경분 인덱싱으로 이어간다.
-    /// 처리 중이던 파일은 충돌 의심으로 기록되고, 같은 파일이 두 번 걸리면 건너뛴다.
     fn try_recover_indexing(&mut self) {
         let msg = self.indexer.progress.lock().message.clone();
         if self.cfg.auto_recover && msg.contains("서버 연결이 끊겼습니다") {
@@ -1781,8 +1868,9 @@ impl GemmaApp {
             }
         }
         self.poll_update(ctx);
+        self.watch_tick(ctx);
 
-        let (state, title_prefix, done_msg) = {
+        let (state, title_prefix, done_msg, watch_log) = {
             let p = self.indexer.progress.lock();
             let prefix = match p.state {
                 RunState::Running if p.scanning => format!("[탐색 중 {}개] ", fmt_num(p.discovered)),
@@ -1794,7 +1882,19 @@ impl GemmaApp {
                 RunState::Stopping => "[중지 중] ".to_string(),
                 _ => String::new(),
             };
+            // 폴더 감시가 돌린 실행은 알림을 띄우지 않고 로그에만 남긴다 (파일이 바뀔 때마다 뜨지 않게)
+            let watch_log = (p.targeted && p.state == RunState::Completed).then(|| {
+                format!(
+                    "[감시] 반영 완료: 처리 {} · 변경 없음 {} · 옮김 {} · 삭제 {} · 오류 {}",
+                    fmt_num(p.processed.saturating_sub(p.unchanged + p.moved)),
+                    fmt_num(p.unchanged),
+                    fmt_num(p.moved),
+                    fmt_num(p.removed),
+                    fmt_num(p.errors)
+                )
+            });
             let msg = match p.state {
+                RunState::Completed if p.targeted => None,
                 RunState::Completed => Some((
                     format!(
                         "인덱싱 완료: {}개 처리 (새로 인덱싱 {} · 변경 없음 {} · 오류 {})",
@@ -1809,11 +1909,14 @@ impl GemmaApp {
                 RunState::Failed => Some((format!("인덱싱 오류: {}", p.message), true)),
                 _ => None,
             };
-            (p.state, prefix, msg)
+            (p.state, prefix, msg, watch_log)
         };
         if state != self.last_index_state {
             if let Some((m, err)) = done_msg {
                 self.notify(m, err);
+            }
+            if let Some(line) = watch_log {
+                self.server.log(line);
             }
             match state {
                 RunState::Completed | RunState::Stopped => self.recover_attempts = 0,

@@ -368,6 +368,52 @@ impl Db {
         Ok((file_id, ids))
     }
 
+    /// 옮기거나 이름을 바꾼 파일: 경로를 바꾸고 이름 청크(이름 벡터와 키워드 본문)만 새로 넣는다.
+    /// 내용 청크와 썸네일은 그대로 둔다.
+    pub fn move_file(&mut self, id: i64, new_path: &str, name: &ChunkRecord) -> Result<()> {
+        let vec = if self.f16 {
+            vecmath::to_f16_bytes(&name.vec)
+        } else {
+            vecmath::to_bytes(&name.vec)
+        };
+        let tx = self.conn.transaction()?;
+        tx.execute("UPDATE files SET path=?2 WHERE id=?1", params![id, new_path])?;
+        // 예전 이름 청크를 지우면 트리거가 키워드 색인에서도 지운다
+        tx.execute(
+            "DELETE FROM chunks WHERE file_id=?1 AND modality=?2",
+            params![id, Modality::Name as i64],
+        )?;
+        tx.execute(
+            "INSERT INTO chunks(file_id,modality,locator,snippet,vec) VALUES(?1,?2,?3,?4,?5)",
+            params![id, name.modality as i64, name.locator, name.snippet, vec],
+        )?;
+        let cid = tx.last_insert_rowid();
+        if let Some(t) = name.text.as_deref().filter(|t| !t.trim().is_empty()) {
+            tx.execute("INSERT INTO fts(rowid, body) VALUES(?1,?2)", params![cid, t])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 파일 하나의 벡터 전부 (검색용 메모리 저장소의 그 파일 항목을 다시 채울 때)
+    pub fn file_vectors(&self, file_id: i64) -> Result<Vec<(i64, Modality, i64, Vec<f32>)>> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, modality, locator, vec FROM chunks WHERE file_id=?1 ORDER BY id")?;
+        let mut rows = st.query([file_id])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let blob: Vec<u8> = r.get(3)?;
+            out.push((
+                r.get(0)?,
+                Modality::from_u8(r.get::<_, i64>(1)? as u8),
+                r.get(2)?,
+                self.decode_vec(&blob),
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn delete_files(&mut self, ids: &[i64]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {

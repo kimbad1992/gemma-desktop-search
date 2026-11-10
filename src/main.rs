@@ -11,6 +11,7 @@ mod headless;
 mod shell;
 mod sysinfo;
 mod update;
+mod watch;
 mod index;
 mod open;
 mod precheck;

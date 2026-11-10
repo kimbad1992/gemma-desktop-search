@@ -32,8 +32,13 @@ impl GemmaApp {
         if !self.cfg.index_overlay || self.overlay_dismissed || self.setup_open || self.shot.is_some() {
             return false;
         }
-        let state = self.indexer.progress.lock().state;
-        if !matches!(state, RunState::Running | RunState::Paused | RunState::Stopping) {
+        let (state, brief) = {
+            let p = self.indexer.progress.lock();
+            // 폴더 감시가 돌린 실행은 금방 끝나는 일이 많다: 몇 초 넘게 걸릴 때만 띄운다
+            let brief = p.targeted && p.started.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(4));
+            (p.state, brief)
+        };
+        if brief || !matches!(state, RunState::Running | RunState::Paused | RunState::Stopping) {
             return false;
         }
         // 전체 화면 게임·영상·발표 중에는 숨긴다 (게임 위에 창이 뜨거나 포커스가 넘어가는 문제 방지)
@@ -47,7 +52,7 @@ impl GemmaApp {
     }
 
     /// 전체 화면 상태 확인 (1초에 한 번만 묻는다)
-    fn overlay_user_busy(&self) -> bool {
+    pub(crate) fn overlay_user_busy(&self) -> bool {
         let mut c = self.overlay_busy_cache.lock();
         if c.0.is_none_or(|t: std::time::Instant| t.elapsed() > std::time::Duration::from_secs(1)) {
             *c = (Some(std::time::Instant::now()), crate::shell::user_busy());
