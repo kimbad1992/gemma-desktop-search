@@ -174,6 +174,12 @@ pub struct GemmaApp {
     /// 선택한 결과 (섹션, 파일) — 오른쪽 미리보기, 키보드 이동
     pub selected: Option<(Section, i64)>,
     pub scroll_to_selected: bool,
+    /// 사용자가 결과를 직접 고른(↑↓·클릭) 때의 검색어. 같은 검색어의 결과가 다시 오면 고르던 줄을 지킨다.
+    pub nav_query: Option<String>,
+    /// 지금 선택이 화면 목록의 몇 번째 줄인지
+    pub selected_row: Option<usize>,
+    /// 새 결과가 와서 선택을 다시 맞춰야 할 때: 고르던 줄 번호 (화면 목록이 정해지면 맞춘다)
+    pub reselect: Option<usize>,
     /// 큰 미리보기 그림 (경로, 위치) → 텍스처
     previews: HashMap<(String, i64), Option<egui::TextureHandle>>,
     preview_pending: HashSet<(String, i64)>,
@@ -204,6 +210,10 @@ pub struct GemmaApp {
     force_foreground: Option<Instant>,
     /// 빠른 검색창 모드
     pub quick: Option<QuickState>,
+    /// 빠른 검색창 모양인 채로 숨겨 둔 창의 원래(큰 창) 모양. 다음에 큰 창을 보일 때 되돌린다.
+    parked_shape: Option<QuickState>,
+    /// logic 쪽에서 빠른 검색창을 닫아 달라고 함 (ui가 이번 프레임을 그린 뒤 닫는다)
+    quick_close: bool,
     /// 빠른 검색창에서 마지막으로 입력한 시각 (입력을 멈추면 검색)
     pub query_edited: Option<Instant>,
     /// 서버가 뜨면 실행할 검색
@@ -319,6 +329,9 @@ impl GemmaApp {
             select_query: false,
             selected: None,
             scroll_to_selected: false,
+            nav_query: None,
+            selected_row: None,
+            reselect: None,
             previews: HashMap::new(),
             preview_pending: HashSet::new(),
             preview_tx,
@@ -345,6 +358,8 @@ impl GemmaApp {
             },
             force_foreground: None,
             quick: None,
+            parked_shape: None,
+            quick_close: false,
             query_edited: None,
             pending_search: None,
             pending_since: None,
@@ -802,8 +817,20 @@ impl GemmaApp {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        // 빠른 검색창 모양인 채로 숨겨 둔 창이면, 보이기 전에 큰 창 모양으로 되돌린다
+        let mut maximize = false;
+        if self.quick.is_none() {
+            if let Some(q) = self.parked_shape.take() {
+                Self::send_main_shape(ctx, &q);
+                maximize = q.prev_maximized;
+            }
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        if maximize {
+            // 숨긴 창을 최대화하면 창이 먼저 나타나므로, 보인 다음에 한다
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         self.window_visible = true;
         self.hidden_flag.store(false, Ordering::SeqCst);
@@ -816,20 +843,45 @@ impl GemmaApp {
         self.hidden_flag.store(true, Ordering::SeqCst);
     }
 
+    /// 빠른 검색창 모양(테두리 없음·작게·항상 위)을 큰 창 모양으로 되돌리는 명령 (최대화는 따로)
+    fn send_main_shape(ctx: &egui::Context, q: &QuickState) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+        if let Some(r) = q.prev_inner {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(r.size()));
+        }
+        if let Some(r) = q.prev_outer {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(r.min));
+        }
+    }
+
     /// 빠른 검색창: 창을 테두리 없이 작게, 마우스가 있는 화면 위쪽 가운데에, 항상 위로
     pub fn enter_quick(&mut self, ctx: &egui::Context) {
         if self.quick.is_none() {
-            let (outer, inner, maximized) = ctx.input(|i| {
-                let v = i.viewport();
-                (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false))
-            });
-            self.quick = Some(QuickState {
-                prev_outer: outer,
-                prev_inner: inner,
-                prev_maximized: maximized,
-                was_visible: self.window_visible,
-                got_focus: false,
-            });
+            let mut maximized = false;
+            let state = match self.parked_shape.take() {
+                // 빠른 검색창 모양인 채로 숨겨 둔 창: 그때 적어 둔 큰 창 모양을 이어받는다
+                Some(q) => QuickState {
+                    was_visible: false,
+                    got_focus: false,
+                    ..q
+                },
+                None => {
+                    let (outer, inner, max) = ctx.input(|i| {
+                        let v = i.viewport();
+                        (v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false))
+                    });
+                    maximized = max;
+                    QuickState {
+                        prev_outer: outer,
+                        prev_inner: inner,
+                        prev_maximized: max,
+                        was_visible: self.window_visible,
+                        got_focus: false,
+                    }
+                }
+            };
+            self.quick = Some(state);
             let size = egui::vec2(QUICK_SIZE[0], QUICK_SIZE[1]);
             let npp = ctx.native_pixels_per_point().unwrap_or(1.0).max(0.5);
             if maximized {
@@ -854,21 +906,32 @@ impl GemmaApp {
     pub fn leave_quick(&mut self, ctx: &egui::Context, keep_open: bool) {
         let Some(q) = self.quick.take() else { return };
         self.quick_enter = false;
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
-        if let Some(r) = q.prev_inner {
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(r.size()));
-        }
-        if let Some(r) = q.prev_outer {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(r.min));
-        }
-        if q.prev_maximized {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-        }
+        self.quick_close = false;
         if keep_open || q.was_visible {
+            Self::send_main_shape(ctx, &q);
+            if q.prev_maximized {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            }
             self.show_window(ctx);
         } else {
+            // 숨길 때는 창 모양을 건드리지 않고 숨기기만 한다. Windows는 창을 숨길 때 잠깐 서서히 사라지게
+            // 하는데, 그 사이에(앞이든 뒤든) 큰 창 모양으로 되돌리면 큰 창이 번쩍 보였다 사라진다.
+            // 되돌리기는 다음에 큰 창을 보일 때 한다 (`show_window`). 다시 빠른 검색창으로 열면 그대로 쓴다.
+            self.parked_shape = Some(q);
             self.hide_window(ctx);
+        }
+    }
+
+    /// logic 쪽(단축키, 포커스 잃음)에서 빠른 검색창을 닫을 때. 숨기게 되는 경우에는 ui가 이번 프레임을
+    /// 평소대로 그린 뒤 닫는다 (그리지 않고 숨기면 빈 창이 사라지는 모습이 보인다).
+    /// 다음에 불릴 때까지 ui가 처리하지 못했으면 바로 닫는다.
+    fn request_quick_close(&mut self, ctx: &egui::Context) {
+        let to_tray = self.quick.as_ref().is_some_and(|q| !q.was_visible);
+        if to_tray && !self.quick_close {
+            self.quick_close = true;
+            ctx.request_repaint();
+        } else {
+            self.leave_quick(ctx, false);
         }
     }
 
@@ -887,7 +950,7 @@ impl GemmaApp {
             match ev {
                 ShellEvent::QuickSearch => {
                     if self.quick.is_some() {
-                        self.leave_quick(ctx, false);
+                        self.request_quick_close(ctx);
                     } else {
                         self.enter_quick(ctx);
                     }
@@ -1010,7 +1073,9 @@ impl GemmaApp {
             return;
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        if self.quick.is_some() {
+        if let Some(q) = &mut self.quick {
+            // 닫기는 숨기는 것이므로, 빠른 검색창을 열기 전에 큰 창이 보였더라도 다시 띄우지 않는다
+            q.was_visible = false;
             self.leave_quick(ctx, false);
         }
         self.hide_window(ctx);
@@ -1142,7 +1207,7 @@ impl GemmaApp {
                 Some(true) => q.got_focus = true,
                 Some(false) if q.got_focus => {
                     // PowerToys Run처럼 다른 곳을 누르면 사라진다
-                    self.leave_quick(ctx, false);
+                    self.request_quick_close(ctx);
                 }
                 _ => {}
             }
@@ -1493,7 +1558,19 @@ impl GemmaApp {
                 if self.thumbs.len() > 600 {
                     self.thumbs.clear();
                 }
-                self.selected = None;
+                // 같은 검색어로 검색하는 동안 사용자가 고른 줄은 지킨다. 한글 입력은 ↓를 누를 때 조합이 확정되며
+                // 같은 검색이 한 번 더 돌고, 입력하는 대로 찾을 때는 고르는 사이에 결과가 바뀐다.
+                // 검색어가 달라졌으면 선택을 푼다.
+                let same_query = matches!(&self.last_query, Some(QueryKind::Text(q))
+                    if self.nav_query.as_deref() == Some(q.trim()));
+                if same_query && self.selected.is_some() {
+                    self.reselect = Some(self.selected_row.unwrap_or(0));
+                } else {
+                    self.selected = None;
+                    self.reselect = None;
+                    // 예전 검색어로 고른 기록은 버린다 (나중에 같은 검색어를 다시 쳤을 때 엉뚱한 줄을 지키지 않게)
+                    self.nav_query = None;
+                }
                 self.outcome = Some(o);
                 self.search_rx = None;
                 self.search_started = None;
@@ -1823,8 +1900,17 @@ impl eframe::App for GemmaApp {
             return;
         }
         if self.quick.is_some() {
+            let to_tray = self.quick.as_ref().is_some_and(|q| !q.was_visible);
             // Esc: 입력칸에 포커스가 있든 없든 바로 닫는다 (입력칸이 Esc를 먹어 포커스만 잃던 문제)
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            let close = esc || std::mem::take(&mut self.quick_close);
+            if close && to_tray {
+                // 숨기는 경우: 이번 프레임도 빠른 검색창을 그대로 그린 뒤 숨긴다 (큰 창 화면이나 빈 화면을 남기지 않는다)
+                self.quick_ui(ui);
+                self.leave_quick(&ctx, false);
+                return;
+            } else if close {
+                // 큰 창으로 돌아가는 경우: 아래에서 큰 창을 그린다
                 self.leave_quick(&ctx, false);
             } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
                 self.open_full_from_quick(&ctx);

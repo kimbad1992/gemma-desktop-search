@@ -49,8 +49,16 @@ impl GemmaApp {
                     }
                 }
                 if resp.changed() {
-                    // 입력을 멈추면 바로 검색
-                    self.query_edited = Some(std::time::Instant::now());
+                    // 입력을 멈추면 바로 검색. 한글 조합이 확정될 때처럼 글자는 그대로인데 "바뀜"만 온 경우,
+                    // 지금 결과가 이미 그 검색어의 것이면 다시 찾지 않는다.
+                    let current = self.query_edited.is_none()
+                        && self.search_rx.is_none()
+                        && self.outcome.is_some()
+                        && matches!(&self.last_query, Some(crate::search::query::QueryKind::Text(q))
+                            if q.trim() == self.query.trim());
+                    if !current {
+                        self.query_edited = Some(std::time::Instant::now());
+                    }
                 }
                 if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     // Enter: 선택한 결과를 연다. 입력이 결과보다 새로우면 바로 검색하고, 결과가 오면 첫 결과를 연다.
@@ -100,6 +108,7 @@ impl GemmaApp {
                 .collect();
             let mut shown = unified(&visible, &outcome.kind_hints);
             shown.truncate(QUICK_LIMIT);
+            self.reconcile_selection(&shown);
             self.handle_result_keys(&ctx, &shown);
             if shown.is_empty() {
                 ui.add_space(12.0);
@@ -111,6 +120,7 @@ impl GemmaApp {
             } else if self.selected.is_none() {
                 self.selected = Some((shown[0].0, shown[0].1.hit.file_id));
             }
+            self.note_selected_row(&shown);
             let selected = self.selected.and_then(|(s, f)| {
                 shown.iter().find(|(ss, hv)| *ss == s && hv.hit.file_id == f).map(|(_, hv)| *hv)
             });
@@ -188,7 +198,7 @@ impl GemmaApp {
             .response
             .interact(egui::Sense::click());
         if resp.clicked() {
-            self.selected = Some((sec, hv.hit.file_id));
+            self.user_select(sec, hv.hit.file_id);
         }
         if resp.double_clicked() {
             self.open_hit(hv);

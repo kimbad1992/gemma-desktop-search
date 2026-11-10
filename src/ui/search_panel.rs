@@ -235,7 +235,9 @@ impl GemmaApp {
                 .flat_map(|(s, h)| h.iter().map(move |hv| (*s, *hv)))
                 .collect(),
         };
+        self.reconcile_selection(&shown);
         self.handle_result_keys(&ctx, &shown);
+        self.note_selected_row(&shown);
         // 선택한 결과는 오른쪽에 크게
         let selected = self.selected.and_then(|(s, f)| {
             shown
@@ -429,6 +431,27 @@ impl GemmaApp {
         changed
     }
 
+    /// 사용자가 직접 고른 선택 (↑↓·클릭). 그때의 검색어를 적어 두어, 같은 검색의 결과가 다시 와도 지킨다.
+    pub(crate) fn user_select(&mut self, sec: Section, file_id: i64) {
+        self.selected = Some((sec, file_id));
+        self.nav_query = Some(self.query.trim().to_string());
+    }
+
+    /// 새 결과가 왔으면 고르던 줄을 다시 맞춘다 (`app.rs`의 poll이 `reselect`를 세운다)
+    pub(crate) fn reconcile_selection(&mut self, shown: &[(Section, &HitView)]) {
+        let Some(row) = self.reselect.take() else { return };
+        let keys: Vec<(Section, i64)> = shown.iter().map(|(s, hv)| (*s, hv.hit.file_id)).collect();
+        self.selected = kept_selection(self.selected, row, &keys);
+        self.scroll_to_selected = self.selected.is_some();
+    }
+
+    /// 선택이 화면 목록의 몇 번째 줄인지 적어 둔다 (다음 결과가 왔을 때 쓴다)
+    pub(crate) fn note_selected_row(&mut self, shown: &[(Section, &HitView)]) {
+        self.selected_row = self
+            .selected
+            .and_then(|(s, f)| shown.iter().position(|(ss, hv)| *ss == s && hv.hit.file_id == f));
+    }
+
     /// ↑↓ 이동, Enter 열기(시점·페이지), Ctrl+Enter 폴더에서 보기, Ctrl+C 파일 복사, Esc 검색창으로
     pub(crate) fn handle_result_keys(&mut self, ctx: &egui::Context, shown: &[(Section, &HitView)]) {
         let box_id = egui::Id::unique(SEARCH_BOX);
@@ -463,7 +486,7 @@ impl GemmaApp {
             };
             if down || up {
                 if let Some(p) = p {
-                    self.selected = Some((shown[p].0, shown[p].1.hit.file_id));
+                    self.user_select(shown[p].0, shown[p].1.hit.file_id);
                     self.scroll_to_selected = true;
                 }
             }
@@ -478,7 +501,7 @@ impl GemmaApp {
         if box_focused {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
                 let (s, hv) = shown[pos.unwrap_or(0)];
-                self.selected = Some((s, hv.hit.file_id));
+                self.user_select(s, hv.hit.file_id);
                 self.scroll_to_selected = true;
                 ctx.memory_mut(|m| m.surrender_focus(box_id));
             }
@@ -510,7 +533,7 @@ impl GemmaApp {
         };
         if down || up {
             if let Some(p) = new_pos {
-                self.selected = Some((shown[p].0, shown[p].1.hit.file_id));
+                self.user_select(shown[p].0, shown[p].1.hit.file_id);
                 self.scroll_to_selected = true;
             }
         }
@@ -623,7 +646,7 @@ impl GemmaApp {
     /// 결과 카드/줄 공통: 클릭 선택, 더블클릭 열기, 우클릭 메뉴, 키보드 이동 시 화면에 보이게
     fn after_hit_response(&mut self, ctx: &egui::Context, sec: Section, hv: &HitView, resp: &egui::Response) {
         if resp.clicked() {
-            self.selected = Some((sec, hv.hit.file_id));
+            self.user_select(sec, hv.hit.file_id);
         }
         if resp.double_clicked() {
             self.open_hit(hv);
@@ -815,5 +838,32 @@ pub fn locator_label(hv: &HitView) -> Option<String> {
         }
         (Modality::Text, _) if hv.hit.locator > 0 => Some(format!("{}번째 구간", hv.hit.locator + 1)),
         _ => None,
+    }
+}
+
+/// 새 결과 목록에서 선택을 정한다: 고르던 것이 그대로 있으면 그것, 없으면 같은 줄 위치
+/// (목록이 짧아졌으면 마지막 줄, 비었으면 선택 없음).
+fn kept_selection<K: PartialEq + Copy>(prev: Option<K>, row: usize, shown: &[K]) -> Option<K> {
+    match prev {
+        Some(k) if shown.contains(&k) => Some(k),
+        _ => shown.get(row.min(shown.len().saturating_sub(1))).copied(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kept_selection;
+
+    #[test]
+    fn keeps_the_chosen_item_when_results_are_replaced() {
+        // 같은 검색이 다시 돌아 같은 결과가 왔다: 고르던 것 그대로
+        assert_eq!(kept_selection(Some(30), 2, &[10, 20, 30, 40]), Some(30));
+        // 순서가 바뀌어도 고르던 파일을 따라간다
+        assert_eq!(kept_selection(Some(30), 2, &[30, 10, 20]), Some(30));
+        // 고르던 파일이 빠졌으면 같은 줄 위치
+        assert_eq!(kept_selection(Some(30), 2, &[10, 20, 50, 60]), Some(50));
+        // 목록이 짧아졌으면 마지막 줄, 비었으면 선택 없음
+        assert_eq!(kept_selection(Some(30), 2, &[10]), Some(10));
+        assert_eq!(kept_selection(Some(30), 2, &[] as &[i32]), None);
     }
 }
