@@ -12,6 +12,7 @@
 //! - 실제 인덱싱(서버 켜기, 전체 화면 앱 중에는 미루기)은 앱이 한다 (`app.rs`의 `watch_tick`).
 
 use crate::index::db::Db;
+use crate::paths::{norm, parts, under};
 use notify::{EventKind, RecursiveMode, Watcher as _};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -31,32 +32,6 @@ const COOLDOWN_TAKES: u32 = 2;
 const MAX_PENDING: usize = 20_000;
 /// 켠 뒤 처음 훑기까지 (꺼져 있던 동안의 변경을 찾는다)
 const FIRST_SCAN: Duration = Duration::from_secs(30);
-
-/// 네트워크 위치인지: `\\서버\공유` 또는 네트워크 드라이브에 연결한 드라이브 문자
-pub fn is_network(path: &str) -> bool {
-    let p = path.trim();
-    if p.starts_with(r"\\") {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        let b = p.as_bytes();
-        if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-            const DRIVE_REMOTE: u32 = 4;
-            let root: Vec<u16> = format!("{}:\\", b[0] as char).encode_utf16().chain(Some(0)).collect();
-            return unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOTE;
-        }
-    }
-    false
-}
-
-fn norm(path: &str) -> String {
-    path.trim().trim_end_matches('\\').to_lowercase()
-}
-
-fn under(path: &str, base: &str) -> bool {
-    path.starts_with(base) && path[base.len()..].starts_with('\\')
-}
 
 /// 인덱싱 대상인 경로만 남기는 규칙 (인덱서의 탐색과 같은 기준)
 struct PathFilter {
@@ -88,9 +63,9 @@ impl PathFilter {
         let Some(root) = self.roots.iter().find(|r| under(&lower, r)) else {
             return true;
         };
-        let mut parts = lower[root.len()..].split('\\').filter(|s| !s.is_empty()).peekable();
-        while let Some(part) = parts.next() {
-            if parts.peek().is_some() {
+        let mut names = parts(&lower[root.len()..]).peekable();
+        while let Some(part) = names.next() {
+            if names.peek().is_some() {
                 // 폴더 이름
                 if self.excl.iter().any(|e| e == part) {
                     return true;
@@ -198,7 +173,7 @@ impl Watcher {
             .filter(|r| !r.is_empty())
             .map(|r| RootStatus {
                 path: r.to_string(),
-                network: is_network(r),
+                network: crate::platform::is_network_path(r),
                 error: None,
                 registering: true,
             })
@@ -321,7 +296,7 @@ impl Watcher {
     }
 
     /// 폴더를 훑어 인덱스와 비교한다 (백그라운드). 바뀐 경로는 대기 목록에 들어간다.
-    pub fn start_scan(&self, db_path: PathBuf, ctx: eframe::egui::Context) {
+    pub fn start_scan(&self, db_path: PathBuf, wake: crate::util::Waker) {
         {
             let mut g = self.inner.lock();
             if g.scanning {
@@ -355,7 +330,7 @@ impl Watcher {
                 g.next_scan = every.map(|d| Instant::now() + d);
                 g.scan_note = note;
                 drop(g);
-                ctx.request_repaint();
+                wake();
             }
         });
         if spawned.is_err() {
@@ -511,13 +486,6 @@ mod tests {
         assert!(f.ignores(r"C:\Docs\~$report.docx"));
         assert!(f.ignores(r"C:\Docs\movie.mp4.crdownload"));
         assert!(f.ignores(r"C:\Docs\a1b2.tmp"));
-    }
-
-    #[test]
-    fn network_paths() {
-        assert!(is_network(r"\\192.168.0.100\storage\Media"));
-        assert!(!is_network(r"C:\Users"));
-        assert!(!is_network("relative"));
     }
 
     #[test]

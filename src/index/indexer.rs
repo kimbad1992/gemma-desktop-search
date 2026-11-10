@@ -11,6 +11,7 @@ use crate::embed::client::{EmbedClient, EmbedError, EmbedInput};
 use crate::embed::prompt;
 use crate::embed::selftest::Capabilities;
 use crate::extract::{self, media, Kind, Modality};
+use crate::paths::{norm, under};
 use crate::search::keyword;
 use crate::search::store::{Entry, FileInfo, VectorStore};
 use crate::util::{fmt_ts, truncate_chars};
@@ -212,15 +213,7 @@ enum Done {
     },
 }
 
-/// `path`가 `base` 폴더 아래인지 (둘 다 소문자, base는 끝에 \ 없음)
-fn under(path: &str, base: &str) -> bool {
-    path.starts_with(base) && path[base.len()..].starts_with('\\')
-}
 
-/// 경로 비교용: 끝의 \를 떼고 소문자로
-fn norm(path: &str) -> String {
-    path.trim().trim_end_matches('\\').to_lowercase()
-}
 
 struct WorkerCtx {
     cfg: Config,
@@ -423,7 +416,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
             .cfg
             .roots
             .iter()
-            .map(|r| r.trim().trim_end_matches('\\').to_lowercase())
+            .map(|r| norm(r))
             .filter(|r| !r.is_empty())
             .collect();
         let err_dirs: Vec<String> = walk.error_dirs.iter().map(|d| d.to_lowercase()).collect();
@@ -705,7 +698,7 @@ impl Walker<'_> {
             return true;
         };
         // 대상 폴더 아래의 폴더 이름 가운데 제외 목록에 있는 것이 있는지 (마지막 이름은 폴더일 때만 본다)
-        let parts: Vec<&str> = lower[root.len()..].split('\\').filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = crate::paths::parts(&lower[root.len()..]).collect();
         let (last, dirs) = match parts.split_last() {
             Some((last, dirs)) => (Some(*last), dirs),
             None => (None, &parts[..]),

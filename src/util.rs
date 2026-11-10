@@ -3,18 +3,17 @@
 use anyhow::{bail, Result};
 use std::ffi::OsStr;
 use std::io::Read;
-use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// CREATE_NO_WINDOW — GUI 앱에서 자식 프로세스가 콘솔 창을 띄우지 않도록
-pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// 백그라운드 작업이 상태를 바꿨을 때 부르는 함수. 화면이 있는 앱은 다시 그리게 하고, 서비스판은 아무것도 하지 않는다.
+pub type Waker = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-/// 모든 자식 프로세스(llama-server, ffmpeg, ffprobe)는 이 헬퍼로 만든다.
+/// 모든 자식 프로세스(llama-server, ffmpeg, ffprobe)는 이 헬퍼로 만든다 (콘솔 창이 뜨지 않게).
 pub fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     let mut c = Command::new(program);
-    c.creation_flags(CREATE_NO_WINDOW);
+    crate::platform::no_console(&mut c);
     c
 }
 
@@ -56,7 +55,7 @@ pub fn run_capture(mut cmd: Command, timeout: Duration) -> Result<Output> {
     })
 }
 
-/// PATH와 winget 설치 위치에서 실행 파일을 찾는다.
+/// PATH와 그 OS의 흔한 설치 위치에서 실행 파일을 찾는다.
 pub fn find_tool(exe: &str) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -66,67 +65,13 @@ pub fn find_tool(exe: &str) -> Option<PathBuf> {
             }
         }
     }
-    // winget(Gyan.FFmpeg 등) 기본 설치 위치
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-        let links = Path::new(&local).join(r"Microsoft\WinGet\Links").join(exe);
-        if links.is_file() {
-            return Some(links);
-        }
-        let pkgs = Path::new(&local).join(r"Microsoft\WinGet\Packages");
-        if let Ok(rd) = std::fs::read_dir(&pkgs) {
-            for pkg in rd.flatten() {
-                if let Ok(inner) = std::fs::read_dir(pkg.path()) {
-                    for sub in inner.flatten() {
-                        let p = sub.path().join("bin").join(exe);
-                        if p.is_file() {
-                            return Some(p);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// 기본 프로그램으로 파일 열기
-pub fn open_path(path: &str) {
-    let _ = Command::new("explorer.exe").arg(path).spawn();
-}
-
-/// 파일 자체를 클립보드에 (탐색기·메신저에 붙여넣기). PowerShell의 Set-Clipboard 사용.
-pub fn copy_file_to_clipboard(path: &str) -> Result<()> {
-    let quoted = path.replace('\'', "''");
-    let mut cmd = hidden_command("powershell.exe");
-    cmd.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!("Set-Clipboard -LiteralPath '{quoted}'"),
-    ]);
-    let out = run_capture(cmd, Duration::from_secs(15))?;
-    if !out.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
-    }
-    Ok(())
-}
-
-/// 탐색기에서 파일 선택한 채로 폴더 열기
-pub fn reveal_path(path: &str) {
-    let _ = Command::new("explorer.exe")
-        .raw_arg(format!("/select,\"{path}\""))
-        .spawn();
+    crate::platform::find_installed_tool(exe)
 }
 
 /// 현재 로컬 시각 "2026-11-08 22:04:43"
 pub fn now_local_string() -> String {
-    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
-    let mut t = unsafe { std::mem::zeroed() };
-    unsafe { GetLocalTime(&mut t) };
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
-    )
+    let [y, mo, d, h, mi, s] = crate::platform::local_time();
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
 /// 1234567 → "1,234,567"

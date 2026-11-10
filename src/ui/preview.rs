@@ -106,7 +106,7 @@ impl GemmaApp {
                 .on_hover_text("Ctrl+Enter")
                 .clicked()
             {
-                crate::util::reveal_path(&hv.hit.path);
+                crate::platform::reveal_in_file_manager(&hv.hit.path);
             }
             if widgets::icon_button(ui, Btn::Secondary, Icon::Copy, "파일 복사")
                 .on_hover_text("Ctrl+C")

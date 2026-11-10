@@ -99,6 +99,10 @@ pub struct Config {
     /// 폴더를 훑어 인덱스와 비교하는 주기(시간). 변경 알림이 오지 않는 네트워크 폴더와 놓친 알림을 찾는다.
     /// 0 = 켤 때 한 번만
     pub watch_rescan_hours: u32,
+    /// 서비스판(`gemma-search serve`)이 접속을 받는 주소. 다른 기기에서 접속하게 하려면 `0.0.0.0:8787`.
+    pub service_bind: String,
+    /// 서비스판의 접속 토큰. 다른 기기에서 접속하게 열면 있어야 하고, 비어 있으면 그때 만든다.
+    pub service_token: String,
 }
 
 impl Default for Config {
@@ -109,11 +113,11 @@ impl Default for Config {
             // ggml-org의 Q8_0 (310MB + 555MB). BF16과 벡터가 사실상 같다 (실측 코사인 0.997 이상)
             // 포터블: 프로그램 폴더의 models\ 아래 (설정 → 준비물 받기). 없으면 예전 위치.
             model_path: default_path(&[
-                app_dir().join(r"models\embeddinggemma-2\embeddinggemma-2-Q8_0.gguf"),
+                model_dir().join("embeddinggemma-2-Q8_0.gguf"),
                 PathBuf::from(r"F:\Tools\models\embeddinggemma-2\embeddinggemma-2-Q8_0.gguf"),
             ]),
             mmproj_path: default_path(&[
-                app_dir().join(r"models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
+                model_dir().join("mmproj-embeddinggemma-2-Q8_0.gguf"),
                 PathBuf::from(r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
             ]),
             extra_dll_dir: String::new(),
@@ -130,10 +134,10 @@ impl Default for Config {
             auto_start_server: false,
             auto_recover: true,
 
-            ffmpeg_path: crate::util::find_tool("ffmpeg.exe")
+            ffmpeg_path: crate::util::find_tool(&crate::platform::exe_name("ffmpeg"))
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            ffprobe_path: crate::util::find_tool("ffprobe.exe")
+            ffprobe_path: crate::util::find_tool(&crate::platform::exe_name("ffprobe"))
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
 
@@ -197,6 +201,8 @@ impl Default for Config {
             index_overlay: true,
             watch_folders: false,
             watch_rescan_hours: 6,
+            service_bind: "127.0.0.1:8787".into(),
+            service_token: String::new(),
         }
     }
 }
@@ -417,6 +423,34 @@ fn existing(p: &str) -> Option<PathBuf> {
     }
     let pb = PathBuf::from(p);
     pb.is_file().then_some(pb)
+}
+
+/// 포터블 준비물 가운데 모델이 놓이는 폴더: 프로그램 폴더의 `models/embeddinggemma-2`
+fn model_dir() -> PathBuf {
+    app_dir().join("models").join("embeddinggemma-2")
+}
+
+/// 한 데이터 폴더를 한 프로세스만 쓰게 하는 잠금 (창이 있는 앱과 서비스판이 같은 인덱스를 함께 고치지 않게).
+/// 돌려받은 파일을 들고 있는 동안 잠겨 있고, 프로세스가 끝나면 풀린다.
+pub fn instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
+    let path = data_dir.join("instance.lock");
+    let file = std::fs::create_dir_all(data_dir)
+        .and_then(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+        })
+        .map_err(|e| format!("데이터 폴더에 쓸 수 없습니다 ({}): {e}", path.display()))?;
+    match file.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "다른 Gemma Search가 이미 이 데이터 폴더를 쓰고 있습니다 ({}).\n창이 있는 앱과 서비스(gemma-search serve)는 같은 데이터 폴더로 함께 띄울 수 없습니다.",
+            data_dir.display()
+        )),
+        // 잠금을 지원하지 않는 파일 시스템이면 잠그지 않고 쓴다
+        Ok(()) | Err(std::fs::TryLockError::Error(_)) => Ok(file),
+    }
 }
 
 /// 데이터 폴더: exe 옆의 `data`. cargo로 실행 중(target\debug|release)이면 프로젝트 루트의 `data`.

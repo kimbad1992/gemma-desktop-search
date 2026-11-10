@@ -163,6 +163,12 @@ impl Shot {
     }
 }
 
+/// 백그라운드 작업이 끝났을 때 화면을 다시 그리게 하는 함수
+pub(crate) fn waker(ctx: &egui::Context) -> crate::util::Waker {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.request_repaint())
+}
+
 /// 창 없이 시작하는지: 트레이로 시작(`--background`)하거나 화면 확인용(`--shot`)
 fn starts_hidden() -> bool {
     std::env::args().any(|a| a == "--background" || a == "--shot")
@@ -422,16 +428,7 @@ impl GemmaApp {
             shot_view: None,
             logo: None,
             titlebar_dark: None,
-            main_hwnd: {
-                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                cc.window_handle()
-                    .ok()
-                    .and_then(|h| match h.as_raw() {
-                        RawWindowHandle::Win32(w) => Some(w.hwnd.get() as usize),
-                        _ => None,
-                    })
-                    .unwrap_or(0)
-            },
+            main_hwnd: crate::platform::native_window(cc),
             force_foreground: None,
             quick: None,
             parked_shape: None,
@@ -634,19 +631,7 @@ impl GemmaApp {
                 _ => None,
             };
             // 화면 밖에서 잠깐 보이게 되더라도 포커스를 받지 않게 한다
-            if app.main_hwnd != 0 {
-                use windows_sys::Win32::UI::WindowsAndMessaging::{
-                    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-                };
-                unsafe {
-                    let ex = GetWindowLongPtrW(app.main_hwnd as _, GWL_EXSTYLE);
-                    SetWindowLongPtrW(
-                        app.main_hwnd as _,
-                        GWL_EXSTYLE,
-                        ex | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize,
-                    );
-                }
-            }
+            crate::platform::make_window_passive(app.main_hwnd);
         }
         // 화면 확인용: 시스템 테마와 상관없이 밝은/어두운 테마로 고정
         match value("--theme").as_deref() {
@@ -906,7 +891,7 @@ impl GemmaApp {
         }
         let first = todo.remove(0);
         self.dl_queue = todo;
-        crate::download::start(first, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), ctx.clone());
+        crate::download::start(first, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
     }
 
     /// 받기가 끝날 때마다 대기열의 다음 준비물을 받는다 (실패했으면 대기열을 비운다)
@@ -917,7 +902,7 @@ impl GemmaApp {
         }
         if !self.dl_queue.is_empty() {
             let next = self.dl_queue.remove(0);
-            crate::download::start(next, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), ctx.clone());
+            crate::download::start(next, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
         }
     }
 
@@ -1331,9 +1316,7 @@ impl GemmaApp {
             if focused || t.elapsed() > Duration::from_secs(2) {
                 self.force_foreground = None;
             } else if t.elapsed() > Duration::from_millis(200) && self.main_hwnd != 0 {
-                unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(self.main_hwnd as _);
-                }
+                crate::platform::bring_to_front(self.main_hwnd);
                 self.force_foreground = None;
             } else {
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -1571,7 +1554,7 @@ impl GemmaApp {
         }
         let Some(w) = &self.watcher else { return };
         if w.scan_due() {
-            w.start_scan(self.db_path.clone(), ctx.clone());
+            w.start_scan(self.db_path.clone(), waker(ctx));
         }
         if self.watch_batch.is_empty() {
             let ready = w.take_ready();
@@ -2174,7 +2157,7 @@ impl GemmaApp {
     /// 업데이트를 시작한다: 새 버전이 있는지 확인하고, 있으면 받아서 지금 exe와 바꾼다 (`update.rs`).
     /// 바꾼 뒤에는 `poll_update`가 다시 시작한다.
     pub fn start_update(&mut self, ctx: &egui::Context) {
-        crate::update::start(self.updater.clone(), ctx.clone());
+        crate::update::start(self.updater.clone(), waker(ctx));
     }
 
     /// 새 exe로 다시 시작한다 (창을 숨겨 둔 상태였으면 다시 숨긴 채로)
@@ -2308,18 +2291,9 @@ impl GemmaApp {
             return;
         }
         self.titlebar_dark = Some(dark);
-        use windows_sys::Win32::Graphics::Dwm::{
-            DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
-        };
         let p = crate::ui::theme::palette_of(dark);
-        let colorref = |c: egui::Color32| c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16;
-        let hwnd = self.main_hwnd;
-        let set = |attr: i32, value: u32| unsafe {
-            DwmSetWindowAttribute(hwnd as _, attr as u32, &value as *const u32 as *const _, 4);
-        };
-        set(DWMWA_USE_IMMERSIVE_DARK_MODE, dark as u32);
-        set(DWMWA_CAPTION_COLOR, colorref(p.sidebar));
-        set(DWMWA_BORDER_COLOR, colorref(p.card_stroke));
+        let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
+        crate::platform::set_titlebar_colors(self.main_hwnd, dark, rgb(p.sidebar), rgb(p.card_stroke));
     }
 
     /// 알림을 오른쪽 아래 토스트로 보여준다 (오류는 15초, 안내는 6초 또는 닫을 때까지)
@@ -2559,8 +2533,8 @@ fn setup_fonts(ctx: &egui::Context) {
             .insert(name.to_string(), Arc::new(egui::FontData::from_owned(bytes)));
         true
     };
-    let has_malgun = system(&mut fonts, "malgun", r"C:\Windows\Fonts\malgun.ttf");
-    let has_symbols = system(&mut fonts, "segoe-symbol", r"C:\Windows\Fonts\seguisym.ttf");
+    let has_malgun = system(&mut fonts, "malgun", crate::platform::TEXT_FALLBACK_FONT);
+    let has_symbols = system(&mut fonts, "segoe-symbol", crate::platform::SYMBOL_FALLBACK_FONT);
 
     // 본문: Pretendard → 맑은 고딕 → egui 기본 글꼴(이모지 등) → 기호
     let prop = fonts.families.entry(FontFamily::Proportional).or_default();

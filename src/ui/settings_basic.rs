@@ -222,15 +222,13 @@ impl GemmaApp {
             },
             Fix::Index => self.start_index_when_ready(),
             Fix::InstallFfmpeg => {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/c", "start", "ffmpeg 설치", "cmd", "/k", "winget install --id Gyan.FFmpeg -e"])
-                    .spawn();
+                crate::platform::install_ffmpeg();
             }
             Fix::FindFfmpeg => {
-                if let Some(p) = crate::util::find_tool("ffmpeg.exe") {
+                if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffmpeg")) {
                     self.cfg.ffmpeg_path = p.display().to_string();
                 }
-                if let Some(p) = crate::util::find_tool("ffprobe.exe") {
+                if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffprobe")) {
                     self.cfg.ffprobe_path = p.display().to_string();
                 }
                 self.invalidate_health();
@@ -458,7 +456,7 @@ impl GemmaApp {
             );
             if c.watch_folders {
                 // 네트워크 폴더는 바로 반영된다고 약속할 수 없다: 한계를 늘 보이게 둔다
-                let network = c.roots.iter().filter(|r| crate::watch::is_network(r)).count();
+                let network = c.roots.iter().filter(|r| crate::platform::is_network_path(r)).count();
                 if network > 0 {
                     let every = if c.watch_rescan_hours > 0 {
                         format!("{}시간마다", c.watch_rescan_hours)

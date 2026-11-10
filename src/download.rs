@@ -249,7 +249,7 @@ pub fn run(pack: Pack, app_dir: &Path, st: &Mutex<DlState>, cancel: &AtomicBool)
 }
 
 /// 백그라운드로 받기 시작
-pub fn start(pack: Pack, app_dir: PathBuf, st: Arc<Mutex<DlState>>, cancel: Arc<AtomicBool>, ctx: eframe::egui::Context) {
+pub fn start(pack: Pack, app_dir: PathBuf, st: Arc<Mutex<DlState>>, cancel: Arc<AtomicBool>, wake: crate::util::Waker) {
     {
         let mut g = st.lock();
         if g.running {
@@ -270,7 +270,8 @@ pub fn start(pack: Pack, app_dir: PathBuf, st: Arc<Mutex<DlState>>, cancel: Arc<
             Ok(dir) => (true, dir),
             Err(e) => (false, e.to_string()),
         });
-        ctx.request_repaint();
+        drop(g);
+        wake();
     });
 }
 

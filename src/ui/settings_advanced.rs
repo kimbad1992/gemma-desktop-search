@@ -115,7 +115,7 @@ impl GemmaApp {
 
         if let Some(pack) = start {
             self.dl_queue.clear();
-            crate::download::start(pack, app_dir, self.dl.clone(), self.dl_cancel.clone(), ui.ctx().clone());
+            crate::download::start(pack, app_dir, self.dl.clone(), self.dl_cancel.clone(), crate::app::waker(ui.ctx()));
         }
     }
 
@@ -341,10 +341,10 @@ impl GemmaApp {
                 let ok = self.cfg.ffmpeg().is_some() && self.cfg.ffprobe().is_some();
                 status(ui, ok, "ffmpeg/ffprobe 사용 가능", "없으면 영상·오디오는 이름만 인덱싱");
                 if widgets::small_button(ui, widgets::Btn::Secondary, "자동 탐색").clicked() {
-                    if let Some(p) = crate::util::find_tool("ffmpeg.exe") {
+                    if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffmpeg")) {
                         self.cfg.ffmpeg_path = p.display().to_string();
                     }
-                    if let Some(p) = crate::util::find_tool("ffprobe.exe") {
+                    if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffprobe")) {
                         self.cfg.ffprobe_path = p.display().to_string();
                     }
                     changed = true;
@@ -372,8 +372,9 @@ impl GemmaApp {
                             .desired_width(360.0),
                     );
                     if ui.button("추가").clicked() && !self.new_root.trim().is_empty() {
-                        let s = self.new_root.trim().trim_end_matches('\\').to_string();
-                        let s = if s.ends_with(':') { format!("{s}\\") } else { s };
+                        let s = self.new_root.trim().trim_end_matches(crate::paths::is_sep).to_string();
+                        // "C:"처럼 드라이브만 남았으면 구분자를 다시 붙인다
+                        let s = if s.ends_with(':') { format!("{s}{}", crate::paths::SEP) } else { s };
                         if !self.cfg.roots.contains(&s) {
                             self.cfg.roots.push(s);
                             added = true;

@@ -370,7 +370,7 @@ pub fn swap_exe(current: &Path, new: &Path) -> Result<PathBuf, String> {
 pub type Shared = Arc<Mutex<Stage>>;
 
 /// 백그라운드로 업데이트를 시작한다 (확인부터). 이미 진행 중이면 아무 일도 하지 않는다.
-pub fn start(state: Shared, ctx: eframe::egui::Context) {
+pub fn start(state: Shared, wake: crate::util::Waker) {
     {
         let mut g = state.lock();
         if g.busy() {
@@ -383,7 +383,7 @@ pub fn start(state: Shared, ctx: eframe::egui::Context) {
         move || {
             let report = |s: Stage| {
                 *state.lock() = s;
-                ctx.request_repaint();
+                wake();
             };
             let end = match run(&report) {
                 Ok(Outcome::UpToDate) => Stage::UpToDate,
@@ -404,7 +404,8 @@ pub fn start(state: Shared, ctx: eframe::egui::Context) {
     }
 }
 
-/// 새 exe로 다시 시작한다. 새 프로세스는 이 프로세스가 끝나기를 기다렸다가 뜬다 (`--after-update <pid>`).
+/// 새 exe로 다시 시작한다. 새 프로세스는 이 프로세스가 끝나기를 기다렸다가 뜬다 (`--after-update <pid>`, main.rs).
+/// 같은 데이터 폴더로는 앱이 하나만 뜨므로, 기다리지 않으면 "이미 실행 중"으로 보고 바로 끝난다.
 /// `background`면 창 없이 트레이로 뜬다.
 pub fn spawn_restart(background: bool) -> Result<(), String> {
     let mut cmd = std::process::Command::new(exe_path());
@@ -413,20 +414,6 @@ pub fn spawn_restart(background: bool) -> Result<(), String> {
         cmd.arg("--background");
     }
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
-}
-
-/// `--after-update <pid>`로 시작했을 때: 이전 프로세스가 끝날 때까지 기다린다.
-/// 같은 데이터 폴더로는 앱이 하나만 뜨므로, 기다리지 않으면 "이미 실행 중"으로 보고 바로 끝난다.
-pub fn wait_for_previous(pid: u32) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-    unsafe {
-        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-        if !h.is_null() {
-            WaitForSingleObject(h, 20_000);
-            CloseHandle(h);
-        }
-    }
 }
 
 /// 창 없이 업데이트 (`gemma-search.exe --update`): 새 버전이 있으면 받아서 바꾼다.

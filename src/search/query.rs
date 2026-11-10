@@ -180,3 +180,54 @@ pub fn run(
         expr: kw.expr.clone(),
     }
 }
+
+/// 결과가 파일의 어디인지 알려 주는 짧은 말 ("3페이지", "01:20 장면"). 파일 전체면 None.
+pub fn locator_label(hv: &HitView) -> Option<String> {
+    use crate::util::fmt_ts;
+    match (hv.hit.modality, hv.hit.kind) {
+        (Modality::Video, _) => Some(format!("{}~ 구간", fmt_ts(hv.hit.locator))),
+        (Modality::Image, Kind::Video) => Some(format!("{} 장면", fmt_ts(hv.hit.locator))),
+        (Modality::Audio, _) => Some(format!("{}부터", fmt_ts(hv.hit.locator))),
+        (Modality::Text, Kind::Doc) if crate::extract::pdf::page_of(hv.hit.locator).is_some() => {
+            crate::extract::pdf::page_of(hv.hit.locator).map(|p| format!("{p}페이지"))
+        }
+        (Modality::Text, _) if hv.hit.locator > 0 => Some(format!("{}번째 구간", hv.hit.locator + 1)),
+        _ => None,
+    }
+}
+
+/// 최소 일치도 이상이거나 질의 단어가 들어 있는 결과 (순위는 키워드 가산점까지 반영된 순서 그대로)
+pub fn passing(hits: &[HitView], min: f32) -> Vec<&HitView> {
+    hits.iter().filter(|h| h.visible(min)).collect()
+}
+
+/// "전체" 목록 최대 개수
+const UNIFIED_LIMIT: usize = 60;
+
+/// 모든 섹션을 합쳐 순위 점수(보정 일치도 + 키워드 가산점) 순으로. 같은 파일은 가장 높은 것 하나만.
+/// "고양이 영상"처럼 종류를 말한 질의는 그 종류에 작은 가산점.
+pub fn unified<'a>(visible: &[(Section, Vec<&'a HitView>)], hints: &[Section]) -> Vec<(Section, &'a HitView)> {
+    // 표시된 일치도 순서 그대로. 종류를 말한 질의(hints)는 같은 점수일 때만 그 종류를 앞으로.
+    let mut all: Vec<(Section, &HitView)> =
+        visible.iter().flat_map(|(s, h)| h.iter().map(move |hv| (*s, *hv))).collect();
+    all.sort_by(|a, b| {
+        b.1.hit
+            .score
+            .total_cmp(&a.1.hit.score)
+            .then_with(|| hints.contains(&b.0).cmp(&hints.contains(&a.0)))
+    });
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|(_, hv)| seen.insert(hv.hit.file_id));
+    // 같은 파일이 여러 폴더에 있으면(사진 폴더 + Immich 라이브러리 등) 한 번만: 이름이 같고 점수가 사실상 같으면 복사본
+    let mut kept: Vec<(Section, &HitView)> = Vec::with_capacity(all.len());
+    for (s, hv) in all {
+        let dup = kept.iter().any(|(ks, k)| {
+            *ks == s && k.file_name.eq_ignore_ascii_case(&hv.file_name) && (k.hit.cosine - hv.hit.cosine).abs() < 0.003
+        });
+        if !dup {
+            kept.push((s, hv));
+        }
+    }
+    kept.truncate(UNIFIED_LIMIT);
+    kept
+}

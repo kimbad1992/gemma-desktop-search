@@ -79,33 +79,6 @@ fn loader_reason(code: u32) -> String {
     }
 }
 
-#[cfg(windows)]
-mod quiet {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn SetErrorMode(mode: u32) -> u32;
-    }
-    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
-
-    /// 살아 있는 동안 만든 자식 프로세스는 DLL이 없어도 Windows 오류 창을 띄우지 않는다
-    /// (오류 모드는 프로세스를 만들 때 물려받는다). 사라지면 원래대로 돌린다.
-    pub struct QuietErrors(u32);
-
-    impl QuietErrors {
-        pub fn new() -> Self {
-            let old = unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
-            unsafe { SetErrorMode(old | SEM_FAILCRITICALERRORS) };
-            Self(old)
-        }
-    }
-
-    impl Drop for QuietErrors {
-        fn drop(&mut self) {
-            unsafe { SetErrorMode(self.0) };
-        }
-    }
-}
-
 /// llama.cpp가 이 PC에서 실제로 실행되는지 본다. 몇 초 걸릴 수 있으니 UI 스레드에서 부르지 않는다.
 pub fn check_engine(llama_path: &str, extra_dll_dir: &str) -> Verdict {
     let (exe, _serve) = match crate::server::resolve_binary(llama_path) {
@@ -114,14 +87,15 @@ pub fn check_engine(llama_path: &str, extra_dll_dir: &str) -> Verdict {
     };
     // 서버를 켤 때와 같은 PATH (실행 파일 폴더, 추가 DLL 경로)
     let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    let sep = if cfg!(windows) { ";" } else { ":" };
     let mut path_env = std::ffi::OsString::new();
     path_env.push(exe_dir.as_os_str());
     if !extra_dll_dir.trim().is_empty() {
-        path_env.push(";");
+        path_env.push(sep);
         path_env.push(extra_dll_dir.trim());
     }
     if let Some(old) = std::env::var_os("PATH") {
-        path_env.push(";");
+        path_env.push(sep);
         path_env.push(old);
     }
     let mut cmd = crate::util::hidden_command(&exe);
@@ -132,8 +106,8 @@ pub fn check_engine(llama_path: &str, extra_dll_dir: &str) -> Verdict {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let spawned = {
-        #[cfg(windows)]
-        let _quiet = quiet::QuietErrors::new();
+        // DLL이 빠진 폴더를 실행해도 Windows의 "DLL을 찾을 수 없습니다" 창이 뜨지 않게
+        let _quiet = crate::platform::QuietErrors::new();
         cmd.spawn()
     };
     let mut child = match spawned {

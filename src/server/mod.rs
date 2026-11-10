@@ -111,9 +111,10 @@ pub fn resolve_binary(path: &str) -> Result<(PathBuf, bool)> {
     if path.trim().is_empty() {
         bail!("llama.cpp 위치가 지정되지 않았습니다");
     }
+    let (server_exe, llama_exe) = (crate::platform::exe_name("llama-server"), crate::platform::exe_name("llama"));
     let is_llama_exe = |f: &Path| {
         f.file_name()
-            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("llama.exe"))
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case(&llama_exe))
             .unwrap_or(false)
     };
     if p.is_file() {
@@ -121,20 +122,21 @@ pub fn resolve_binary(path: &str) -> Result<(PathBuf, bool)> {
         return Ok((p, serve));
     }
     if p.is_dir() {
-        let subdirs = ["", "build\\bin", "bin", "build\\bin\\Release"];
+        let subdirs: [&[&str]; 4] = [&[], &["build", "bin"], &["bin"], &["build", "bin", "Release"]];
+        let dir = |sub: &[&str]| sub.iter().fold(p.clone(), |d, s| d.join(s));
         for sub in subdirs {
-            let c = p.join(sub).join("llama-server.exe");
+            let c = dir(sub).join(&server_exe);
             if c.is_file() {
                 return Ok((c, false));
             }
         }
         for sub in subdirs {
-            let c = p.join(sub).join("llama.exe");
+            let c = dir(sub).join(&llama_exe);
             if c.is_file() {
                 return Ok((c, true));
             }
         }
-        bail!("{}에서 llama-server.exe / llama.exe를 찾지 못했습니다", p.display());
+        bail!("{}에서 {server_exe} / {llama_exe}를 찾지 못했습니다", p.display());
     }
     bail!("경로가 존재하지 않습니다: {}", p.display())
 }
@@ -262,18 +264,30 @@ impl ServerManager {
 
         let args = build_args(cfg, serve_mode);
         let exe_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+        // 실행 파일 폴더(와 추가 DLL 폴더)를 PATH 앞에 둔다
+        let sep = if cfg!(windows) { ";" } else { ":" };
         let mut path_env = std::ffi::OsString::new();
         path_env.push(exe_dir.as_os_str());
         if !cfg.extra_dll_dir.trim().is_empty() {
-            path_env.push(";");
+            path_env.push(sep);
             path_env.push(cfg.extra_dll_dir.trim());
         }
+        // Linux: 실행 파일과 같은 폴더의 공유 라이브러리를 찾게 한다
+        let mut lib_env = path_env.clone();
+        if let Some(old) = std::env::var_os("LD_LIBRARY_PATH") {
+            lib_env.push(sep);
+            lib_env.push(old);
+        }
         if let Some(old) = std::env::var_os("PATH") {
-            path_env.push(";");
+            path_env.push(sep);
             path_env.push(old);
         }
 
         let mut cmd = crate::util::hidden_command(&exe);
+        crate::platform::die_with_parent(&mut cmd);
+        if cfg!(unix) {
+            cmd.env("LD_LIBRARY_PATH", lib_env);
+        }
         cmd.args(&args)
             .current_dir(&exe_dir)
             .env("PATH", path_env)

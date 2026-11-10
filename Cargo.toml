@@ -6,8 +6,13 @@ description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
 repository = "https://github.com/kimbad1992/gemma-desktop-search"
 
+[features]
+default = ["gui"]
+# 창이 있는 앱. 끄면(--no-default-features) 창 없이 도는 서비스판만 빌드된다 (Linux 서버·NAS용: `gemma-search serve`).
+gui = ["dep:eframe", "dep:rfd", "dep:raw-window-handle", "dep:lucide-icons"]
+
 [dependencies]
-eframe = "0.37"
+eframe = { version = "0.37", optional = true }
 rusqlite = { version = "0.41", features = ["bundled"] }
 ureq = { version = "3", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,16 +27,25 @@ pdf-extract = "0.12"
 zip = "9"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "tiff"] }
 base64 = "0.23"
-rfd = "0.18"
+rfd = { version = "0.18", optional = true }
 anyhow = "1"
 parking_lot = "0.13"
 half = "2"
 sha2 = "0.10"
-raw-window-handle = "0.6"
+raw-window-handle = { version = "0.6", optional = true }
 # 아이콘 글꼴 (Lucide, ISC). 글꼴 파일과 아이콘 이름만 쓴다.
-lucide-icons = "1.71"
+lucide-icons = { version = "1.71", optional = true }
 # 폴더 변경 알림 (Windows ReadDirectoryChangesW · macOS FSEvents · Linux inotify)
 notify = "8"
+# 서비스판(`serve`)의 검색 API와 웹 페이지
+tiny_http = "0.12"
+# 서비스판: Ctrl+C·종료 신호를 받아 서버를 정리하고 끝낸다
+ctrlc = { version = "3", features = ["termination"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

@@ -3,8 +3,7 @@
 //! 때만 위치를 넘기고, 그 밖의 앱은 처음부터 연다.
 
 use crate::extract::{Kind, Modality};
-use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,25 +33,6 @@ pub fn is_pdf(path: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
-}
-
-/// 확장자(".mp4")에 연결된 기본 앱 실행 파일
-pub fn default_app(ext: &str) -> Option<PathBuf> {
-    use windows_sys::Win32::UI::Shell::{AssocQueryStringW, ASSOCF_NONE, ASSOCSTR_EXECUTABLE};
-    let wide = |s: &str| -> Vec<u16> { std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect() };
-    let assoc = wide(ext);
-    let verb = wide("open");
-    let mut buf = vec![0u16; 1024];
-    let mut len = buf.len() as u32;
-    let hr = unsafe {
-        AssocQueryStringW(ASSOCF_NONE, ASSOCSTR_EXECUTABLE, assoc.as_ptr(), verb.as_ptr(), buf.as_mut_ptr(), &mut len)
-    };
-    if hr != 0 {
-        return None;
-    }
-    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let p = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-    p.is_file().then_some(p)
 }
 
 fn hms(secs: f64) -> String {
@@ -123,7 +103,7 @@ pub fn open_at(path: &str, place: Place) -> Option<String> {
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
-        if let Some(app) = default_app(&ext) {
+        if let Some(app) = crate::platform::default_app_for(&ext) {
             if let Some(args) = place_command(&app, path, place) {
                 // 플레이어·뷰어는 앱을 닫아도 남아 있어야 하므로 Job에 넣지 않는다
                 if Command::new(&app).args(&args).spawn().is_ok() {
@@ -137,7 +117,7 @@ pub fn open_at(path: &str, place: Place) -> Option<String> {
             }
         }
     }
-    crate::util::open_path(path);
+    crate::platform::open_with_default_app(path);
     None
 }
 

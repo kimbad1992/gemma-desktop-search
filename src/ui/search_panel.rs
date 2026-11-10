@@ -20,10 +20,8 @@ const CARD_W: f32 = 168.0;
 /// 처음 화면에 보여주는 예시 검색어
 const EXAMPLES: [&str; 3] = ["바다가 보이는 사진", "예산 회의록", "고양이 영상"];
 
-/// 최소 일치도 이상이거나 질의 단어가 들어 있는 결과 (순위는 키워드 가산점까지 반영된 순서 그대로)
-pub fn passing(hits: &[HitView], min: f32) -> Vec<&HitView> {
-    hits.iter().filter(|h| h.visible(min)).collect()
-}
+// 결과를 추리는 규칙은 화면과 상관없어 `search::query`에 있다
+pub use crate::search::query::{locator_label, passing, unified};
 
 impl GemmaApp {
     pub fn search_tab(&mut self, ui: &mut egui::Ui) {
@@ -590,7 +588,7 @@ impl GemmaApp {
             }
             if reveal {
                 if let Some(p) = p {
-                    crate::util::reveal_path(&shown[p].1.hit.path);
+                    crate::platform::reveal_in_file_manager(&shown[p].1.hit.path);
                     self.leave_quick_after_open = true;
                 }
             }
@@ -643,7 +641,7 @@ impl GemmaApp {
         if enter {
             self.open_hit(hv);
         } else if reveal {
-            crate::util::reveal_path(&hv.hit.path);
+            crate::platform::reveal_in_file_manager(&hv.hit.path);
         } else if copy {
             self.copy_file(&hv.hit.path);
         }
@@ -661,7 +659,7 @@ impl GemmaApp {
     }
 
     pub fn copy_file(&mut self, path: &str) {
-        match crate::util::copy_file_to_clipboard(path) {
+        match crate::platform::copy_file_to_clipboard(path) {
             Ok(()) => self.notify("파일을 클립보드에 복사했습니다 (탐색기·메신저에 붙여넣기)", false),
             Err(e) => self.notify(format!("파일 복사 실패: {e}"), true),
         }
@@ -772,7 +770,7 @@ impl GemmaApp {
                 ui.close();
             }
             if ui.button("폴더에서 보기").clicked() {
-                crate::util::reveal_path(&hv.hit.path);
+                crate::platform::reveal_in_file_manager(&hv.hit.path);
                 ui.close();
             }
             if ui.button("파일 복사").clicked() {
@@ -942,15 +940,16 @@ pub fn hit_visual(ui: &mut egui::Ui, tex: Option<&egui::TextureHandle>, hv: &Hit
 
 /// 긴 경로는 앞부분을 줄여서 표시 (`…\사진\2024`)
 fn short_path(p: &str) -> String {
-    let p = p.trim_end_matches('\\');
+    use crate::paths::{is_sep, SEP};
+    let p = p.trim_end_matches(is_sep);
     if p.chars().count() <= 32 {
         return p.to_string();
     }
-    let parts: Vec<&str> = p.split('\\').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = crate::paths::parts(p).collect();
     match parts.len() {
         0 => p.to_string(),
         1 => crate::util::truncate_chars(p, 32),
-        n => format!("…\\{}\\{}", parts[n - 2], parts[n - 1]),
+        n => format!("…{SEP}{}{SEP}{}", parts[n - 2], parts[n - 1]),
     }
 }
 
@@ -978,37 +977,6 @@ pub fn highlight_job(ui: &egui::Ui, text: &str, size: f32) -> egui::text::Layout
     job
 }
 
-/// "전체" 목록 최대 개수
-const UNIFIED_LIMIT: usize = 60;
-
-/// 모든 섹션을 합쳐 순위 점수(보정 일치도 + 키워드 가산점) 순으로. 같은 파일은 가장 높은 것 하나만.
-/// "고양이 영상"처럼 종류를 말한 질의는 그 종류에 작은 가산점.
-pub fn unified<'a>(visible: &[(Section, Vec<&'a HitView>)], hints: &[Section]) -> Vec<(Section, &'a HitView)> {
-    // 표시된 일치도 순서 그대로. 종류를 말한 질의(hints)는 같은 점수일 때만 그 종류를 앞으로.
-    let mut all: Vec<(Section, &HitView)> =
-        visible.iter().flat_map(|(s, h)| h.iter().map(move |hv| (*s, *hv))).collect();
-    all.sort_by(|a, b| {
-        b.1.hit
-            .score
-            .total_cmp(&a.1.hit.score)
-            .then_with(|| hints.contains(&b.0).cmp(&hints.contains(&a.0)))
-    });
-    let mut seen = std::collections::HashSet::new();
-    all.retain(|(_, hv)| seen.insert(hv.hit.file_id));
-    // 같은 파일이 여러 폴더에 있으면(사진 폴더 + Immich 라이브러리 등) 한 번만: 이름이 같고 점수가 사실상 같으면 복사본
-    let mut kept: Vec<(Section, &HitView)> = Vec::with_capacity(all.len());
-    for (s, hv) in all {
-        let dup = kept.iter().any(|(ks, k)| {
-            *ks == s && k.file_name.eq_ignore_ascii_case(&hv.file_name) && (k.hit.cosine - hv.hit.cosine).abs() < 0.003
-        });
-        if !dup {
-            kept.push((s, hv));
-        }
-    }
-    kept.truncate(UNIFIED_LIMIT);
-    kept
-}
-
 /// "01:30부터 열기", "4페이지 열기" 또는 "열기"
 pub fn open_label(hv: &HitView) -> String {
     match Place::of(&hv.hit.path, hv.hit.kind, hv.hit.modality, hv.hit.locator) {
@@ -1020,19 +988,6 @@ pub fn open_label(hv: &HitView) -> String {
 
 fn is_media(s: Section) -> bool {
     matches!(s, Section::Images | Section::Videos)
-}
-
-pub fn locator_label(hv: &HitView) -> Option<String> {
-    match (hv.hit.modality, hv.hit.kind) {
-        (Modality::Video, _) => Some(format!("{}~ 구간", fmt_ts(hv.hit.locator))),
-        (Modality::Image, Kind::Video) => Some(format!("{} 장면", fmt_ts(hv.hit.locator))),
-        (Modality::Audio, _) => Some(format!("{}부터", fmt_ts(hv.hit.locator))),
-        (Modality::Text, Kind::Doc) if crate::extract::pdf::page_of(hv.hit.locator).is_some() => {
-            crate::extract::pdf::page_of(hv.hit.locator).map(|p| format!("{p}페이지"))
-        }
-        (Modality::Text, _) if hv.hit.locator > 0 => Some(format!("{}번째 구간", hv.hit.locator + 1)),
-        _ => None,
-    }
 }
 
 /// 새 결과 목록에서 선택을 정한다: 고르던 것이 그대로 있으면 그것, 없으면 같은 줄 위치

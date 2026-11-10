@@ -223,15 +223,13 @@ impl GemmaApp {
                                 .on_hover_text("명령 창이 열리고 winget으로 설치합니다. 끝나면 '다시 찾기'를 누르세요.")
                                 .clicked()
                             {
-                                let _ = std::process::Command::new("cmd")
-                                    .args(["/c", "start", "ffmpeg 설치", "cmd", "/k", "winget install --id Gyan.FFmpeg -e"])
-                                    .spawn();
+                                crate::platform::install_ffmpeg();
                             }
                             if widgets::button(ui, Btn::Ghost, "다시 찾기").clicked() {
-                                if let Some(p) = crate::util::find_tool("ffmpeg.exe") {
+                                if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffmpeg")) {
                                     self.cfg.ffmpeg_path = p.display().to_string();
                                 }
-                                if let Some(p) = crate::util::find_tool("ffprobe.exe") {
+                                if let Some(p) = crate::util::find_tool(&crate::platform::exe_name("ffprobe")) {
                                     self.cfg.ffprobe_path = p.display().to_string();
                                 }
                             }

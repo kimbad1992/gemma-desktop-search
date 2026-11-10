@@ -242,10 +242,10 @@ pub fn query_once(args: &[String]) -> i32 {
         let visible: Vec<(crate::search::store::Section, Vec<&query::HitView>)> = o
             .sections
             .iter()
-            .map(|(s, h)| (*s, crate::ui::search_panel::passing(h, min)))
+            .map(|(s, h)| (*s, crate::search::query::passing(h, min)))
             .filter(|(_, h)| !h.is_empty())
             .collect();
-        for (i, (sec, h)) in crate::ui::search_panel::unified(&visible, &o.kind_hints).iter().take(8).enumerate() {
+        for (i, (sec, h)) in crate::search::query::unified(&visible, &o.kind_hints).iter().take(8).enumerate() {
             println!(
                 "    {:>2}. [{}] {} 일치도 {:.3} (의미 {:.3}, 코사인 {:.3}) 단어{:.2}",
                 i + 1,

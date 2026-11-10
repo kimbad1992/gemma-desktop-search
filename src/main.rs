@@ -1,83 +1,124 @@
-// 릴리스 빌드는 콘솔 창 없이 GUI로만 실행
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 창이 있는 앱의 릴리스 빌드는 콘솔 창 없이 실행한다. 서비스판(gui 기능 없이 빌드)은 콘솔 프로그램이다.
+#![cfg_attr(all(not(debug_assertions), feature = "gui"), windows_subsystem = "windows")]
+// 서비스판에는 화면에서만 쓰는 설정·함수가 쓰이지 않은 채 남는다
+#![cfg_attr(not(feature = "gui"), allow(dead_code))]
 
+#[cfg(feature = "gui")]
 mod app;
+#[cfg(feature = "gui")]
 mod autostart;
 mod config;
 mod download;
 mod embed;
 mod extract;
 mod headless;
-mod shell;
-mod sysinfo;
-mod update;
-mod watch;
 mod index;
+#[cfg(feature = "gui")]
 mod open;
+mod paths;
+mod platform;
 mod precheck;
 mod search;
 mod server;
+mod service;
+#[cfg(feature = "gui")]
+mod shell;
+mod sysinfo;
+#[cfg(feature = "gui")]
 mod ui;
+mod update;
 mod util;
+mod watch;
 
-use eframe::egui;
-
-fn main() -> eframe::Result {
+fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     // exe를 바꾸기 전의 위치를 기억해 둔다 (업데이트 뒤 같은 자리의 새 exe로 다시 시작)
     update::exe_path();
     // 업데이트 뒤 다시 시작한 경우: 이전 프로세스가 끝나기를 기다린다
     if let Some(i) = args.iter().position(|a| a == "--after-update") {
         if let Some(pid) = args.get(i + 1).and_then(|p| p.parse::<u32>().ok()) {
-            update::wait_for_previous(pid);
+            platform::wait_for_process_exit(pid, std::time::Duration::from_secs(20));
         }
         args.drain(i..(i + 2).min(args.len()));
     }
-    if args.first().map(|a| a == "--update").unwrap_or(false) {
-        std::process::exit(update::run_cli());
+    if let Some(code) = command(&args) {
+        std::process::exit(code);
     }
-    if args.first().map(|a| a == "--headless-test").unwrap_or(false) {
-        std::process::exit(headless::run(&args[1..]));
+    #[cfg(feature = "gui")]
+    if let Err(e) = gui(&args) {
+        eprintln!("창을 띄우지 못했습니다: {e}");
+        std::process::exit(1);
     }
-    if args.first().map(|a| a == "--stress").unwrap_or(false) {
-        std::process::exit(headless::stress(&args[1..]));
+    #[cfg(not(feature = "gui"))]
+    {
+        eprintln!("Gemma Search v{} (창 없는 서비스판)\n\n{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE, USAGE);
+        std::process::exit(2);
     }
-    if args.first().map(|a| a == "--check-update").unwrap_or(false) {
-        println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
-        match update::check() {
-            Ok(Some((tag, url))) => println!("새 버전 {tag}: {url}"),
-            Ok(None) => println!("새 버전 없음"),
-            Err(e) => println!("확인 실패: {e}"),
+}
+
+/// 창 없이 도는 명령이면 실행하고 종료 코드를 돌려준다. 아니면 None (창을 띄운다).
+fn command(args: &[String]) -> Option<i32> {
+    let rest = args.get(1..).unwrap_or_default();
+    Some(match args.first()?.as_str() {
+        "serve" | "--serve" => service::serve(rest),
+        "search" | "--search" => service::search_cli(rest),
+        "--update" => update::run_cli(),
+        "--check-update" => {
+            println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
+            match update::check() {
+                Ok(Some((tag, url))) => println!("새 버전 {tag}: {url}"),
+                Ok(None) => println!("새 버전 없음"),
+                Err(e) => println!("확인 실패: {e}"),
+            }
+            0
         }
-        return Ok(());
-    }
-    if args.first().map(|a| a == "--sysinfo").unwrap_or(false) {
-        std::process::exit(headless::sysinfo());
-    }
-    if args.first().map(|a| a == "--query-once").unwrap_or(false) {
-        std::process::exit(headless::query_once(&args[1..]));
-    }
-    if args.first().map(|a| a == "--bench-compare").unwrap_or(false) {
-        std::process::exit(headless::bench_compare(&args[1..]));
-    }
-    if args.first().map(|a| a == "--index-once").unwrap_or(false) {
-        std::process::exit(headless::index_once());
-    }
-    if args.first().map(|a| a == "--compat").unwrap_or(false) {
-        std::process::exit(headless::compat(&args[1..]));
-    }
-    if args.first().map(|a| a == "--compare-queries").unwrap_or(false) {
-        std::process::exit(headless::compare_queries(&args[1..]));
-    }
-    if args.first().map(|a| a == "--bench").unwrap_or(false) {
-        std::process::exit(headless::bench(args.get(1).map(String::as_str).unwrap_or("README.md")));
-    }
+        "--sysinfo" => headless::sysinfo(),
+        "--index-once" => headless::index_once(),
+        "--query-once" => headless::query_once(rest),
+        "--compat" => headless::compat(rest),
+        "--headless-test" => headless::run(rest),
+        "--stress" => headless::stress(rest),
+        "--bench" => headless::bench(rest.first().map(String::as_str).unwrap_or("README.md")),
+        "--bench-compare" => headless::bench_compare(rest),
+        "--compare-queries" => headless::compare_queries(rest),
+        _ => return None,
+    })
+}
+
+/// 서비스판(창 없는 빌드)을 명령 없이 실행했을 때의 안내
+#[cfg(not(feature = "gui"))]
+const USAGE: &str = "\
+그 밖의 명령:
+  gemma-search --sysinfo          사양 확인과 추천 설정
+  gemma-search --index-once       바뀐 파일을 한 번 인덱싱하고 끝낸다
+  gemma-search --check-update     새 버전 확인";
+
+/// 창이 있는 앱
+#[cfg(feature = "gui")]
+fn gui(args: &[String]) -> eframe::Result {
+    use eframe::egui;
     // 화면 확인용 --shot <png>: 창을 화면에 띄우지 않고 그려서 PNG로 저장하고 끝낸다 (app::Shot)
     let shot = args.iter().any(|a| a == "--shot");
     // 이미 실행 중이면 그 창을 띄우고 끝낸다 (로그인 시 자동 실행 + 직접 실행이 겹쳐도 하나만)
     if !shot && shell::already_running(&config::data_dir()) {
         return Ok(());
     }
+    // 서비스(gemma-search serve)가 이 데이터 폴더를 쓰는 중이면 띄우지 않는다: 인덱스를 둘이 함께 고치면 안 된다
+    let _lock = if shot {
+        None
+    } else {
+        match config::instance_lock(&config::data_dir()) {
+            Ok(lock) => Some(lock),
+            Err(why) => {
+                rfd::MessageDialog::new()
+                    .set_title("Gemma Search")
+                    .set_description(why)
+                    .set_level(rfd::MessageLevel::Warning)
+                    .show();
+                return Ok(());
+            }
+        }
+    };
     // --background: 창 없이 트레이로 시작 (로그인 시 실행)
     let background = args.iter().any(|a| a == "--background");
     // --size 1280x860: 창 크기 (화면 확인용)

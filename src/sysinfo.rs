@@ -91,89 +91,6 @@ fn driver_major(v: &str) -> Option<u32> {
     v.split('.').next()?.trim().parse().ok()
 }
 
-fn ram_mb() -> u64 {
-    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
-        return 0;
-    }
-    m.ullTotalPhys / 1_048_576
-}
-
-fn free_disk_mb(dir: &Path) -> u64 {
-    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    let mut p = dir.to_path_buf();
-    while !p.exists() {
-        match p.parent() {
-            Some(q) => p = q.to_path_buf(),
-            None => break,
-        }
-    }
-    let w: Vec<u16> = p.as_os_str().encode_wide_null();
-    let mut free = 0u64;
-    let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
-    if ok == 0 {
-        0
-    } else {
-        free / 1_048_576
-    }
-}
-
-trait WideNull {
-    fn encode_wide_null(&self) -> Vec<u16>;
-}
-impl WideNull for std::ffi::OsStr {
-    fn encode_wide_null(&self) -> Vec<u16> {
-        use std::os::windows::ffi::OsStrExt;
-        self.encode_wide().chain(Some(0)).collect()
-    }
-}
-
-/// PowerShell 한 번으로 Windows 버전과 그래픽카드 목록(레지스트리의 정확한 VRAM)을 얻는다
-fn os_and_adapters() -> (String, u32, Vec<Gpu>) {
-    let script = r#"
-$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-"OS`t$($cv.ProductName)`t$($cv.DisplayVersion)`t$($cv.CurrentBuildNumber)"
-Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}' -ErrorAction SilentlyContinue |
-  Where-Object { $_.PSChildName -match '^\d{4}$' } | ForEach-Object {
-    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-    $mem = $p.'HardwareInformation.qwMemorySize'
-    if (-not $mem) { $mem = $p.'HardwareInformation.MemorySize' }
-    if ($mem -is [byte[]]) { $mem = [BitConverter]::ToUInt32($mem, 0) }
-    if ($p.DriverDesc) { "GPU`t$($p.DriverDesc)`t$([uint64]$mem)" }
-  }
-"#;
-    let mut cmd = hidden_command("powershell.exe");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    let mut os = String::from("Windows");
-    let mut build = 0;
-    let mut gpus = Vec::new();
-    if let Ok(out) = run_capture(cmd, Duration::from_secs(20)) {
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let f: Vec<&str> = line.trim_end().split('\t').collect();
-            match f.as_slice() {
-                ["OS", name, ver, b] => {
-                    build = b.trim().parse().unwrap_or(0);
-                    // Windows 11도 ProductName은 "Windows 10 …"으로 남아 있다 → 빌드 번호로 판별
-                    let name = if build >= 22000 { name.replace("Windows 10", "Windows 11") } else { name.to_string() };
-                    os = format!("{name} {ver} (빌드 {build})");
-                }
-                ["GPU", name, mem] => {
-                    let vram_mb = mem.trim().parse::<u64>().unwrap_or(0) / 1_048_576;
-                    let vendor = vendor_of(name);
-                    // 원격 데스크톱·가상 어댑터 등은 뺀다
-                    if vendor != Vendor::Other || vram_mb >= 1024 {
-                        gpus.push(Gpu { name: name.to_string(), vram_mb, driver: None, vendor });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    (os, build, gpus)
-}
-
 /// NVIDIA 카드는 nvidia-smi로 VRAM과 드라이버 버전을 정확히
 fn nvidia_smi() -> Vec<(String, u64, String)> {
     let mut cmd = hidden_command("nvidia-smi");
@@ -191,7 +108,22 @@ fn nvidia_smi() -> Vec<(String, u64, String)> {
 }
 
 pub fn probe(app_dir: &Path, ffmpeg: bool) -> SysInfo {
-    let (os, build, mut gpus) = os_and_adapters();
+    let info = crate::platform::os_and_adapters();
+    let mut gpus: Vec<Gpu> = info
+        .adapters
+        .into_iter()
+        .filter_map(|(name, vram_bytes)| {
+            let vram_mb = vram_bytes / 1_048_576;
+            let vendor = vendor_of(&name);
+            // 원격 데스크톱·가상 어댑터 등은 뺀다
+            (vendor != Vendor::Other || vram_mb >= 1024).then_some(Gpu {
+                name,
+                vram_mb,
+                driver: None,
+                vendor,
+            })
+        })
+        .collect();
     let smi = nvidia_smi();
     if !smi.is_empty() {
         gpus.retain(|g| g.vendor != Vendor::Nvidia);
@@ -200,10 +132,10 @@ pub fn probe(app_dir: &Path, ffmpeg: bool) -> SysInfo {
         }
     }
     SysInfo {
-        os,
-        build,
-        ram_mb: ram_mb(),
-        free_disk_mb: free_disk_mb(app_dir),
+        os: info.name,
+        build: info.build,
+        ram_mb: crate::platform::total_memory_mb(),
+        free_disk_mb: crate::platform::free_disk_mb(app_dir),
         gpus,
         ffmpeg,
     }
@@ -222,11 +154,11 @@ fn server_for(vram_mb: u64) -> (u32, u32, u32, u32) {
 
 pub fn recommend(info: &SysInfo) -> Plan {
     let mut checks = Vec::new();
-    // Windows
-    let os_ok = info.build >= 10240;
+    // 운영체제: Windows는 10 이상이어야 한다
+    let os_ok = !cfg!(windows) || info.build >= 10240;
     checks.push((
         if os_ok { Level::Ok } else { Level::Bad },
-        "Windows".to_string(),
+        if cfg!(windows) { "Windows" } else { "운영체제" }.to_string(),
         info.os.clone(),
     ));
     // 메모리: 검색용 벡터가 메모리에 올라간다 (벡터 10만 개 ≈ 300MB)

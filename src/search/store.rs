@@ -97,8 +97,15 @@ pub struct Hit {
 
 /// 폴더 비교용 키: 소문자 + 끝에 '\' 하나 (예: `c:\`, `\\nas\share\photos\`)
 pub fn folder_key(path: &str) -> String {
-    let mut k = path.trim().trim_end_matches(['\\', '/']).to_lowercase().replace('/', "\\");
-    k.push('\\');
+    use crate::paths::{is_sep, SEP};
+    let mut k: String = path
+        .trim()
+        .trim_end_matches(is_sep)
+        .to_lowercase()
+        .chars()
+        .map(|c| if is_sep(c) { SEP } else { c })
+        .collect();
+    k.push(SEP);
     k
 }
 
