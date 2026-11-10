@@ -45,11 +45,6 @@ fn level_tone(lv: Level) -> Tone {
     }
 }
 
-/// 단계 제목. 끝난 단계에는 ✔를 붙인다.
-fn step_title(n: u32, title: &str, done: bool) -> String {
-    format!("{n}. {title}{}", if done { "  ✔" } else { "" })
-}
-
 impl GemmaApp {
     /// 마법사 열기 (사양 확인을 백그라운드로 시작)
     pub fn open_setup(&mut self, ctx: &egui::Context) {
@@ -143,10 +138,10 @@ impl GemmaApp {
             );
 
             // ── 1. PC 확인 ──
-            widgets::section(ui, &step_title(1, "PC 확인", plan.is_some()), None, |ui| match &plan {
+            widgets::step_section(ui, 1, "PC 확인", plan.is_some(), None, |ui| match &plan {
                 None => {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        widgets::spinner(ui);
                         ui.label("그래픽카드·메모리·디스크를 확인하는 중…");
                     });
                 }
@@ -156,7 +151,7 @@ impl GemmaApp {
                         widgets::status_line(ui, level_tone(*level), &format!("{name}: {text}"));
                     }
                     if plan.checks.iter().any(|c| c.0 == Level::Bad) {
-                        widgets::tone_label(ui, Tone::Danger, "✖ 표시된 항목은 실행이 어렵습니다. 그래도 계속할 수는 있습니다.");
+                        widgets::tone_note(ui, Tone::Danger, "표시된 항목은 실행이 어렵습니다. 그래도 계속할 수는 있습니다.");
                     }
                     if widgets::button(ui, Btn::Ghost, "다시 확인").clicked() {
                         self.probe.start(ffmpeg_ok, &ctx);
@@ -165,9 +160,11 @@ impl GemmaApp {
             });
 
             // ── 2. 필요한 파일 ──
-            widgets::section(
+            widgets::step_section(
                 ui,
-                &step_title(2, "필요한 파일 준비", files_ok),
+                2,
+                "필요한 파일 준비",
+                files_ok,
                 Some("AI 모델(EmbeddingGemma 2)과 그 모델을 돌리는 프로그램(llama.cpp)이 필요합니다. 받으면 이 프로그램 폴더 아래에 놓이고, 폴더째 옮겨도 그대로 씁니다."),
                 |ui| {
                     // AI 모델
@@ -202,7 +199,7 @@ impl GemmaApp {
                         match &engine_verdict {
                             None => {
                                 ui.horizontal(|ui| {
-                                    ui.spinner();
+                                    widgets::spinner(ui);
                                     ui.label("llama.cpp를 실행해 보는 중…");
                                 });
                             }
@@ -279,7 +276,7 @@ impl GemmaApp {
                                 verdict_line(ui, engine_verdict.as_ref(), "실행해 보는 중…");
                                 // 빠진 DLL을 채워 넣은 뒤 다시 볼 수 있게
                                 if llama_ok && engine_verdict.as_ref().is_some_and(|v| v.level != Level::Ok) {
-                                    recheck = ui.small_button("다시 검사").clicked();
+                                    recheck = widgets::small_button(ui, Btn::Secondary, "다시 검사").clicked();
                                 }
                             });
                             model_changed = path_row(
@@ -294,12 +291,12 @@ impl GemmaApp {
                                 let has = self.cfg.has_mmproj() && Path::new(self.cfg.mmproj_path.trim()).is_file();
                                 status_row(ui, |ui| {
                                     if has {
-                                        widgets::tone_label(ui, Tone::Ok, "✔ 사진·영상·소리용 파일(mmproj)도 찾았습니다");
+                                        widgets::tone_note(ui, Tone::Ok, "사진·영상·소리용 파일(mmproj)도 찾았습니다");
                                     } else {
-                                        widgets::tone_label(
+                                        widgets::tone_note(
                                             ui,
                                             Tone::Warn,
-                                            "⚠ 같은 폴더에 mmproj-*.gguf가 없어 글만 내용으로 찾습니다",
+                                            "같은 폴더에 mmproj-*.gguf가 없어 글만 내용으로 찾습니다",
                                         );
                                     }
                                 });
@@ -325,9 +322,11 @@ impl GemmaApp {
             );
 
             // ── 3. 이 PC에 맞추기 ──
-            widgets::section(
+            widgets::step_section(
                 ui,
-                &step_title(3, "이 PC에 맞추기", plan.is_some() && self.setup.apply_plan),
+                3,
+                "이 PC에 맞추기",
+                plan.is_some() && self.setup.apply_plan,
                 None,
                 |ui| match &plan {
                     Some(plan) => {
@@ -344,9 +343,11 @@ impl GemmaApp {
             );
 
             // ── 4. 검색할 폴더 ──
-            widgets::section(
+            widgets::step_section(
                 ui,
-                &step_title(4, "검색할 폴더", !self.cfg.roots.is_empty()),
+                4,
+                "검색할 폴더",
+                !self.cfg.roots.is_empty(),
                 Some("사진·문서·영상이 있는 폴더를 고르세요."),
                 |ui| {
                     let mut remove = None;
@@ -376,9 +377,11 @@ impl GemmaApp {
             // ── 5. 동작 확인 (선택) ──
             let state = self.server.state();
             let caps = self.server.capabilities();
-            widgets::section(
+            widgets::step_section(
                 ui,
-                &step_title(5, "동작 확인 (선택)", caps.is_some()),
+                5,
+                "동작 확인 (선택)",
+                caps.is_some(),
                 Some("llama.cpp 서버를 켜서 모델이 글·사진·소리를 실제로 처리하는지 시험해 봅니다."),
                 |ui| {
                     ui.horizontal(|ui| {

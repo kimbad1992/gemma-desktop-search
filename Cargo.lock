@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "gemma-search"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1602,6 +1602,7 @@ dependencies = [
  "encoding_rs",
  "half",
  "image",
+ "lucide-icons",
  "parking_lot 0.13.0",
  "pdf-extract",
  "raw-window-handle",
@@ -2338,6 +2339,12 @@ dependencies = [
  "ttf-parser",
  "weezl",
 ]
+
+[[package]]
+name = "lucide-icons"
+version = "1.71.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b0755f5e6d1e359cc48eafd14f366e55d48efaf6abd796a7c3ca15de7ef9726"
 
 [[package]]
 name = "lzma-rust2"

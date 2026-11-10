@@ -4,33 +4,43 @@
 use crate::app::GemmaApp;
 use crate::search::query::HitView;
 use crate::search::store::Section;
-use crate::ui::search_panel::{locator_label, passing, unified, SEARCH_BOX};
-use crate::ui::widgets;
+use crate::ui::search_panel::{hit_visual, locator_label, passing, unified, SEARCH_BOX};
+use crate::ui::widgets::{self, Btn, Icon};
 use eframe::egui::{self, RichText};
 
 /// 빠른 검색창에 보여주는 결과 수
 const QUICK_LIMIT: usize = 12;
-const ROW_H: f32 = 52.0;
+/// 결과 줄 왼쪽 그림의 한 변
+const THUMB: f32 = 40.0;
 
 impl GemmaApp {
     pub fn quick_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let accent = crate::ui::theme::palette(ui.visuals()).accent;
+        let p = crate::ui::theme::palette(ui.visuals());
+        // 테두리 없는 창이라, 뒤의 화면과 구별되게 강조색 테두리를 두른다
         let frame = egui::Frame::new()
-            .fill(ui.visuals().panel_fill)
-            .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.7)))
-            .inner_margin(12);
+            .fill(p.panel)
+            .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.75)))
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 14,
+                top: 12,
+                bottom: 8,
+            });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             // ── 입력 ──
             ui.horizontal(|ui| {
-                ui.label(RichText::new("🔍").size(22.0));
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.add_space(4.0);
+                widgets::icon(ui, Icon::Search, 20.0, p.accent_text);
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.query)
                         .id(egui::Id::unique(SEARCH_BOX))
                         .hint_text("찾고 싶은 내용을 설명하세요 (사진, 영상, 문서, 소리)")
                         .font(crate::ui::theme::query_font())
-                        .desired_width(ui.available_width() - 120.0)
-                        .frame(egui::Frame::NONE),
+                        .desired_width(ui.available_width() - 130.0)
+                        .frame(egui::Frame::NONE)
+                        .align(egui::Align2::LEFT_CENTER),
                 );
                 if self.focus_search {
                     resp.request_focus();
@@ -71,8 +81,7 @@ impl GemmaApp {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button("큰 창 ⤢")
+                    if widgets::icon_button(ui, Btn::Ghost, Icon::Maximize2, "큰 창")
                         .on_hover_text("같은 검색을 큰 창에서 (Ctrl+O)")
                         .clicked()
                     {
@@ -80,18 +89,28 @@ impl GemmaApp {
                     }
                     let st = self.server.state();
                     if self.pending_search_waiting() || !st.is_ready() && st.is_running() {
-                        ui.spinner();
+                        widgets::spinner(ui);
                         ui.label(RichText::new("서버 준비 중").small().weak());
                     } else if self.search_rx.is_some() {
-                        ui.spinner();
+                        widgets::spinner(ui);
                     }
                 });
             });
-            ui.separator();
+            ui.add_space(4.0);
+            widgets::hairline(ui);
             // 아래에 늘 보이는 단축키 안내
-            egui::Panel::bottom("quick_hint").show(ui, |ui| {
-                widgets::caption(ui, "↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Ctrl+O 큰 창 · Esc 닫기");
-            });
+            egui::Panel::bottom("quick_hint")
+                .show_separator_line(false)
+                .frame(egui::Frame::new().inner_margin(egui::Margin {
+                    left: 4,
+                    right: 4,
+                    top: 6,
+                    bottom: 0,
+                }))
+                .show(ui, |ui| {
+                    widgets::caption(ui, "↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Ctrl+O 큰 창 · Esc 닫기");
+                });
+            ui.add_space(4.0);
 
             // ── 결과 ──
             let Some(outcome) = self.outcome.take() else {
@@ -134,7 +153,14 @@ impl GemmaApp {
             if let Some(hv) = selected {
                 egui::Panel::right("quick_preview")
                     .resizable(false)
-                    .exact_size(ui.available_width() * 0.45)
+                    .show_separator_line(false)
+                    .exact_size(ui.available_width() * 0.46)
+                    .frame(widgets::card_frame(ui).outer_margin(egui::Margin {
+                        left: 10,
+                        right: 0,
+                        top: 0,
+                        bottom: 2,
+                    }))
                     .show(ui, |ui| self.preview_panel(ui, &ctx, hv, outcome.expr.as_deref()));
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
@@ -147,56 +173,33 @@ impl GemmaApp {
     }
 
     fn quick_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sec: Section, hv: &HitView) {
+        use crate::ui::theme::{self, Tone};
         let is_sel = self.selected == Some((sec, hv.hit.file_id));
-        let p = crate::ui::theme::palette(ui.visuals());
-        let resp = egui::Frame::new()
-            .fill(if is_sel { p.accent_soft } else { egui::Color32::TRANSPARENT })
-            .corner_radius(6)
-            .inner_margin(egui::Margin::symmetric(6, 4))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.set_height(ROW_H - 8.0);
-                ui.horizontal(|ui| {
-                    let tex = hv.thumb_chunk.and_then(|c| self.thumb_texture(ctx, c));
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::hover());
-                    match tex {
-                        Some(t) => {
-                            egui::Image::new(&t).corner_radius(4).paint_at(ui, rect);
+        let tex = hv.thumb_chunk.and_then(|c| self.thumb_texture(ctx, c));
+        let resp = Self::hit_box(ui, is_sel, egui::Margin::symmetric(8, 6), |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                hit_visual(ui, tex.as_ref(), hv, THUMB);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.add(
+                        egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_strong()).strong()).truncate(),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 7.0;
+                        widgets::score_bar(ui, hv.hit.score, widgets::ScoreStyle::Compact);
+                        ui.label(RichText::new(sec.label()).small().weak());
+                        if let Some(l) = locator_label(hv) {
+                            ui.label(RichText::new(l).small().color(Tone::Info.fg(ui.visuals())));
                         }
-                        None => {
-                            ui.painter().rect_filled(rect, 4.0, p.inset_fill);
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                kind_icon(sec),
-                                egui::FontId::proportional(18.0),
-                                ui.visuals().weak_text_color(),
-                            );
+                        if hv.keyword_match() {
+                            ui.label(RichText::new("검색어 포함").small().color(Tone::Ok.fg(ui.visuals())));
                         }
-                    }
-                    ui.vertical(|ui| {
-                        use crate::ui::theme::{self, Tone};
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_strong()).strong())
-                                    .truncate(),
-                            );
-                        });
-                        ui.horizontal(|ui| {
-                            widgets::score_bar(ui, hv.hit.score, widgets::ScoreStyle::Compact);
-                            ui.label(RichText::new(sec.label()).small().weak());
-                            if let Some(l) = locator_label(hv) {
-                                ui.label(RichText::new(l).small().color(Tone::Info.fg(ui.visuals())));
-                            }
-                            if hv.keyword_match() {
-                                ui.label(RichText::new("검색어 포함").small().color(Tone::Ok.fg(ui.visuals())));
-                            }
-                        });
                     });
                 });
-            })
-            .response
-            .interact(egui::Sense::click());
+            });
+        });
         if resp.clicked() {
             self.user_select(sec, hv.hit.file_id);
         }
@@ -207,15 +210,5 @@ impl GemmaApp {
             resp.scroll_to_me(Some(egui::Align::Center));
             self.scroll_to_selected = false;
         }
-    }
-}
-
-fn kind_icon(sec: Section) -> &'static str {
-    match sec {
-        Section::Docs => "📄",
-        Section::Images => "🖼",
-        Section::Videos => "🎬",
-        Section::Audio => "🎵",
-        Section::Names => "📁",
     }
 }

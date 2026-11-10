@@ -1,18 +1,23 @@
-//! 공용 위젯: 화면 틀(page·card·section), 제목·도움말, 안내 상자, 버튼, 토글, 탭 묶음, 배지, 통계 카드, 토스트.
+//! 공용 위젯: 화면 틀(page·card·section), 제목·도움말, 안내 상자, 버튼, 토글, 탭 묶음, 칩, 배지, 통계 카드, 토스트.
 //!
 //! 색과 크기는 `theme`에서 가져온다. 화면 코드는 여기 있는 부품만 조합해서 모양을 통일한다.
+//! 버튼·칩·토글·막대는 egui 기본 위젯을 쓰지 않고 직접 그린다 (그라데이션, 올렸을 때의 움직임, 아이콘).
 
 use crate::index::progress::RunState;
 use crate::server::ServerState;
-use crate::ui::theme::{self, palette, space, Tone};
-use eframe::egui::{self, Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke, TextStyle, Vec2};
+use crate::ui::theme::{self, palette, space, Hue, Tone};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, FontFamily, FontId, Layout, Margin, Pos2, Rect, RichText, Sense, Shadow, Stroke,
+    StrokeKind, TextStyle, Vec2,
+};
+pub use lucide_icons::Icon;
 
 // 점·막대 채움용 색. 글자·테두리에는 `Tone`을 쓴다 (밝은 테마에서 대비가 맞도록).
-pub const GREEN: Color32 = Color32::from_rgb(46, 160, 67);
-pub const YELLOW: Color32 = Color32::from_rgb(214, 158, 26);
-pub const GRAY: Color32 = Color32::from_rgb(128, 128, 128);
-pub const BLUE: Color32 = Color32::from_rgb(56, 132, 244);
-pub const RED: Color32 = Color32::from_rgb(214, 54, 51);
+pub const GREEN: Color32 = Color32::from_rgb(52, 199, 128);
+pub const YELLOW: Color32 = Color32::from_rgb(240, 170, 60);
+pub const GRAY: Color32 = Color32::from_rgb(128, 134, 152);
+pub const BLUE: Color32 = Color32::from_rgb(98, 114, 255);
+pub const RED: Color32 = Color32::from_rgb(240, 84, 78);
 
 pub fn server_color(s: &ServerState) -> Color32 {
     match s {
@@ -52,9 +57,81 @@ pub fn run_tone(s: RunState) -> Tone {
     }
 }
 
-fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round().clamp(0.0, 255.0) as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+// ── 아이콘 · 그라데이션 ──
+
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(theme::ICONS.into()))
+}
+
+/// `center`에 아이콘을 그린다 (자리를 차지하지 않는다)
+pub fn paint_icon(painter: &egui::Painter, center: Pos2, icon: Icon, size: f32, color: Color32) {
+    let g = painter.layout_no_wrap(icon.unicode().to_string(), icon_font(size), color);
+    painter.galley(center - g.size() / 2.0, g, color);
+}
+
+/// 아이콘 하나 (정사각형 자리를 차지한다)
+pub fn icon(ui: &mut egui::Ui, icon: Icon, size: f32, color: Color32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_icon(ui.painter(), rect.center(), icon, size, color);
+    }
+    resp
+}
+
+/// 글 한 줄 높이에 맞춰 놓는 아이콘 (위로 정렬된 줄에서 글자와 높이가 맞게)
+fn icon_in_row(ui: &mut egui::Ui, glyph: Icon, size: f32, color: Color32, row_h: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, row_h.max(size)), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        paint_icon(ui.painter(), rect.center(), glyph, size, color);
+    }
+}
+
+const GRADIENT_N: usize = 64;
+
+fn gradient_texture(ctx: &egui::Context, dark: bool) -> egui::TextureId {
+    let id = egui::Id::unique(("accent-gradient", dark));
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return t.id();
+    }
+    let (a, b) = theme::gradient(dark);
+    let px: Vec<Color32> = (0..GRADIENT_N).map(|i| mix(a, b, i as f32 / (GRADIENT_N - 1) as f32)).collect();
+    let tex = ctx.load_texture(
+        format!("accent-gradient-{dark}"),
+        egui::ColorImage::new([GRADIENT_N, 1], px),
+        egui::TextureOptions::LINEAR,
+    );
+    let tid = tex.id();
+    ctx.data_mut(|d| d.insert_temp(id, tex));
+    tid
+}
+
+/// 강조 그라데이션(남색→청록)으로 채운 둥근 사각형. `tint`로 투명도를 조절한다 (흰색이면 그대로).
+pub fn paint_gradient(ui: &egui::Ui, rect: Rect, radius: impl Into<CornerRadius>, tint: Color32) {
+    let tex = gradient_texture(ui.ctx(), ui.visuals().dark_mode);
+    // 양 끝 픽셀이 번지지 않게 반 픽셀 안쪽만 쓴다
+    let half = 0.5 / GRADIENT_N as f32;
+    let uv = Rect::from_min_max(egui::pos2(half, 0.0), egui::pos2(1.0 - half, 1.0));
+    ui.painter()
+        .add(egui::epaint::RectShape::filled(rect, radius, tint).with_texture(tex, uv));
+}
+
+/// 올렸을 때 서서히 바뀌는 정도 (0~1)
+fn hover_t(ui: &egui::Ui, resp: &egui::Response, on: bool) -> f32 {
+    ui.ctx().animate_bool_with_time(resp.id.with("hover"), on && resp.hovered(), 0.12)
+}
+
+/// 키보드로 골랐을 때의 테두리
+fn focus_ring(ui: &egui::Ui, resp: &egui::Response, rect: Rect, radius: f32) {
+    if resp.has_focus() {
+        let c = palette(ui.visuals()).accent_text;
+        ui.painter()
+            .rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(1.5, c), StrokeKind::Outside);
+    }
 }
 
 // ── 화면 틀 ──
@@ -79,6 +156,9 @@ pub fn centered<R>(ui: &mut egui::Ui, max_w: f32, add: impl FnOnce(&mut egui::Ui
 /// 긴 화면의 아랫부분을 입력 없이 캡처하기 위한 것.
 pub static TEST_SCROLL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// 화면 확인용 (`--open filter_kinds`): 이 이름의 드롭다운을 펼친 채로 그린다.
+pub static TEST_OPEN: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
 /// 화면 전체를 감싸는 틀: 세로 스크롤 + 가운데 정렬된 최대 폭 `max_w`의 본문
 pub fn page<R>(ui: &mut egui::Ui, id: &str, max_w: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let mut area = egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]);
@@ -91,21 +171,37 @@ pub fn page<R>(ui: &mut egui::Ui, id: &str, max_w: f32, add: impl FnOnce(&mut eg
             centered(ui, max_w, |ui| {
                 ui.add_space(space::S);
                 let r = add(ui);
-                ui.add_space(space::L);
+                ui.add_space(space::XL);
                 r
             })
         })
         .inner
 }
 
-/// 테두리 있는 카드 (폭은 가능한 만큼 채운다)
-pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let p = palette(ui.visuals());
-    egui::Frame::new()
+/// 카드의 틀 (바탕·옅은 테두리·둥근 모서리)
+pub fn card_frame(ui: &egui::Ui) -> egui::Frame {
+    let v = ui.visuals();
+    let p = palette(v);
+    let mut f = egui::Frame::new()
         .fill(p.card_fill)
         .stroke(Stroke::new(1.0, p.card_stroke))
         .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::same(theme::CARD_PAD))
+        .inner_margin(Margin::same(theme::CARD_PAD));
+    if !v.dark_mode {
+        // 밝은 테마에서는 카드가 바탕에서 살짝 떠 보이게
+        f = f.shadow(Shadow {
+            offset: [0, 2],
+            blur: 10,
+            spread: 0,
+            color: Color32::from_black_alpha(10),
+        });
+    }
+    f
+}
+
+/// 테두리 있는 카드 (폭은 가능한 만큼 채운다)
+pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    card_frame(ui)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)
@@ -115,7 +211,7 @@ pub fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
 
 /// 제목 + (도움말) + 카드
 pub fn section<R>(ui: &mut egui::Ui, title: &str, help_text: Option<&str>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.add_space(space::S);
+    ui.add_space(space::M);
     // 제목 줄 높이를 버튼이 있는 `section_with`와 맞춘다 (두 열로 나란히 놓였을 때 어긋나지 않게)
     ui.horizontal(|ui| {
         ui.set_min_height(ui.spacing().interact_size.y);
@@ -134,7 +230,7 @@ pub fn section_with<H, R>(
     header_right: impl FnOnce(&mut egui::Ui) -> H,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> (H, R) {
-    ui.add_space(space::S);
+    ui.add_space(space::M);
     let h = ui
         .horizontal(|ui| {
             ui.set_min_height(ui.spacing().interact_size.y);
@@ -161,9 +257,15 @@ pub fn collapsing_section<R>(
         .body_returned
 }
 
+/// 한 줄짜리 옅은 구분선
+pub fn hairline(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, palette(ui.visuals()).card_stroke);
+}
+
 // ── 글자 ──
 
-/// 화면 제목 (20 굵게)
+/// 화면 제목 (22 굵게)
 pub fn page_title(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).text_style(TextStyle::Heading).strong());
 }
@@ -183,7 +285,7 @@ pub fn help(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).weak());
 }
 
-/// 덧붙이는 작은 글 (11.5, 옅은 색)
+/// 덧붙이는 작은 글 (12, 옅은 색)
 pub fn caption(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).small().weak());
 }
@@ -196,9 +298,76 @@ pub fn tone_label(ui: &mut egui::Ui, tone: Tone, text: impl Into<String>) -> egu
 /// 아이콘 + 글 한 줄 (✔ 준비됨 / ✖ 없음)
 pub fn status_line(ui: &mut egui::Ui, tone: Tone, text: &str) {
     ui.horizontal_wrapped(|ui| {
-        ui.colored_label(tone.fg(ui.visuals()), tone.icon());
+        ui.spacing_mut().interact_size.y = 22.0;
+        let row = ui.text_style_height(&TextStyle::Body);
+        let fg = tone.fg(ui.visuals());
+        icon_in_row(ui, tone.glyph(), 15.0, fg, row);
         ui.label(text);
     });
+}
+
+/// 글자 옆에 놓는 돌아가는 표시
+pub fn spinner(ui: &mut egui::Ui) -> egui::Response {
+    ui.add(egui::Spinner::new().size(16.0))
+}
+
+/// 아이콘과 글을 한 줄로 이은 레이아웃 (글이 길면 줄이 바뀐다)
+pub fn icon_text_job(ui: &egui::Ui, glyph: Icon, text: &str, color: Color32) -> egui::text::LayoutJob {
+    let font = TextStyle::Body.resolve(ui.style());
+    let mut job = egui::text::LayoutJob::default();
+    let icon_fmt = egui::TextFormat {
+        font_id: icon_font(font.size + 1.0),
+        color,
+        valign: Align::Center,
+        ..Default::default()
+    };
+    job.append(&glyph.unicode().to_string(), 0.0, icon_fmt);
+    let text_fmt = egui::TextFormat {
+        font_id: font,
+        color,
+        valign: Align::Center,
+        ..Default::default()
+    };
+    job.append(text, 6.0, text_fmt);
+    job
+}
+
+/// 뜻에 맞는 아이콘 + 같은 색의 글 (✔ 파일 있음 / ⚠ 비어 있음)
+pub fn tone_note(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response {
+    let job = icon_text_job(ui, tone.glyph(), text, tone.fg(ui.visuals()));
+    ui.add(egui::Label::new(job).wrap())
+}
+
+/// 순서가 있는 단계의 섹션 (처음 설정): 번호 동그라미 + 제목 + (도움말) + 카드. 끝난 단계는 번호 대신 체크.
+pub fn step_section<R>(
+    ui: &mut egui::Ui,
+    n: u32,
+    title: &str,
+    done: bool,
+    help_text: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.add_space(space::M);
+    ui.horizontal(|ui| {
+        ui.set_min_height(ui.spacing().interact_size.y);
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+        let v = ui.visuals();
+        let p = palette(v);
+        if done {
+            ui.painter().circle_filled(rect.center(), 12.0, Tone::Ok.bg(v));
+            paint_icon(ui.painter(), rect.center(), Icon::Check, 14.0, Tone::Ok.fg(v));
+        } else {
+            ui.painter().circle_filled(rect.center(), 12.0, p.accent_soft);
+            let font = FontId::new(13.0, FontFamily::Name(theme::SEMIBOLD.into()));
+            let g = ui.painter().layout_no_wrap(n.to_string(), font, p.accent_text);
+            ui.painter().galley(rect.center() - g.size() / 2.0, g, p.accent_text);
+        }
+        section_title(ui, title);
+    });
+    if let Some(h) = help_text {
+        help(ui, h);
+    }
+    card(ui, add)
 }
 
 // ── 안내 상자 ──
@@ -207,8 +376,8 @@ fn callout_frame(ui: &egui::Ui, tone: Tone) -> egui::Frame {
     let v = ui.visuals();
     egui::Frame::new()
         .fill(tone.bg(v))
-        .stroke(Stroke::new(1.0, tone.fg(v).gamma_multiply(0.5)))
-        .corner_radius(CornerRadius::same(theme::RADIUS_SM))
+        .stroke(Stroke::new(1.0, tone.fg(v).gamma_multiply(0.32)))
+        .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::symmetric(12, 10))
 }
 
@@ -227,14 +396,18 @@ pub fn callout_ui<R>(ui: &mut egui::Ui, tone: Tone, title: &str, add: impl FnOnc
     callout_frame(ui, tone)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if !title.is_empty() {
-                ui.label(
-                    RichText::new(format!("{} {title}", tone.icon()))
-                        .text_style(theme::ts_strong())
-                        .color(fg),
-                );
-            }
-            add(ui)
+            ui.horizontal_top(|ui| {
+                let row = ui.text_style_height(&theme::ts_strong());
+                icon_in_row(ui, tone.glyph(), 16.0, fg, row);
+                ui.vertical(|ui| {
+                    if !title.is_empty() {
+                        ui.label(RichText::new(title).text_style(theme::ts_strong()).color(fg));
+                    }
+                    add(ui)
+                })
+                .inner
+            })
+            .inner
         })
         .inner
 }
@@ -243,7 +416,7 @@ pub fn callout_ui<R>(ui: &mut egui::Ui, tone: Tone, title: &str, add: impl FnOnc
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Btn {
-    /// 그 화면의 주된 동작 (강조색 채움)
+    /// 그 화면의 주된 동작 (강조 그라데이션)
     Primary,
     /// 보통 버튼
     Secondary,
@@ -254,45 +427,124 @@ pub enum Btn {
 }
 
 pub fn button(ui: &mut egui::Ui, kind: Btn, text: &str) -> egui::Response {
-    button_enabled(ui, kind, true, text)
+    button_impl(ui, kind, true, None, text, theme::CONTROL_H)
 }
 
 pub fn button_enabled(ui: &mut egui::Ui, kind: Btn, enabled: bool, text: &str) -> egui::Response {
-    ui.scope(|ui| {
-        let p = palette(ui.visuals());
-        let dark = ui.visuals().dark_mode;
-        let danger_bg = Tone::Danger.bg(ui.visuals());
-        let w = &mut ui.visuals_mut().widgets;
-        match kind {
-            Btn::Primary => {
-                // Button::fill은 hover 표시가 사라지므로 상태별 색을 직접 준다
-                let hover = mix(p.accent, if dark { Color32::WHITE } else { Color32::BLACK }, 0.12);
-                let press = mix(p.accent, Color32::BLACK, 0.18);
-                for (wv, fill) in [(&mut w.inactive, p.accent), (&mut w.hovered, hover), (&mut w.active, press)] {
-                    wv.weak_bg_fill = fill;
-                    wv.bg_fill = fill;
-                    wv.bg_stroke = Stroke::NONE;
-                    wv.fg_stroke = Stroke::new(1.0, p.on_accent);
-                }
+    button_impl(ui, kind, enabled, None, text, theme::CONTROL_H)
+}
+
+/// 아이콘이 붙은 버튼. `text`가 비어 있으면 아이콘만 있는 정사각형 버튼.
+pub fn icon_button(ui: &mut egui::Ui, kind: Btn, icon: Icon, text: &str) -> egui::Response {
+    button_impl(ui, kind, true, Some(icon), text, theme::CONTROL_H)
+}
+
+pub fn icon_button_enabled(ui: &mut egui::Ui, kind: Btn, enabled: bool, icon: Icon, text: &str) -> egui::Response {
+    button_impl(ui, kind, enabled, Some(icon), text, theme::CONTROL_H)
+}
+
+/// 좁은 자리에 놓는 낮은 버튼 (표 안, 줄 끝)
+pub fn small_button(ui: &mut egui::Ui, kind: Btn, text: &str) -> egui::Response {
+    button_impl(ui, kind, true, None, text, 26.0)
+}
+
+/// 아이콘이 붙은 낮은 버튼
+pub fn small_icon_button(ui: &mut egui::Ui, kind: Btn, icon: Icon, text: &str) -> egui::Response {
+    button_impl(ui, kind, true, Some(icon), text, 26.0)
+}
+
+fn button_impl(ui: &mut egui::Ui, kind: Btn, enabled: bool, icon: Option<Icon>, text: &str, h: f32) -> egui::Response {
+    let enabled = enabled && ui.is_enabled();
+    let p = palette(ui.visuals());
+    let dark = ui.visuals().dark_mode;
+    let small = h < theme::CONTROL_H;
+    let mut font = TextStyle::Button.resolve(ui.style());
+    if small {
+        font.size = 13.0;
+    }
+    let text_g = (!text.is_empty()).then(|| ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER));
+    let icon_size = if small { 14.0 } else { 16.0 };
+    let gap = if icon.is_some() && text_g.is_some() { 7.0 } else { 0.0 };
+    let text_w = text_g.as_ref().map_or(0.0, |g| g.size().x);
+    let content_w = text_w + gap + if icon.is_some() { icon_size } else { 0.0 };
+    let pad = match (&text_g, small) {
+        (None, _) => (h - icon_size) / 2.0,
+        (_, true) => 10.0,
+        (_, false) => 14.0,
+    };
+    let size = egui::vec2((content_w + pad * 2.0).ceil(), h);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, enabled, text));
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let hov = hover_t(ui, &resp, enabled);
+    let down = enabled && resp.is_pointer_button_down_on();
+    let radius = if small { 7.0 } else { theme::RADIUS_SM as f32 };
+    let dim = if enabled { 1.0 } else { 0.45 };
+    let fg = match kind {
+        Btn::Primary => {
+            if hov > 0.0 && !down {
+                // 올리면 아래로 강조색이 번진다
+                let glow = Shadow {
+                    offset: [0, 3],
+                    blur: 14,
+                    spread: 0,
+                    color: p.accent.gamma_multiply(0.5 * hov),
+                };
+                ui.painter().add(glow.as_shape(rect, radius));
             }
-            Btn::Danger => {
-                w.inactive.weak_bg_fill = danger_bg;
-                w.inactive.bg_stroke = Stroke::new(1.0, p.danger.gamma_multiply(0.5));
-                w.inactive.fg_stroke = Stroke::new(1.0, p.danger);
-                for wv in [&mut w.hovered, &mut w.active] {
-                    wv.weak_bg_fill = p.danger;
-                    wv.bg_fill = p.danger;
-                    wv.bg_stroke = Stroke::NONE;
-                    wv.fg_stroke = Stroke::new(1.0, p.on_accent);
-                }
-            }
-            Btn::Secondary | Btn::Ghost => {}
+            paint_gradient(ui, rect, radius, Color32::WHITE.gamma_multiply(dim));
+            let over = if down {
+                Color32::from_black_alpha(40)
+            } else {
+                Color32::from_white_alpha((30.0 * hov) as u8)
+            };
+            ui.painter().rect_filled(rect, radius, over);
+            p.on_accent.gamma_multiply(dim)
         }
-        let b = egui::Button::new(text);
-        let b = if kind == Btn::Ghost { b.frame_when_inactive(false) } else { b };
-        ui.add_enabled(enabled, b)
-    })
-    .inner
+        Btn::Secondary => {
+            let fill = if down { p.control_active } else { mix(p.control_fill, p.control_hover, hov) };
+            let stroke = mix(p.control_stroke, p.control_stroke_hover, hov);
+            ui.painter().rect(
+                rect,
+                radius,
+                fill.gamma_multiply(dim),
+                Stroke::new(1.0, stroke.gamma_multiply(dim)),
+                StrokeKind::Inside,
+            );
+            mix(p.text, p.text_strong, hov).gamma_multiply(dim)
+        }
+        Btn::Ghost => {
+            let wash = if dark { Color32::WHITE } else { Color32::BLACK };
+            let a = if down { 0.10 } else { 0.07 * hov };
+            ui.painter().rect_filled(rect, radius, wash.gamma_multiply(a));
+            mix(p.muted, p.text_strong, hov).gamma_multiply(dim)
+        }
+        Btn::Danger => {
+            let a = if down { 0.30 } else { 0.13 + 0.10 * hov };
+            ui.painter().rect(
+                rect,
+                radius,
+                p.danger.gamma_multiply(a * dim),
+                Stroke::new(1.0, p.danger.gamma_multiply((0.38 + 0.25 * hov) * dim)),
+                StrokeKind::Inside,
+            );
+            p.danger.gamma_multiply(dim)
+        }
+    };
+    let mut x = rect.center().x - content_w / 2.0;
+    let cy = rect.center().y;
+    if let Some(ic) = icon {
+        paint_icon(ui.painter(), egui::pos2(x + icon_size / 2.0, cy), ic, icon_size, fg);
+        x += icon_size + gap;
+    }
+    if let Some(g) = text_g {
+        ui.painter().galley(egui::pos2(x, cy - g.size().y / 2.0), g, fg);
+    }
+    focus_ring(ui, &resp, rect, radius);
+    resp
 }
 
 // ── 입력 줄 ──
@@ -326,27 +578,32 @@ pub fn field<R>(ui: &mut egui::Ui, label: &str, help_text: Option<&str>, add: im
 
 /// 켜고 끄는 스위치
 pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
-    let size = egui::vec2(38.0, 22.0);
+    let size = egui::vec2(40.0, 22.0);
     let (rect, mut resp) = ui.allocate_exact_size(size, Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
     }
+    let enabled = ui.is_enabled();
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, enabled, *on, ""));
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(resp.id, *on);
         let p = palette(ui.visuals());
-        let off = if ui.visuals().dark_mode { Color32::from_gray(78) } else { Color32::from_gray(190) };
-        let mut bg = mix(off, p.accent, t);
-        if resp.hovered() {
-            bg = mix(bg, if ui.visuals().dark_mode { Color32::WHITE } else { Color32::BLACK }, 0.08);
-        }
-        if !ui.is_enabled() {
-            bg = bg.gamma_multiply(0.5);
-        }
+        let dim = if enabled { 1.0 } else { 0.5 };
         let r = rect.height() / 2.0;
-        ui.painter().rect_filled(rect, r, bg);
+        let mut off = p.track;
+        if resp.hovered() {
+            off = mix(off, p.control_stroke_hover, 0.6);
+        }
+        ui.painter().rect_filled(rect, r, off.gamma_multiply(dim));
+        if t > 0.0 {
+            paint_gradient(ui, rect, r, Color32::WHITE.gamma_multiply(t * dim));
+        }
         let cx = egui::lerp((rect.left() + r)..=(rect.right() - r), t);
-        ui.painter().circle_filled(egui::pos2(cx, rect.center().y), r - 3.0, Color32::WHITE);
+        let c = egui::pos2(cx, rect.center().y);
+        ui.painter().circle_filled(c + egui::vec2(0.0, 1.0), r - 3.0, Color32::from_black_alpha(50));
+        ui.painter().circle_filled(c, r - 3.0, Color32::WHITE.gamma_multiply(if enabled { 1.0 } else { 0.8 }));
+        focus_ring(ui, &resp, rect, r);
     }
     resp
 }
@@ -355,7 +612,7 @@ pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
 pub fn toggle_row(ui: &mut egui::Ui, on: &mut bool, title: &str, desc: &str) -> egui::Response {
     ui.horizontal(|ui| {
         let r = toggle(ui, on);
-        ui.add_space(space::XS);
+        ui.add_space(space::S);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
             ui.label(RichText::new(title).text_style(theme::ts_strong()).strong());
@@ -368,21 +625,43 @@ pub fn toggle_row(ui: &mut egui::Ui, on: &mut bool, title: &str, desc: &str) -> 
     .inner
 }
 
-/// 붙어 있는 선택 버튼 묶음 (탭, 일반|고급). 값이 바뀌면 true.
+/// 붙어 있는 선택 버튼 묶음 (일반|고급). 값이 바뀌면 true.
 pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) -> bool {
     let p = palette(ui.visuals());
     let mut changed = false;
     egui::Frame::new()
         .fill(p.inset_fill)
-        .corner_radius(CornerRadius::same(theme::RADIUS))
+        .stroke(Stroke::new(1.0, p.card_stroke))
+        .corner_radius(CornerRadius::same(11))
         .inner_margin(Margin::same(3))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
                 for (v, label) in options {
                     let selected = *value == *v;
-                    let b = egui::Button::selectable(selected, *label).min_size(egui::vec2(68.0, 26.0));
-                    if ui.add(b).clicked() && !selected {
+                    let font = if selected {
+                        FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into()))
+                    } else {
+                        TextStyle::Button.resolve(ui.style())
+                    };
+                    let g = ui.painter().layout_no_wrap((*label).to_owned(), font, Color32::PLACEHOLDER);
+                    let size = egui::vec2((g.size().x + 30.0).max(72.0), 28.0);
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, *label));
+                    let hov = hover_t(ui, &resp, !selected);
+                    if selected {
+                        ui.painter().rect(
+                            rect,
+                            8.0,
+                            p.control_hover,
+                            Stroke::new(1.0, p.control_stroke),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    let fg = if selected { p.text_strong } else { mix(p.muted, p.text_strong, hov) };
+                    ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+                    focus_ring(ui, &resp, rect, 8.0);
+                    if resp.clicked() && !selected {
                         *value = *v;
                         changed = true;
                     }
@@ -394,18 +673,157 @@ pub fn segmented<T: PartialEq + Copy>(ui: &mut egui::Ui, value: &mut T, options:
 
 /// 둥근 선택 칩 (선택되지 않았을 때도 테두리가 보여 누를 수 있음을 알 수 있다)
 pub fn chip(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
-    ui.add(
-        egui::Button::selectable(selected, text)
-            .frame_when_inactive(true)
-            .corner_radius(CornerRadius::same(13)),
-    )
+    chip_impl(ui, selected, None, text, false)
+}
+
+/// 아이콘이 붙은 칩의 폭 (여러 개를 가운데에 놓을 때 미리 잰다)
+pub fn chip_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = FontId::new(13.0, FontFamily::Name(theme::MEDIUM.into()));
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+    (g.size().x + 20.0 + 24.0).ceil()
+}
+
+/// 아이콘이 붙은 칩
+pub fn icon_chip(ui: &mut egui::Ui, selected: bool, icon: Icon, text: &str) -> egui::Response {
+    chip_impl(ui, selected, Some(icon), text, false)
+}
+
+fn chip_impl(ui: &mut egui::Ui, selected: bool, icon: Option<Icon>, text: &str, chevron: bool) -> egui::Response {
+    let p = palette(ui.visuals());
+    let h = 28.0;
+    let font = FontId::new(13.0, FontFamily::Name(theme::MEDIUM.into()));
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+    let icon_w = if icon.is_some() { 14.0 + 6.0 } else { 0.0 };
+    let chev_w = if chevron { 6.0 + 12.0 } else { 0.0 };
+    let size = egui::vec2((g.size().x + icon_w + chev_w + 24.0).ceil(), h);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, text));
+    if !ui.is_rect_visible(rect) {
+        return resp;
+    }
+    let hov = hover_t(ui, &resp, true);
+    let r = h / 2.0;
+    let (fill, stroke, fg) = if selected {
+        (
+            p.accent.gamma_multiply(0.20 + 0.06 * hov),
+            p.accent.gamma_multiply(0.55),
+            p.text_strong,
+        )
+    } else {
+        (
+            mix(p.field_fill, p.control_hover, hov),
+            mix(p.control_stroke, p.control_stroke_hover, hov),
+            mix(p.text, p.text_strong, hov),
+        )
+    };
+    ui.painter().rect(rect, r, fill, Stroke::new(1.0, stroke), StrokeKind::Inside);
+    let mut x = rect.left() + 12.0;
+    let cy = rect.center().y;
+    if let Some(ic) = icon {
+        let c = if selected { p.accent_text } else { mix(p.muted, p.text, hov) };
+        paint_icon(ui.painter(), egui::pos2(x + 7.0, cy), ic, 14.0, c);
+        x += 20.0;
+    }
+    let text_w = g.size().x;
+    ui.painter().galley(egui::pos2(x, cy - g.size().y / 2.0), g, fg);
+    if chevron {
+        paint_icon(ui.painter(), egui::pos2(x + text_w + 6.0 + 6.0, cy), Icon::ChevronDown, 13.0, p.muted);
+    }
+    focus_ring(ui, &resp, rect, r);
+    resp
+}
+
+/// 정보를 알리는 작은 꼬리표 (누를 수 없다): 결과 줄의 "검색어 포함", "4페이지"
+pub fn tag(ui: &mut egui::Ui, text: &str, fg: Color32, bg: Color32) -> egui::Response {
+    let font = FontId::new(11.5, FontFamily::Name(theme::MEDIUM.into()));
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
+    let size = egui::vec2((g.size().x + 14.0).ceil(), 20.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter().rect_filled(rect, 10.0, bg);
+        ui.painter().galley(rect.center() - g.size() / 2.0, g, fg);
+    }
+    resp
+}
+
+/// 꼬리표의 폭 (한 줄에 들어갈 자리를 미리 잴 때)
+pub fn tag_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = FontId::new(11.5, FontFamily::Name(theme::MEDIUM.into()));
+    let g = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+    (g.size().x + 14.0).ceil()
+}
+
+/// 의미 색 꼬리표
+pub fn tone_tag(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response {
+    let v = ui.visuals();
+    let (fg, bg) = (tone.fg(v), tone.bg(v));
+    tag(ui, text, fg, bg)
+}
+
+/// 파일 종류를 알리는 색 타일 (썸네일이 없는 결과의 왼쪽)
+pub fn kind_tile(ui: &mut egui::Ui, hue: Hue, icon: Icon, size: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let v = ui.visuals();
+        ui.painter().rect_filled(rect, size * 0.27, hue.bg(v));
+        paint_icon(ui.painter(), rect.center(), icon, (size * 0.5).round(), hue.fg(v));
+    }
+    resp
+}
+
+/// 왼쪽 메뉴의 한 줄. `compact`면 아이콘만. `mark`는 "저장하지 않은 변경 있음" 같은 점.
+pub fn nav_item(ui: &mut egui::Ui, selected: bool, icon: Icon, label: &str, compact: bool, mark: bool) -> egui::Response {
+    let p = palette(ui.visuals());
+    let dark = ui.visuals().dark_mode;
+    let size = egui::vec2(ui.available_width(), 38.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Tab, true, selected, label));
+    if ui.is_rect_visible(rect) {
+        let hov = hover_t(ui, &resp, !selected);
+        let r = 10.0;
+        if selected {
+            ui.painter().rect_filled(rect, r, p.accent.gamma_multiply(if dark { 0.20 } else { 0.14 }));
+        } else if hov > 0.0 {
+            let wash = if dark { Color32::WHITE } else { Color32::BLACK };
+            ui.painter().rect_filled(rect, r, wash.gamma_multiply(0.06 * hov));
+        }
+        let fg = if selected { p.text_strong } else { mix(p.muted, p.text_strong, hov) };
+        let icon_fg = if selected { p.accent_text } else { fg };
+        let cy = rect.center().y;
+        if compact {
+            paint_icon(ui.painter(), rect.center(), icon, 18.0, icon_fg);
+        } else {
+            paint_icon(ui.painter(), egui::pos2(rect.left() + 21.0, cy), icon, 17.0, icon_fg);
+            let font = if selected {
+                FontId::new(14.0, FontFamily::Name(theme::SEMIBOLD.into()))
+            } else {
+                FontId::new(14.0, FontFamily::Name(theme::MEDIUM.into()))
+            };
+            let g = ui.painter().layout_no_wrap(label.to_owned(), font, fg);
+            ui.painter().galley(egui::pos2(rect.left() + 40.0, cy - g.size().y / 2.0), g, fg);
+        }
+        if mark {
+            let c = if compact {
+                egui::pos2(rect.right() - 12.0, rect.top() + 11.0)
+            } else {
+                egui::pos2(rect.right() - 14.0, cy)
+            };
+            ui.painter().circle_filled(c, 3.5, p.warn);
+        }
+        focus_ring(ui, &resp, rect, r);
+    }
+    if compact {
+        resp.on_hover_text(label)
+    } else {
+        resp
+    }
 }
 
 // ── 상태 표시 ──
 
 /// 둥근 테두리 + 색 점 + 텍스트. pulse=true면 점이 깜빡여 "진행 중"을 표시.
 pub fn badge(ui: &mut egui::Ui, color: Color32, text: &str, large: bool, pulse: bool) -> egui::Response {
-    let size = if large { 16.0 } else { 13.0 };
+    let size = if large { 15.0 } else { 12.5 };
     let dot_color = if pulse {
         let t = ui.input(|i| i.time) as f32;
         let a = 0.45 + 0.55 * (t * 3.2).sin().abs();
@@ -415,17 +833,18 @@ pub fn badge(ui: &mut egui::Ui, color: Color32, text: &str, large: bool, pulse: 
         color
     };
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.14))
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
-        .corner_radius(CornerRadius::same(if large { 14 } else { 10 }))
+        .fill(color.gamma_multiply(0.12))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.34)))
+        .corner_radius(CornerRadius::same(if large { 16 } else { 12 }))
         .inner_margin(if large {
-            Margin::symmetric(12, 5)
+            Margin::symmetric(13, 6)
         } else {
-            Margin::symmetric(8, 2)
+            Margin::symmetric(9, 3)
         })
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let r = size * 0.34;
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let r = size * 0.30;
                 let dot = |ui: &mut egui::Ui| {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(r * 2.0 + 2.0), Sense::hover());
                     ui.painter().circle_filled(rect.center(), r, dot_color);
@@ -434,7 +853,7 @@ pub fn badge(ui: &mut egui::Ui, color: Color32, text: &str, large: bool, pulse: 
                     ui.label(
                         RichText::new(text)
                             .size(size)
-                            .family(egui::FontFamily::Name(theme::SEMIBOLD.into()))
+                            .family(FontFamily::Name(theme::SEMIBOLD.into()))
                             .color(color),
                     );
                 };
@@ -459,52 +878,147 @@ pub fn tone_badge(ui: &mut egui::Ui, tone: Tone, text: &str, large: bool, pulse:
 
 /// 큰 숫자 + 라벨 카드
 pub fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    let p = palette(ui.visuals());
-    egui::Frame::new()
-        .fill(p.card_fill)
-        .stroke(Stroke::new(1.0, p.card_stroke))
-        .corner_radius(CornerRadius::same(theme::RADIUS))
-        .inner_margin(Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            ui.set_min_width(112.0);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(value).text_style(theme::ts_stat()).color(color));
-                ui.label(RichText::new(label).small().weak());
-            });
+    card_frame(ui).inner_margin(Margin::symmetric(16, 12)).show(ui, |ui| {
+        ui.set_min_width(116.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(RichText::new(value).text_style(theme::ts_stat()).color(color));
+            ui.label(RichText::new(label).small().weak());
         });
+    });
 }
 
+/// 상태 점 (둘레에 옅은 빛)
 pub fn dot(ui: &mut egui::Ui, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 5.0, color);
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+    ui.painter().circle_filled(rect.center(), 6.5, color.gamma_multiply(0.22));
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+fn progress_impl(ui: &mut egui::Ui, frac: f32, fill: Option<Color32>, height: f32, animate: bool) -> egui::Response {
+    let frac = frac.clamp(0.0, 1.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let r = height / 2.0;
+        ui.painter().rect_filled(rect, r, palette(ui.visuals()).track);
+        if frac > 0.0 {
+            let mut bar = rect;
+            bar.set_width((rect.width() * frac).max(height));
+            match fill {
+                Some(c) => {
+                    ui.painter().rect_filled(bar, r, c);
+                }
+                None => paint_gradient(ui, bar, r, Color32::WHITE),
+            }
+            if animate {
+                // 찬 부분 위를 지나가는 옅은 빛: 움직이고 있음을 알린다
+                let t = (ui.input(|i| i.time) as f32 * 0.6).fract();
+                let w = 90.0;
+                let x = bar.left() - w + (bar.width() + w * 2.0) * t;
+                let shine = Rect::from_min_max(egui::pos2(x, bar.top()), egui::pos2(x + w, bar.bottom()));
+                ui.painter()
+                    .with_clip_rect(bar.intersect(ui.clip_rect()))
+                    .rect_filled(shine, r, Color32::from_white_alpha(46));
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+    resp
 }
 
 /// 얇은 진행 막대 (글자는 막대 밖에 따로 쓴다)
 pub fn progress(ui: &mut egui::Ui, frac: f32, color: Color32, height: f32, animate: bool) -> egui::Response {
-    ui.add(
-        egui::ProgressBar::new(frac.clamp(0.0, 1.0))
-            .desired_height(height)
-            .fill(color)
-            .animate(animate)
-            .corner_radius(CornerRadius::same((height / 2.0) as u8)),
-    )
+    progress_impl(ui, frac, Some(color), height, animate)
+}
+
+/// 강조 그라데이션으로 차는 진행 막대
+pub fn progress_accent(ui: &mut egui::Ui, frac: f32, height: f32, animate: bool) -> egui::Response {
+    progress_impl(ui, frac, None, height, animate)
+}
+
+/// 값 하나를 고르는 막대: 끌거나 눌러서 바꾼다. 왼쪽이 강조 그라데이션으로 찬다.
+pub fn slider(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+    width: f32,
+) -> egui::Response {
+    let (lo, hi) = (*range.start(), *range.end());
+    let knob = 8.0;
+    let (rect, mut resp) = ui.allocate_exact_size(egui::vec2(width, 22.0), Sense::click_and_drag());
+    let (x0, x1) = (rect.left() + knob, rect.right() - knob);
+    let snap = |v: f32| {
+        let v = if step > 0.0 { (v / step).round() * step } else { v };
+        v.clamp(lo, hi)
+    };
+    let mut new = *value;
+    if let Some(pos) = resp.interact_pointer_pos() {
+        new = snap(lo + ((pos.x - x0) / (x1 - x0)).clamp(0.0, 1.0) * (hi - lo));
+    }
+    if resp.has_focus() {
+        let (left, right) = ui.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+        if left {
+            new = snap(new - step);
+        }
+        if right {
+            new = snap(new + step);
+        }
+    }
+    if (new - *value).abs() > f32::EPSILON {
+        *value = new;
+        resp.mark_changed();
+    }
+    if ui.is_rect_visible(rect) {
+        let p = palette(ui.visuals());
+        let t = ((*value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        let cy = rect.center().y;
+        let track = Rect::from_min_max(egui::pos2(x0, cy - 2.0), egui::pos2(x1, cy + 2.0));
+        ui.painter().rect_filled(track, 2.0, p.track);
+        let kx = egui::lerp(x0..=x1, t);
+        if t > 0.0 {
+            let filled = Rect::from_min_max(track.min, egui::pos2(kx, track.max.y));
+            paint_gradient(ui, filled, 2.0, Color32::WHITE);
+        }
+        let active = resp.hovered() || resp.dragged();
+        let grow = ui.ctx().animate_bool_with_time(resp.id.with("grow"), active, 0.1);
+        let c = egui::pos2(kx, cy);
+        if grow > 0.0 {
+            ui.painter().circle_filled(c, knob + 4.0 * grow, p.accent.gamma_multiply(0.25 * grow));
+        }
+        ui.painter().circle_filled(c + egui::vec2(0.0, 1.0), knob - 1.0, Color32::from_black_alpha(60));
+        ui.painter().circle_filled(c, knob - 1.0, Color32::WHITE);
+        focus_ring(ui, &resp, rect.shrink2(egui::vec2(0.0, 2.0)), 9.0);
+    }
+    resp
 }
 
 // ── 드롭다운 · 관련도 · 빈 화면 ──
 
 /// 체크 항목 여러 개를 담는 드롭다운. 안을 눌러도 닫히지 않고, 바깥을 누르거나 Esc로 닫힌다.
-/// `active`면 걸러내는 중이라는 뜻으로 요약 글자를 강조색으로 쓴다.
-pub fn multi_dropdown(ui: &mut egui::Ui, id_salt: &str, summary: &str, active: bool, add: impl FnOnce(&mut egui::Ui)) {
-    let text = if active {
-        RichText::new(summary).color(palette(ui.visuals()).accent)
-    } else {
-        RichText::new(summary)
-    };
-    egui::ComboBox::from_id_salt(id_salt)
-        .selected_text(text)
+/// `active`면 걸러내는 중이라는 뜻으로 강조색으로 그린다.
+pub fn multi_dropdown(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    icon: Icon,
+    summary: &str,
+    active: bool,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let resp = chip_impl(ui, active, Some(icon), summary, true);
+    let popup_id = egui::Id::unique(("multi_dropdown", id_salt));
+    // 화면 확인용 (`--shot … --open <이름>`): 그 드롭다운을 펼친 채로
+    if TEST_OPEN.lock().as_deref() == Some(id_salt) {
+        egui::Popup::open_id(ui.ctx(), popup_id);
+    }
+    egui::Popup::menu(&resp)
+        .id(popup_id)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show_ui(ui, add);
+        .gap(4.0)
+        .show(|ui| {
+            ui.set_min_width(200.0);
+            egui::ScrollArea::vertical().max_height(340.0).show(ui, add);
+        });
 }
 
 /// 관련도의 뜻: 7 이상 뚜렷함, 5.5 이상 관련 있음, 그 아래 약함
@@ -528,26 +1042,31 @@ pub enum ScoreStyle {
     Labeled,
 }
 
-/// 관련도 표시: 뜻에 맞는 색의 숫자와 얇은 막대 (0~10)
+/// 관련도 표시: 뜻에 맞는 색의 숫자와 얇은 막대 (0~10). 뚜렷하게 맞으면 막대가 강조 그라데이션.
 pub fn score_bar(ui: &mut egui::Ui, score: f32, style: ScoreStyle) -> egui::Response {
-    let fg = score_tone(score).fg(ui.visuals());
-    let track = palette(ui.visuals()).inset_fill;
+    let tone = score_tone(score);
+    let fg = tone.fg(ui.visuals());
+    let track = palette(ui.visuals()).track;
     let (width, text) = match style {
         ScoreStyle::Compact => (34.0, format!("{score:.1}")),
         ScoreStyle::Row => (56.0, format!("{score:.1}")),
         ScoreStyle::Labeled => (72.0, format!("관련도 {score:.1}")),
     };
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.x = 7.0;
         let number = |ui: &mut egui::Ui| {
             ui.label(RichText::new(&text).text_style(theme::ts_strong()).color(fg));
         };
         let bar = |ui: &mut egui::Ui| {
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), Sense::hover());
-            ui.painter().rect_filled(rect, 3.0, track);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 5.0), Sense::hover());
+            ui.painter().rect_filled(rect, 2.5, track);
             let mut fill = rect;
-            fill.set_width(width * (score / 10.0).clamp(0.0, 1.0));
-            ui.painter().rect_filled(fill, 3.0, fg);
+            fill.set_width((width * (score / 10.0).clamp(0.0, 1.0)).max(5.0));
+            if tone == Tone::Ok {
+                paint_gradient(ui, fill, 2.5, Color32::WHITE);
+            } else {
+                ui.painter().rect_filled(fill, 2.5, fg.gamma_multiply(if tone == Tone::Muted { 0.7 } else { 1.0 }));
+            }
         };
         // 오른쪽 정렬 줄에서도 숫자가 막대 왼쪽에 오게
         if ui.layout().prefer_right_to_left() {
@@ -563,8 +1082,17 @@ pub fn score_bar(ui: &mut egui::Ui, score: f32, style: ScoreStyle) -> egui::Resp
 
 /// 아직 내용이 없을 때 화면 가운데에 놓는 안내
 pub fn empty_state(ui: &mut egui::Ui, title: &str, body: &str) {
+    empty_state_icon(ui, Icon::Search, title, body);
+}
+
+pub fn empty_state_icon(ui: &mut egui::Ui, glyph: Icon, title: &str, body: &str) {
     ui.add_space(space::XL * 2.0);
     ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+        let p = palette(ui.visuals());
+        paint_gradient(ui, rect, 16.0, Color32::WHITE.gamma_multiply(0.20));
+        paint_icon(ui.painter(), rect.center(), glyph, 26.0, p.accent_text);
+        ui.add_space(space::S);
         ui.label(RichText::new(title).text_style(theme::ts_section()).strong());
         ui.label(RichText::new(body).weak());
     });
@@ -578,17 +1106,31 @@ pub fn gallery(ui: &mut egui::Ui) {
         page_title(ui, "화면 요소 미리보기");
         help(ui, "새 화면에 쓰는 글자 크기, 색, 카드, 버튼 모양입니다.");
 
+        section(ui, "버튼", Some("주 버튼은 화면에 하나만 둡니다."), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                icon_button(ui, Btn::Primary, Icon::Play, "인덱싱 시작");
+                icon_button(ui, Btn::Secondary, Icon::FolderPlus, "폴더 추가…");
+                button(ui, Btn::Secondary, "되돌리기");
+                button(ui, Btn::Ghost, "처음 설정 다시 열기");
+                icon_button(ui, Btn::Danger, Icon::Trash2, "전체 재구축…");
+                button_enabled(ui, Btn::Primary, false, "저장");
+                icon_button(ui, Btn::Ghost, Icon::X, "");
+                small_button(ui, Btn::Secondary, "빼기");
+            });
+            ui.add_space(space::XS);
+            ui.horizontal_wrapped(|ui| {
+                let _ = ui.button("egui 기본 버튼");
+                let mut c = true;
+                ui.checkbox(&mut c, "체크 항목");
+                let mut text = String::from("입력칸");
+                ui.add(egui::TextEdit::singleline(&mut text).desired_width(140.0));
+                let _ = ui.link("링크");
+            });
+        });
+
         section(ui, "검색할 폴더", Some("여기에 넣은 폴더 안의 파일을 찾을 수 있습니다."), |ui| {
             status_line(ui, Tone::Ok, r"C:\Users\me\Documents");
             status_line(ui, Tone::Danger, r"D:\사진 (찾을 수 없음)");
-            ui.add_space(space::XS);
-            ui.horizontal_wrapped(|ui| {
-                button(ui, Btn::Primary, "폴더 추가…");
-                button(ui, Btn::Secondary, "되돌리기");
-                button(ui, Btn::Ghost, "처음 설정 다시 열기");
-                button(ui, Btn::Danger, "전체 재구축…");
-                button_enabled(ui, Btn::Primary, false, "저장");
-            });
         });
 
         section(ui, "내용까지 살펴볼 파일 종류", None, |ui| {
@@ -620,14 +1162,34 @@ pub fn gallery(ui: &mut egui::Ui) {
                 stat_card(ui, "오류", "12", Tone::Danger.fg(&v));
             });
             ui.add_space(space::XS);
-            let accent = palette(ui.visuals()).accent;
-            progress(ui, 0.42, accent, 10.0, false);
+            progress_accent(ui, 0.42, 8.0, false);
             caption(ui, "42.3% · 12,345 / 29,000 · 남은 시간 약 12분");
             ui.add_space(space::XS);
             ui.horizontal(|ui| {
                 chip(ui, true, "전체 12");
                 chip(ui, false, "문서 내용 5");
-                chip(ui, false, "이미지 4");
+                icon_chip(ui, false, Icon::Image, "이미지 4");
+                let v = ui.visuals().clone();
+                tone_tag(ui, Tone::Ok, "검색어 포함");
+                tag(ui, "4페이지", Hue::Gray.fg(&v), Hue::Gray.bg(&v));
+            });
+            ui.horizontal(|ui| {
+                for (hue, glyph) in [
+                    (Hue::Indigo, Icon::FileText),
+                    (Hue::Teal, Icon::FileCode),
+                    (Hue::Coral, Icon::BookOpen),
+                    (Hue::Amber, Icon::Image),
+                    (Hue::Violet, Icon::Film),
+                    (Hue::Green, Icon::AudioLines),
+                    (Hue::Gray, Icon::File),
+                ] {
+                    kind_tile(ui, hue, glyph, 40.0);
+                }
+                let mut v = 5.5;
+                slider(ui, &mut v, 0.0..=12.0, 0.1, 140.0);
+                score_bar(ui, 8.4, ScoreStyle::Row);
+                score_bar(ui, 6.1, ScoreStyle::Row);
+                score_bar(ui, 3.9, ScoreStyle::Row);
             });
             let mut view = 0;
             segmented(ui, &mut view, &[(0, "일반"), (1, "고급")]);
@@ -644,7 +1206,7 @@ pub fn gallery(ui: &mut egui::Ui) {
 pub fn toast(ctx: &egui::Context, text: &str, error: bool) -> bool {
     let mut close = false;
     egui::Area::new(egui::Id::unique("toast"))
-        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -40.0))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -20.0))
         .order(egui::Order::Foreground)
         .interactable(true)
         .show(ctx, |ui| {
@@ -652,16 +1214,20 @@ pub fn toast(ctx: &egui::Context, text: &str, error: bool) -> bool {
             let p = palette(ui.visuals());
             let fg = tone.fg(ui.visuals());
             egui::Frame::new()
-                .fill(p.card_fill)
-                .stroke(Stroke::new(1.0, fg.gamma_multiply(0.7)))
+                .fill(p.popup_fill)
+                .stroke(Stroke::new(1.0, fg.gamma_multiply(0.45)))
                 .corner_radius(CornerRadius::same(theme::RADIUS))
-                .inner_margin(Margin::symmetric(12, 10))
+                .shadow(ui.visuals().popup_shadow)
+                .inner_margin(Margin::symmetric(14, 10))
                 .show(ui, |ui| {
                     ui.set_max_width(440.0);
                     ui.horizontal(|ui| {
-                        ui.colored_label(fg, tone.icon());
+                        icon(ui, tone.glyph(), 16.0, fg);
                         ui.add(egui::Label::new(text).wrap());
-                        if ui.small_button("✕").on_hover_text("닫기").clicked() {
+                        if button_impl(ui, Btn::Ghost, true, Some(Icon::X), "", 26.0)
+                            .on_hover_text("닫기")
+                            .clicked()
+                        {
                             close = true;
                         }
                     });

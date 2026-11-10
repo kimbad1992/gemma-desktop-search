@@ -59,18 +59,35 @@ fn main() -> eframe::Result {
     if args.first().map(|a| a == "--bench").unwrap_or(false) {
         std::process::exit(headless::bench(args.get(1).map(String::as_str).unwrap_or("README.md")));
     }
+    // 화면 확인용 --shot <png>: 창을 화면에 띄우지 않고 그려서 PNG로 저장하고 끝낸다 (app::Shot)
+    let shot = args.iter().any(|a| a == "--shot");
     // 이미 실행 중이면 그 창을 띄우고 끝낸다 (로그인 시 자동 실행 + 직접 실행이 겹쳐도 하나만)
-    if shell::already_running(&config::data_dir()) {
+    if !shot && shell::already_running(&config::data_dir()) {
         return Ok(());
     }
     // --background: 창 없이 트레이로 시작 (로그인 시 실행)
     let background = args.iter().any(|a| a == "--background");
+    // --size 1280x860: 창 크기 (화면 확인용)
+    let size = args
+        .iter()
+        .position(|a| a == "--size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.split_once('x'))
+        .and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))
+        .unwrap_or([1280.0, 860.0]);
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Gemma Search")
-        .with_inner_size([1280.0, 860.0])
+        .with_inner_size(size)
         .with_min_inner_size([640.0, 420.0])
         .with_drag_and_drop(true)
-        .with_visible(!background);
+        .with_visible(!background && !shot);
+    if shot {
+        // 숨긴 채로 그리지만, eframe이 첫 그림 뒤에 창을 한 번 보이게 하므로 화면 밖에 두고 포커스도 받지 않게 한다
+        viewport = viewport
+            .with_position([-30000.0, -30000.0])
+            .with_active(false)
+            .with_taskbar(false);
+    }
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
     }

@@ -7,7 +7,7 @@
 
 use crate::app::GemmaApp;
 use crate::index::progress::{Progress, RunState};
-use crate::ui::widgets;
+use crate::ui::widgets::{self, Btn, Icon};
 use crate::util::{fmt_dur, fmt_num};
 use crossbeam_channel::Sender;
 use eframe::egui::{self, RichText};
@@ -29,7 +29,7 @@ pub enum OverlayAction {
 impl GemmaApp {
     /// 오버레이를 띄울지 (app.logic에서도 씀)
     pub fn overlay_should_show(&self, ctx: &egui::Context) -> bool {
-        if !self.cfg.index_overlay || self.overlay_dismissed || self.setup_open {
+        if !self.cfg.index_overlay || self.overlay_dismissed || self.setup_open || self.shot.is_some() {
             return false;
         }
         let state = self.indexer.progress.lock().state;
@@ -108,7 +108,7 @@ impl GemmaApp {
     }
 }
 
-fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<OverlayAction>) {
+pub(crate) fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<OverlayAction>) {
     let p = progress.lock().clone();
     let ctx = ui.ctx().clone();
     let send = |a: OverlayAction| {
@@ -117,10 +117,12 @@ fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<Ov
     };
     let tone = widgets::run_tone(p.state).fg(ui.visuals());
     let warn = crate::ui::theme::Tone::Warn.fg(ui.visuals());
+    let pal = crate::ui::theme::palette(ui.visuals());
+    // 테두리 없는 작은 창이라, 뒤의 화면과 구별되게 테두리를 두른다
     let frame = egui::Frame::new()
-        .fill(crate::ui::theme::palette(ui.visuals()).card_fill)
-        .stroke(egui::Stroke::new(1.0, tone))
-        .inner_margin(10);
+        .fill(pal.card_fill)
+        .stroke(egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.75)))
+        .inner_margin(egui::Margin::symmetric(12, 10));
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 4.0;
         ui.horizontal(|ui| {
@@ -138,7 +140,11 @@ fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<Ov
             });
         });
         let frac = if p.scanning { 0.0 } else { p.fraction().unwrap_or(0.0) };
-        widgets::progress(ui, frac, tone, 8.0, false);
+        if p.state == RunState::Running {
+            widgets::progress_accent(ui, frac, 6.0, false);
+        } else {
+            widgets::progress(ui, frac, tone, 6.0, false);
+        }
         let (fps, _) = p.rates();
         let mut line = format!("{} / {}", fmt_num(p.processed), fmt_num(p.discovered));
         if fps > 0.0 {
@@ -157,25 +163,26 @@ fn overlay_ui(ui: &mut egui::Ui, progress: &Arc<Mutex<Progress>>, tx: &Sender<Ov
         ui.horizontal(|ui| {
             match p.state {
                 RunState::Paused => {
-                    if ui.small_button("▶ 재개").clicked() {
+                    if widgets::small_icon_button(ui, Btn::Primary, Icon::Play, "재개").clicked() {
                         send(OverlayAction::Resume);
                     }
                 }
                 RunState::Running => {
-                    if ui.small_button("⏸ 일시정지").clicked() {
+                    if widgets::small_icon_button(ui, Btn::Secondary, Icon::Pause, "일시정지").clicked() {
                         send(OverlayAction::Pause);
                     }
                 }
                 _ => {}
             }
-            if p.state != RunState::Stopping && ui.small_button("■ 중지").clicked() {
+            if p.state != RunState::Stopping
+                && widgets::small_icon_button(ui, Btn::Secondary, Icon::Square, "중지").clicked()
+            {
                 send(OverlayAction::Stop);
             }
-            if ui.small_button("창 열기").clicked() {
+            if widgets::small_button(ui, Btn::Ghost, "창 열기").clicked() {
                 send(OverlayAction::Open);
             }
-            if ui
-                .small_button("숨기기")
+            if widgets::small_button(ui, Btn::Ghost, "숨기기")
                 .on_hover_text("이번 인덱싱 동안 숨깁니다 (설정에서 아예 끌 수 있음)")
                 .clicked()
             {

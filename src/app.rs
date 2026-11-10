@@ -119,6 +119,54 @@ pub struct QuickState {
     got_focus: bool,
 }
 
+/// 화면 확인용 (`--shot <png>`): 창을 화면에 띄우지 않고 그린 뒤 PNG로 저장하고 끝낸다.
+/// 누가 PC를 쓰는 중에도 포커스를 뺏지 않고 화면을 확인할 수 있다.
+///
+/// 같이 쓰는 인자: `--tab`, `--theme`, `--scroll`, `--size 1280x860`, `--query "질의"`,
+/// `--select`(첫 결과를 고른 상태), `--quick`(빠른 검색창), `--setup`(처음 설정), `--shot-wait <초>`,
+/// `--index --shot-indexing`(인덱싱이 도는 중), `--overlay`(인덱싱 알림 창), `--view images`(결과의 섹션 보기),
+/// `--open filter_kinds`(필터 드롭다운을 펼친 채로).
+/// 쓰는 인덱스와 섞이지 않게 `GEMMA_SEARCH_DATA`로 별도 데이터 폴더를 준다.
+pub struct Shot {
+    path: PathBuf,
+    /// 화면이 자리 잡은 뒤 이만큼 더 기다렸다가 찍는다
+    wait: Duration,
+    started: Instant,
+    settled: Option<Instant>,
+    requested: bool,
+    done: Arc<AtomicBool>,
+    /// 첫 결과를 고른 상태로 찍는다 (미리보기 패널 확인)
+    pub select: bool,
+    /// 인덱싱이 도는 중에 찍는다 (`--index`와 함께)
+    when_indexing: bool,
+    /// 큰 창 대신 인덱싱 알림 창을 그린다 (크기는 `--size 392x136`)
+    pub overlay: bool,
+}
+
+impl Shot {
+    fn from_args() -> Option<Self> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
+        let path = PathBuf::from(value("--shot")?);
+        Some(Self {
+            path,
+            wait: Duration::from_secs_f32(value("--shot-wait").and_then(|v| v.parse().ok()).unwrap_or(1.0)),
+            started: Instant::now(),
+            settled: None,
+            requested: false,
+            done: Arc::new(AtomicBool::new(false)),
+            select: args.iter().any(|a| a == "--select"),
+            when_indexing: args.iter().any(|a| a == "--shot-indexing"),
+            overlay: args.iter().any(|a| a == "--overlay"),
+        })
+    }
+}
+
+/// 창 없이 시작하는지: 트레이로 시작(`--background`)하거나 화면 확인용(`--shot`)
+fn starts_hidden() -> bool {
+    std::env::args().any(|a| a == "--background" || a == "--shot")
+}
+
 /// 검색 폴더 목록의 한 줄 (지금 대상 폴더 + 예전에 인덱싱한 폴더)
 #[derive(Clone, Debug)]
 pub struct FolderStat {
@@ -210,6 +258,14 @@ pub struct GemmaApp {
     force_foreground: Option<Instant>,
     /// 빠른 검색창 모드
     pub quick: Option<QuickState>,
+    /// 화면 확인용 실행 (`--shot`)
+    pub shot: Option<Shot>,
+    /// 화면 확인용 (`--view images`): 결과가 오면 이 섹션 보기로 바꾼다
+    shot_view: Option<Section>,
+    /// 메뉴 맨 위의 앱 아이콘
+    logo: Option<egui::TextureHandle>,
+    /// 제목 표시줄 색을 맞춰 둔 테마 (어두운 테마면 true)
+    titlebar_dark: Option<bool>,
     /// 빠른 검색창 모양인 채로 숨겨 둔 창의 원래(큰 창) 모양. 다음에 큰 창을 보일 때 되돌린다.
     parked_shape: Option<QuickState>,
     /// logic 쪽에서 빠른 검색창을 닫아 달라고 함 (ui가 이번 프레임을 그린 뒤 닫는다)
@@ -343,9 +399,13 @@ impl GemmaApp {
             quitting: false,
             leave_quick_after_open: false,
             quick_enter: false,
-            window_visible: !std::env::args().any(|a| a == "--background"),
-            keep_hidden_frames: if std::env::args().any(|a| a == "--background") { 4 } else { 0 },
-            hidden_flag: Arc::new(AtomicBool::new(std::env::args().any(|a| a == "--background"))),
+            window_visible: !starts_hidden(),
+            keep_hidden_frames: if starts_hidden() { 4 } else { 0 },
+            hidden_flag: Arc::new(AtomicBool::new(starts_hidden())),
+            shot: Shot::from_args(),
+            shot_view: None,
+            logo: None,
+            titlebar_dark: None,
             main_hwnd: {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 cc.window_handle()
@@ -416,8 +476,13 @@ impl GemmaApp {
                 .ok();
         }
         app.spawn_stats_thread();
-        // 트레이·전역 단축키
-        match Shell::start(cc.egui_ctx.clone(), app.cfg.global_hotkey) {
+        // 트레이·전역 단축키 (화면 확인용 실행에서는 만들지 않는다: 쓰고 있는 앱의 단축키와 겹치지 않게)
+        let shell = if app.shot.is_some() {
+            Err(String::new())
+        } else {
+            Shell::start(cc.egui_ctx.clone(), app.cfg.global_hotkey).map_err(|e| e.to_string())
+        };
+        match shell {
             Ok(s) => {
                 let st = s.status();
                 // 이 알림은 8초면 사라지고 첫 실행 마법사에 가려진다 → 상태 표시줄·설정 탭에도 계속 보여준다 (shell_warnings)
@@ -441,18 +506,21 @@ impl GemmaApp {
                 app.last_shell_status = st;
                 app.shell = Some(s);
             }
+            Err(e) if e.is_empty() => {}
             Err(e) => app.notify(format!("트레이 아이콘을 만들지 못했습니다: {e}"), true),
         }
-        // 로그인 시 실행: exe를 옮겼으면 경로를 다시 맞춘다
-        if let Err(e) = crate::autostart::sync(app.cfg.start_with_windows) {
-            app.notify(format!("로그인 시 실행 설정 실패: {e}"), true);
+        // 로그인 시 실행: exe를 옮겼으면 경로를 다시 맞춘다 (화면 확인용 실행은 레지스트리를 건드리지 않는다)
+        if app.shot.is_none() {
+            if let Err(e) = crate::autostart::sync(app.cfg.start_with_windows) {
+                app.notify(format!("로그인 시 실행 설정 실패: {e}"), true);
+            }
         }
         // 새 버전 확인 (하루 한 번)
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if app.cfg.check_updates && now.saturating_sub(app.cfg.last_update_check) > 24 * 3600 {
+        if app.shot.is_none() && app.cfg.check_updates && now.saturating_sub(app.cfg.last_update_check) > 24 * 3600 {
             let (tx, rx) = crossbeam_channel::bounded(1);
             let ctx = cc.egui_ctx.clone();
             std::thread::spawn(move || {
@@ -499,7 +567,7 @@ impl GemmaApp {
             } else {
                 app.open_setup(&cc.egui_ctx);
                 // 트레이로 시작했어도 마법사는 보여야 한다
-                if !app.window_visible {
+                if !app.window_visible && app.shot.is_none() {
                     cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     app.window_visible = true;
                     app.hidden_flag.store(false, Ordering::SeqCst);
@@ -513,6 +581,44 @@ impl GemmaApp {
         if flag("--probe") {
             let ffmpeg = app.cfg.ffmpeg().is_some();
             app.probe.start(ffmpeg, &cc.egui_ctx);
+        }
+        // 화면 확인용: 빠른 검색창·처음 설정 화면을 창 모양을 바꾸지 않고 그린다 (크기는 --size로 맞춘다)
+        if app.shot.is_some() {
+            if flag("--quick") {
+                app.quick = Some(QuickState {
+                    prev_outer: None,
+                    prev_inner: None,
+                    prev_maximized: false,
+                    was_visible: false,
+                    got_focus: false,
+                });
+            }
+            if flag("--setup") && !app.setup_open {
+                app.open_setup(&cc.egui_ctx);
+            }
+            *widgets::TEST_OPEN.lock() = value("--open");
+            app.shot_view = match value("--view").as_deref() {
+                Some("docs") => Some(Section::Docs),
+                Some("images") => Some(Section::Images),
+                Some("videos") => Some(Section::Videos),
+                Some("audio") => Some(Section::Audio),
+                Some("names") => Some(Section::Names),
+                _ => None,
+            };
+            // 화면 밖에서 잠깐 보이게 되더라도 포커스를 받지 않게 한다
+            if app.main_hwnd != 0 {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+                };
+                unsafe {
+                    let ex = GetWindowLongPtrW(app.main_hwnd as _, GWL_EXSTYLE);
+                    SetWindowLongPtrW(
+                        app.main_hwnd as _,
+                        GWL_EXSTYLE,
+                        ex | (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW) as isize,
+                    );
+                }
+            }
         }
         // 화면 확인용: 시스템 테마와 상관없이 밝은/어두운 테마로 고정
         match value("--theme").as_deref() {
@@ -1025,6 +1131,10 @@ impl GemmaApp {
 
     /// 상주 기능(트레이·단축키) 중 지금 안 되는 것. 상태 표시줄과 설정 탭에 계속 보여준다.
     pub fn shell_warnings(&self) -> Vec<String> {
+        // 화면 확인용 실행은 일부러 트레이를 만들지 않는다
+        if self.shot.is_some() {
+            return Vec::new();
+        }
         let Some(shell) = &self.shell else {
             return vec!["트레이·전역 단축키를 시작하지 못했습니다. 창을 닫으면 앱이 끝납니다.".to_string()];
         };
@@ -1045,7 +1155,7 @@ impl GemmaApp {
     /// 트레이 아이콘 없이 숨어 있으면(트레이로 시작했는데 등록이 안 된 경우) 꺼낼 방법이 없다 → 창을 띄운다.
     /// 로그인 직후에는 작업 표시줄이 늦게 뜰 수 있어 잠시 기다린다 (그동안 셸 스레드가 다시 시도한다).
     fn rescue_hidden_window(&mut self, ctx: &egui::Context) {
-        if self.window_visible || self.quick.is_some() || self.tray_available() {
+        if self.window_visible || self.quick.is_some() || self.tray_available() || self.shot.is_some() {
             self.hidden_no_tray_since = None;
             return;
         }
@@ -1574,6 +1684,9 @@ impl GemmaApp {
                 self.outcome = Some(o);
                 self.search_rx = None;
                 self.search_started = None;
+                if let Some(v) = self.shot_view.take() {
+                    self.result_view = Some(v);
+                }
             }
         }
 
@@ -1721,127 +1834,309 @@ impl GemmaApp {
         });
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Gemma Search")
-                    .text_style(crate::ui::theme::ts_section())
-                    .strong(),
-            );
-            ui.add_space(12.0);
-            // 저장하지 않은 설정이 있으면 탭 이름에 점을 붙인다
-            let settings = if self.cfg != self.saved_cfg { "설정 •" } else { "설정" };
-            widgets::segmented(
-                ui,
-                &mut self.tab,
-                &[
-                    (Tab::Search, "검색"),
-                    (Tab::Index, "인덱스"),
-                    (Tab::Server, "서버"),
-                    (Tab::Settings, settings),
-                ],
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let ss = self.server.state();
-                let r = widgets::tone_badge(
-                    ui,
-                    widgets::server_tone(&ss),
-                    &format!("서버 {}", ss.label()),
-                    false,
-                    matches!(
-                        ss,
-                        crate::server::ServerState::Starting | crate::server::ServerState::Loading
-                    ),
-                );
-                if r.interact(egui::Sense::click()).on_hover_text("서버 탭 열기").clicked() {
-                    self.tab = Tab::Server;
-                }
-                let p = self.indexer.progress.lock().clone();
-                if p.state != RunState::Idle {
-                    let text = match p.fraction() {
-                        Some(f) if p.state.is_active() => format!("{} {:.0}%", p.state.label(), f * 100.0),
-                        _ => p.state.label().to_string(),
-                    };
-                    let r = widgets::tone_badge(
-                        ui,
-                        widgets::run_tone(p.state),
-                        &text,
-                        false,
-                        p.state == RunState::Running,
-                    );
-                    if r.interact(egui::Sense::click()).on_hover_text("인덱스 탭 열기").clicked() {
-                        self.tab = Tab::Index;
-                    }
-                }
-            });
-        });
-        ui.add_space(6.0);
+    /// 앱 아이콘 (메뉴 맨 위에 그린다)
+    fn logo(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(t) = &self.logo {
+            return t.clone();
+        }
+        // 그려질 크기(28pt)의 화면 픽셀 수에 맞춰 줄여 둔다 (큰 그림을 그대로 줄여 그리면 거칠다)
+        let px = (28.0 * ctx.pixels_per_point()).round().max(28.0) as u32;
+        let image = image::load_from_memory(include_bytes!("../assets/icon.png"))
+            .map(|i| i.resize_exact(px, px, image::imageops::FilterType::Lanczos3).to_rgba8())
+            .map(|i| egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], i.as_raw()))
+            .unwrap_or_else(|_| egui::ColorImage::filled([1, 1], egui::Color32::TRANSPARENT));
+        let t = ctx.load_texture("logo", image, egui::TextureOptions::LINEAR);
+        self.logo = Some(t.clone());
+        t
     }
 
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        use crate::ui::theme::Tone;
-        let small = |s: String| RichText::new(s).small();
+    /// 왼쪽 메뉴: 앱 이름, 화면 전환, 맨 아래에 서버·인덱스 상태. `compact`면 아이콘만 (창이 좁을 때).
+    fn nav_panel(&mut self, ui: &mut egui::Ui, compact: bool) {
+        use crate::ui::theme;
+        use widgets::Icon;
+        // 본문과의 경계선
+        let edge = ui.max_rect().expand2(egui::vec2(10.0, 14.0));
+        let line = crate::ui::theme::palette(ui.visuals()).card_stroke;
+        ui.painter()
+            .vline(edge.right() - 0.5, edge.y_range(), egui::Stroke::new(1.0, line));
+
+        ui.spacing_mut().item_spacing.y = 4.0;
+        let logo = self.logo(ui.ctx());
         ui.horizontal(|ui| {
-            // 왼쪽: 서버 · 인덱스 크기 · (진행 중일 때만) 인덱싱
-            let ss = self.server.state();
-            widgets::dot(ui, widgets::server_color(&ss));
-            let r = ui.label(small(format!("서버 {}", ss.label())));
-            if ss.is_ready() {
-                r.on_hover_text(format!("포트 {}", self.server.port()));
+            ui.add_space(6.0);
+            ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::Vec2::splat(28.0)));
+            if !compact {
+                ui.add_space(2.0);
+                ui.label(RichText::new("Gemma Search").text_style(theme::ts_item()).strong());
             }
-            ui.separator();
-
-            let (files, chunks, loading) = {
-                let st = self.store.read();
-                (st.file_count(), st.live_chunks(), self.store_loading.load(Ordering::SeqCst))
-            };
-            if loading {
-                ui.spinner();
-                let s = self.store_status.lock().clone();
-                ui.label(small(if s.is_empty() { "인덱스 불러오는 중…".to_string() } else { s }));
-            } else {
-                ui.label(small(format!("파일 {}개", fmt_num(files as u64))))
-                    .on_hover_text(format!("검색할 수 있는 파일 수 · 벡터 {}개", fmt_num(chunks as u64)));
-            }
-
-            let p = self.indexer.progress.lock().clone();
-            if p.state.is_active() {
-                ui.separator();
-                widgets::dot(ui, widgets::run_color(p.state));
-                let pct = p
-                    .fraction()
-                    .map(|f| format!("{:.0}%", f * 100.0))
-                    .unwrap_or_else(|| "탐색 중".into());
-                ui.label(small(format!(
-                    "{} {pct} ({}/{})",
-                    p.state.label(),
-                    fmt_num(p.processed),
-                    fmt_num(p.discovered)
-                )));
-            }
-
-            // 오른쪽: 계속 알아야 하는 것만 (알림은 토스트로 뜬다)
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some((tag, url)) = &self.update_available {
-                    ui.hyperlink_to(small(format!("새 버전 {tag} 받기")), url);
-                }
-                let warnings = self.shell_warnings();
-                if !warnings.is_empty() {
-                    widgets::tone_label(ui, Tone::Warn, "⚠ 상주 기능 제한").on_hover_text(warnings.join("\n\n"));
-                }
-            });
         });
+        ui.add_space(16.0);
+        // 저장하지 않은 설정이 있으면 설정 메뉴에 점을 붙인다
+        let unsaved = self.cfg != self.saved_cfg;
+        for (tab, icon, label, mark) in [
+            (Tab::Search, Icon::Search, "검색", false),
+            (Tab::Index, Icon::Database, "인덱스", false),
+            (Tab::Server, Icon::Server, "서버", false),
+            (Tab::Settings, Icon::Settings, "설정", unsaved),
+        ] {
+            let selected = self.tab == tab && !self.show_gallery;
+            let mut r = widgets::nav_item(ui, selected, icon, label, compact, mark);
+            if mark {
+                r = r.on_hover_text("저장하지 않은 변경이 있습니다");
+            }
+            if r.clicked() {
+                self.tab = tab;
+            }
+        }
+        // 맨 아래: 지금 상태
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| self.nav_status(ui, compact));
+    }
+
+    /// 메뉴 맨 아래의 상태: 서버와 파일 수, (진행 중일 때만) 인덱싱, 계속 알아야 하는 경고.
+    /// 아래에서 위로 쌓는 배치라 넣는 순서가 화면과 거꾸로다. 알림은 토스트로 따로 뜬다.
+    fn nav_status(&mut self, ui: &mut egui::Ui, compact: bool) {
+        use crate::ui::theme::{self, palette, Tone};
+        use widgets::Icon;
+        let p = palette(ui.visuals());
+        let ss = self.server.state();
+        let server_text = format!("서버 {}", ss.label());
+        let prog = self.indexer.progress.lock().clone();
+        let (files, chunks, loading) = {
+            let st = self.store.read();
+            (st.file_count(), st.live_chunks(), self.store_loading.load(Ordering::SeqCst))
+        };
+        let files_text = if loading {
+            let s = self.store_status.lock().clone();
+            if s.is_empty() {
+                "인덱스 불러오는 중…".to_string()
+            } else {
+                s
+            }
+        } else {
+            format!("파일 {}개", fmt_num(files as u64))
+        };
+        let index_text = prog.state.is_active().then(|| {
+            let pct = prog
+                .fraction()
+                .map(|f| format!("{:.0}%", f * 100.0))
+                .unwrap_or_else(|| "탐색 중".into());
+            format!("{} {pct}", prog.state.label())
+        });
+        let warnings = self.shell_warnings();
+        let update = self.update_available.clone();
+        let (mut go_server, mut go_index) = (false, false);
+        let semibold = || egui::FontFamily::Name(theme::SEMIBOLD.into());
+
+        if compact {
+            // 아이콘만 있는 메뉴: 점과 아이콘으로만 알리고, 자세한 내용은 올렸을 때
+            ui.spacing_mut().item_spacing.y = 10.0;
+            let centered = |ui: &mut egui::Ui, w: f32, add: &mut dyn FnMut(&mut egui::Ui)| {
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+                    add(ui);
+                })
+                .response
+            };
+            if !warnings.is_empty() {
+                centered(ui, 16.0, &mut |ui| {
+                    let fg = Tone::Warn.fg(ui.visuals());
+                    widgets::icon(ui, Icon::TriangleAlert, 16.0, fg);
+                })
+                .on_hover_text(warnings.join("\n\n"));
+            }
+            if let Some((tag, url)) = &update {
+                centered(ui, 16.0, &mut |ui| {
+                    ui.hyperlink_to(Icon::Download.unicode().to_string(), url)
+                        .on_hover_text(format!("새 버전 {tag} 받기"));
+                });
+            }
+            let r = centered(ui, 14.0, &mut |ui| widgets::dot(ui, widgets::server_color(&ss)));
+            if r
+                .interact(egui::Sense::click())
+                .on_hover_text(format!("{server_text}\n{files_text}"))
+                .clicked()
+            {
+                go_server = true;
+            }
+            if let Some(t) = &index_text {
+                let r = centered(ui, 14.0, &mut |ui| widgets::dot(ui, widgets::run_color(prog.state)));
+                if r.interact(egui::Sense::click()).on_hover_text(t).clicked() {
+                    go_index = true;
+                }
+            }
+        } else {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let small = |s: &str| RichText::new(s).small();
+            if !warnings.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 5.0;
+                    ui.add_space(2.0);
+                    let fg = Tone::Warn.fg(ui.visuals());
+                    widgets::icon(ui, Icon::TriangleAlert, 14.0, fg);
+                    ui.label(small("상주 기능 제한").color(fg));
+                })
+                .response
+                .on_hover_text(warnings.join("\n\n"));
+            }
+            if let Some((tag, url)) = &update {
+                ui.hyperlink_to(small(&format!("새 버전 {tag} 받기")), url);
+            }
+            let card = || {
+                egui::Frame::new()
+                    .fill(p.card_fill)
+                    .stroke(egui::Stroke::new(1.0, p.card_stroke))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::symmetric(10, 9))
+            };
+            // 서버 · 파일 수 (아래 줄부터 넣는다)
+            let r = card()
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(2.0);
+                        if loading {
+                            ui.add(egui::Spinner::new().size(12.0));
+                        }
+                        ui.label(small(&files_text).weak());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 5.0;
+                        widgets::dot(ui, widgets::server_color(&ss));
+                        ui.label(RichText::new(&server_text).size(13.0).family(semibold()));
+                    });
+                })
+                .response
+                .interact(egui::Sense::click());
+            let hover = if ss.is_ready() {
+                format!(
+                    "포트 {} · 벡터 {}개\n누르면 서버 화면을 엽니다",
+                    self.server.port(),
+                    fmt_num(chunks as u64)
+                )
+            } else {
+                "누르면 서버 화면을 엽니다".to_string()
+            };
+            if r.on_hover_text(hover).clicked() {
+                go_server = true;
+            }
+            // 인덱싱 (진행 중일 때만)
+            if let Some(t) = &index_text {
+                let r = card()
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 5.0;
+                        let frac = prog.fraction().unwrap_or(0.0);
+                        if prog.state == RunState::Running {
+                            widgets::progress_accent(ui, frac, 4.0, true);
+                        } else {
+                            widgets::progress(ui, frac, widgets::run_color(prog.state), 4.0, false);
+                        }
+                        ui.label(
+                            small(&format!("{} / {}", fmt_num(prog.processed), fmt_num(prog.discovered))).weak(),
+                        );
+                        ui.label(RichText::new(t).size(13.0).family(semibold()));
+                    })
+                    .response
+                    .interact(egui::Sense::click());
+                if r.on_hover_text("누르면 인덱스 화면을 엽니다").clicked() {
+                    go_index = true;
+                }
+            }
+        }
+        if go_server {
+            self.tab = Tab::Server;
+        }
+        if go_index {
+            self.tab = Tab::Index;
+        }
+    }
+
+    /// Windows 11: 제목 표시줄 색을 앱 바탕에 맞춘다 (테마가 바뀌면 다시). Windows 10에서는 아무 일도 없다.
+    fn sync_titlebar(&mut self, dark: bool) {
+        if self.titlebar_dark == Some(dark) || self.main_hwnd == 0 {
+            return;
+        }
+        self.titlebar_dark = Some(dark);
+        use windows_sys::Win32::Graphics::Dwm::{
+            DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+        };
+        let p = crate::ui::theme::palette_of(dark);
+        let colorref = |c: egui::Color32| c.r() as u32 | (c.g() as u32) << 8 | (c.b() as u32) << 16;
+        let hwnd = self.main_hwnd;
+        let set = |attr: i32, value: u32| unsafe {
+            DwmSetWindowAttribute(hwnd as _, attr as u32, &value as *const u32 as *const _, 4);
+        };
+        set(DWMWA_USE_IMMERSIVE_DARK_MODE, dark as u32);
+        set(DWMWA_CAPTION_COLOR, colorref(p.sidebar));
+        set(DWMWA_BORDER_COLOR, colorref(p.card_stroke));
     }
 
     /// 알림을 오른쪽 아래 토스트로 보여준다 (오류는 15초, 안내는 6초 또는 닫을 때까지)
     fn show_toast(&mut self, ctx: &egui::Context) {
+        // 화면 확인용 실행: "서버를 시작합니다" 같은 안내가 화면을 가리지 않게 한다 (오류와 부품 미리보기의 예시는 보인다)
+        if self.shot.is_some() && !self.show_gallery && self.notice.as_ref().is_some_and(|n| !n.error) {
+            return;
+        }
         let Some((text, error, age)) = self.notice.as_ref().map(|n| (n.text.clone(), n.error, n.at.elapsed())) else {
             return;
         };
         let ttl = Duration::from_secs(if error { 15 } else { 6 });
         if age > ttl || widgets::toast(ctx, &text, error) {
             self.notice = None;
+        }
+    }
+
+    /// 화면 확인용 실행: 숨긴 창을 계속 그리게 하다가, 화면이 자리 잡으면 찍어서 저장하고 끝낸다
+    fn shot_tick(&mut self, ctx: &egui::Context) {
+        if self.shot.is_none() {
+            return;
+        }
+        let indexing = {
+            let p = self.indexer.progress.lock();
+            p.state == RunState::Running && !p.scanning && p.processed >= 8
+        };
+        let mut busy = self.search_rx.is_some()
+            || self.auto_query.is_some()
+            || self.pending_search.is_some()
+            || self.store_loading.load(Ordering::SeqCst)
+            || !self.preview_pending.is_empty();
+        let Some(s) = &mut self.shot else { return };
+        if s.when_indexing {
+            // 인덱싱이 어느 정도 돈 순간에 바로 찍는다
+            busy = !indexing;
+            s.wait = Duration::ZERO;
+        }
+        if s.done.load(Ordering::SeqCst) {
+            self.quitting = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if s.started.elapsed() > Duration::from_secs(120) {
+            // 서버가 뜨지 않는 등으로 끝나지 않는 경우
+            eprintln!("--shot: 화면이 준비되지 않아 찍지 못했습니다");
+            std::process::exit(2);
+        }
+        // 숨긴 창은 eframe이 그리지 않으므로 매번 그려 달라고 한다 (배치가 몇 프레임에 걸쳐 자리 잡는다)
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        ctx.request_repaint_after(Duration::from_millis(50));
+        if busy {
+            s.settled = None;
+            return;
+        }
+        let since = *s.settled.get_or_insert_with(Instant::now);
+        if !s.requested && since.elapsed() >= s.wait {
+            s.requested = true;
+            let (path, done, ctx2) = (s.path.clone(), s.done.clone(), ctx.clone());
+            ctx.request_screenshot(move |img| {
+                let [w, h] = img.size;
+                if let Err(e) = image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
+                    eprintln!("--shot: 저장 실패: {e}");
+                }
+                done.store(true, Ordering::SeqCst);
+                ctx2.request_repaint();
+            });
         }
     }
 
@@ -1885,6 +2180,7 @@ impl eframe::App for GemmaApp {
         self.poll(ctx);
         self.handle_close(ctx);
         self.rescue_hidden_window(ctx);
+        self.shot_tick(ctx);
         self.overlay_logic(ctx);
         // 트레이로 숨겨져 있어도 인덱싱 오버레이는 그려야 한다 → 이번 프레임은 ui를 부르게
         if !self.window_visible && self.overlay_should_show(ctx) {
@@ -1895,8 +2191,8 @@ impl eframe::App for GemmaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.index_overlay(&ctx);
-        // 숨긴 상태에서 오버레이 때문에 불렸으면 본 창은 그리지 않는다
-        if !self.window_visible && self.quick.is_none() {
+        // 숨긴 상태에서 오버레이 때문에 불렸으면 본 창은 그리지 않는다 (화면 확인용 실행은 숨긴 채로 그린다)
+        if !self.window_visible && self.quick.is_none() && self.shot.is_none() {
             return;
         }
         if self.quick.is_some() {
@@ -1923,15 +2219,39 @@ impl eframe::App for GemmaApp {
                 return;
             }
         }
+        use crate::ui::theme;
+        let p = theme::palette(ui.visuals());
+        if self.shot.as_ref().is_some_and(|s| s.overlay) {
+            crate::ui::overlay::overlay_ui(ui, &self.indexer.progress, &self.overlay_tx);
+            return;
+        }
+        self.sync_titlebar(ui.visuals().dark_mode);
+        // 본문의 바탕과 여백. 아래 여백은 두지 않는다 (스크롤되는 내용이 창 끝까지 이어지게).
+        let body = egui::Frame::new().fill(p.panel).inner_margin(egui::Margin {
+            left: 20,
+            right: 12,
+            top: 16,
+            bottom: 0,
+        });
         // 토스트·대화상자는 숨김 상태의 이른 반환 뒤에만 그린다 (숨긴 창에서 즉시형 창을 띄우면 패닉)
         if self.setup_open {
-            egui::CentralPanel::default().show(ui, |ui| self.setup_ui(ui));
+            egui::CentralPanel::default().frame(body).show(ui, |ui| self.setup_ui(ui));
             self.show_toast(&ctx);
             return;
         }
-        egui::Panel::top("top_bar").show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.status_bar(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
+        // 창이 좁으면 메뉴를 아이콘만 남긴다
+        let compact = ctx.content_rect().width() < 900.0;
+        egui::Panel::left("nav")
+            .exact_size(if compact { theme::NAV_W_COMPACT } else { theme::NAV_W })
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.sidebar)
+                    .inner_margin(egui::Margin::symmetric(10, 14)),
+            )
+            .show(ui, |ui| self.nav_panel(ui, compact));
+        egui::CentralPanel::default().frame(body).show(ui, |ui| {
             if self.show_gallery {
                 return widgets::gallery(ui);
             }
@@ -1971,6 +2291,15 @@ fn setup_fonts(ctx: &egui::Context) {
         fonts.font_data.insert(name.to_string(), Arc::new(data));
     };
     face(&mut fonts, "pretendard", 400.0);
+    // 아이콘 글꼴 (Lucide). 본문 글꼴 목록에는 넣지 않고 `ICONS` 패밀리로만 쓴다: Pretendard가 같은 번호에
+    // 다른 글자를 갖고 있고, 아이콘 글꼴에는 숫자·영문 자리에 빈 글자가 있어 섞으면 서로 가린다.
+    fonts.font_data.insert(
+        "lucide".to_string(),
+        Arc::new(egui::FontData::from_static(lucide_icons::LUCIDE_FONT_BYTES)),
+    );
+    fonts
+        .families
+        .insert(FontFamily::Name(theme::ICONS.into()), vec!["lucide".to_string()]);
 
     // Pretendard에 없는 글자(한자 등)는 맑은 고딕, 기호는 Segoe UI Symbol
     let system = |fonts: &mut egui::FontDefinitions, name: &str, path: &str| -> bool {

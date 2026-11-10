@@ -66,28 +66,28 @@ impl GemmaApp {
                     // 오른쪽부터 놓인다
                     match p.state {
                         RunState::Running => {
-                            if widgets::button(ui, Btn::Secondary, "■ 중지")
+                            if widgets::icon_button(ui, Btn::Secondary, widgets::Icon::Square, "중지")
                                 .on_hover_text("처리 중인 파일까지만 마치고 멈춥니다. 다음에 이어서 처리됩니다.")
                                 .clicked()
                             {
                                 act = Act::Stop;
                             }
-                            if widgets::button(ui, Btn::Secondary, "❚❚ 일시정지").clicked() {
+                            if widgets::icon_button(ui, Btn::Secondary, widgets::Icon::Pause, "일시정지").clicked() {
                                 act = Act::Pause;
                             }
                         }
                         RunState::Paused => {
-                            if widgets::button(ui, Btn::Secondary, "■ 중지").clicked() {
+                            if widgets::icon_button(ui, Btn::Secondary, widgets::Icon::Square, "중지").clicked() {
                                 act = Act::Stop;
                             }
-                            if widgets::button(ui, Btn::Primary, "▶ 재개").clicked() {
+                            if widgets::icon_button(ui, Btn::Primary, widgets::Icon::Play, "재개").clicked() {
                                 act = Act::Resume;
                             }
                         }
                         RunState::Stopping => {}
                         _ => {
                             let can = !loading && !no_roots && !waiting;
-                            if widgets::button_enabled(ui, Btn::Primary, can, "▶ 인덱싱 시작")
+                            if widgets::icon_button_enabled(ui, Btn::Primary, can, widgets::Icon::Play, "인덱싱 시작")
                                 .on_hover_text("새 파일과 바뀐 파일만 처리합니다. 서버가 꺼져 있으면 켜고 시작합니다.")
                                 .clicked()
                             {
@@ -108,8 +108,12 @@ impl GemmaApp {
                         0.0
                     }
                 });
-                let color = widgets::run_tone(p.state).fg(ui.visuals());
-                widgets::progress(ui, frac, color, 10.0, p.state == RunState::Running);
+                if p.state == RunState::Running {
+                    widgets::progress_accent(ui, frac, 8.0, true);
+                } else {
+                    let color = widgets::run_tone(p.state).fg(ui.visuals());
+                    widgets::progress(ui, frac, color, 8.0, false);
+                }
                 let (fps, cps) = p.rates();
                 let mut parts = Vec::new();
                 match p.fraction() {
@@ -137,7 +141,7 @@ impl GemmaApp {
             if waiting {
                 ui.add_space(space::XS);
                 ui.horizontal(|ui| {
-                    ui.spinner();
+                    widgets::spinner(ui);
                     ui.label("서버가 준비되면 바로 시작합니다…");
                 });
             } else if !p.state.is_active() && no_roots {
@@ -223,7 +227,11 @@ impl GemmaApp {
                     ui.label(fmt_num(p.indexed_by_kind[k.idx()]));
                     ui.label(fmt_num(stats.files_by_kind[k.idx()]));
                     let (ok, why) = content_status(self, k, caps.as_ref(), media_ok);
-                    widgets::tone_label(ui, if ok { Tone::Ok } else { Tone::Muted }, why);
+                    if ok {
+                        widgets::tone_note(ui, Tone::Ok, why);
+                    } else {
+                        widgets::tone_label(ui, Tone::Muted, why);
+                    }
                     ui.end_row();
                 }
             });
@@ -358,26 +366,26 @@ fn content_status(
     let img = caps.map(|c| c.image.usable());
     let aud = caps.map(|c| c.audio.usable());
     match k {
-        Kind::Text if c.index_text => (true, "✔ 텍스트"),
-        Kind::Doc if c.index_docs => (true, "✔ 텍스트 추출"),
+        Kind::Text if c.index_text => (true, "텍스트"),
+        Kind::Doc if c.index_docs => (true, "텍스트 추출"),
         Kind::Image if !c.index_images => (false, "꺼짐"),
         Kind::Image => match img {
-            Some(true) => (true, "✔ 이미지 임베딩"),
+            Some(true) => (true, "이미지 임베딩"),
             Some(false) => (false, "이미지 진단 실패 → 이름만"),
             None => (false, "서버 진단 대기"),
         },
         Kind::Video if !c.index_video => (false, "꺼짐"),
         Kind::Video if !media_ok => (false, "ffmpeg 없음 → 이름만"),
         Kind::Video => match (img, aud) {
-            (Some(true), Some(true)) if c.index_audio => (true, "✔ 영상 구간 + 오디오"),
-            (Some(true), _) => (true, "✔ 영상 구간"),
+            (Some(true), Some(true)) if c.index_audio => (true, "영상 구간 + 오디오"),
+            (Some(true), _) => (true, "영상 구간"),
             (Some(false), _) => (false, "이미지 진단 실패 → 이름만"),
             _ => (false, "서버 진단 대기"),
         },
         Kind::Audio if !c.index_audio => (false, "꺼짐"),
         Kind::Audio if !media_ok => (false, "ffmpeg 없음 → 이름만"),
         Kind::Audio => match aud {
-            Some(true) => (true, "✔ 오디오 (실험적)"),
+            Some(true) => (true, "오디오 (실험적)"),
             Some(false) => (false, "오디오 진단 실패 → 이름만"),
             None => (false, "서버 진단 대기"),
         },

@@ -148,8 +148,7 @@ impl GemmaApp {
             if crate::server::resolve_binary(&self.cfg.llama_path).is_ok() {
                 status_row(ui, |ui| {
                     verdict_line(ui, engine_verdict.as_ref(), "실행해 보는 중…");
-                    recheck = ui
-                        .small_button("다시 검사")
+                    recheck = widgets::small_button(ui, widgets::Btn::Secondary, "다시 검사")
                         .on_hover_text("빠진 DLL을 채워 넣었거나 파일을 바꾼 뒤에 누르세요")
                         .clicked();
                 });
@@ -173,12 +172,12 @@ impl GemmaApp {
             );
             status_row(ui, |ui| {
                 if !self.cfg.has_mmproj() {
-                    widgets::tone_label(ui, Tone::Warn, "⚠ 비어 있음 → 텍스트 전용 (이미지·영상·오디오는 이름만)");
+                    widgets::tone_note(ui, Tone::Warn, "비어 있음 → 텍스트 전용 (이미지·영상·오디오는 이름만)");
                 } else {
                     let ok = Path::new(self.cfg.mmproj_path.trim()).is_file();
                     status(ui, ok, "파일 있음", "파일을 찾을 수 없습니다");
                 }
-                find = ui.small_button("모델 폴더에서 찾기").clicked();
+                find = widgets::small_button(ui, widgets::Btn::Secondary, "모델 폴더에서 찾기").clicked();
             });
 
             changed |= path_row(
@@ -270,7 +269,7 @@ impl GemmaApp {
             ui.horizontal(|ui| {
                 match &plan {
                     _ if probing => {
-                        ui.spinner();
+                        widgets::spinner(ui);
                         ui.label("PC 사양을 확인하는 중…");
                     }
                     Some(p) => {
@@ -341,7 +340,7 @@ impl GemmaApp {
             status_row(ui, |ui| {
                 let ok = self.cfg.ffmpeg().is_some() && self.cfg.ffprobe().is_some();
                 status(ui, ok, "ffmpeg/ffprobe 사용 가능", "없으면 영상·오디오는 이름만 인덱싱");
-                if ui.small_button("자동 탐색").clicked() {
+                if widgets::small_button(ui, widgets::Btn::Secondary, "자동 탐색").clicked() {
                     if let Some(p) = crate::util::find_tool("ffmpeg.exe") {
                         self.cfg.ffmpeg_path = p.display().to_string();
                     }

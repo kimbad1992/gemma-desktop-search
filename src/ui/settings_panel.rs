@@ -17,15 +17,10 @@ pub(super) enum Pick {
 
 /// ✔ 좋음 / ✖ 문제
 pub(super) fn status(ui: &mut egui::Ui, ok: bool, ok_text: &str, bad_text: &str) {
-    let (tone, text) = if ok {
-        (Tone::Ok, format!("✔ {ok_text}"))
-    } else {
-        (Tone::Danger, format!("✖ {bad_text}"))
-    };
+    let (tone, text) = if ok { (Tone::Ok, ok_text) } else { (Tone::Danger, bad_text) };
     // 긴 경로가 카드 폭을 밀어내지 않도록 자르고, 전체는 마우스를 올리면 보인다
-    let color = tone.fg(ui.visuals());
-    ui.add(egui::Label::new(egui::RichText::new(&text).color(color)).truncate())
-        .on_hover_text(text);
+    let job = widgets::icon_text_job(ui, tone.glyph(), text, tone.fg(ui.visuals()));
+    ui.add(egui::Label::new(job).truncate()).on_hover_text(text);
 }
 
 fn start_dir(value: &str) -> Option<std::path::PathBuf> {
@@ -53,6 +48,8 @@ fn row_label(ui: &mut egui::Ui, label: &str) {
 /// 라벨 아래 들여쓴 상태 줄
 pub(super) fn status_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
+        // 글 한 줄(또는 낮은 버튼)이라 줄 높이를 낮춘다
+        ui.spacing_mut().interact_size.y = 24.0;
         ui.add_space(LABEL_W + ui.spacing().item_spacing.x);
         add(ui);
     });
@@ -217,7 +214,7 @@ pub(super) fn verdict_line(ui: &mut egui::Ui, v: Option<&crate::precheck::Verdic
     use crate::sysinfo::Level;
     match v {
         None => {
-            ui.spinner();
+            widgets::spinner(ui);
             ui.label(egui::RichText::new(pending).weak());
         }
         Some(v) => {
@@ -226,9 +223,8 @@ pub(super) fn verdict_line(ui: &mut egui::Ui, v: Option<&crate::precheck::Verdic
                 Level::Warn => Tone::Warn,
                 Level::Bad => Tone::Danger,
             };
-            let text = format!("{} {}", tone.icon(), v.text);
-            let color = tone.fg(ui.visuals());
-            ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
+            let job = widgets::icon_text_job(ui, tone.glyph(), &v.text, tone.fg(ui.visuals()));
+            ui.add(egui::Label::new(job).wrap());
         }
     }
 }

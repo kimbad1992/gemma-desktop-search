@@ -6,13 +6,14 @@ use crate::open::Place;
 use crate::search::keyword;
 use crate::search::query::{HitView, QueryKind};
 use crate::search::store::Section;
-use crate::ui::theme::{self, palette, space, Tone};
-use crate::ui::widgets::{self, Btn, ScoreStyle};
+use crate::ui::theme::{self, palette, space, Hue, Tone};
+use crate::ui::widgets::{self, Btn, Icon, ScoreStyle};
 use crate::util::{fmt_num, fmt_ts};
 use eframe::egui::{self, RichText};
 use std::sync::atomic::Ordering;
 
-const THUMB: f32 = 72.0;
+/// 결과 줄 왼쪽 그림(썸네일 또는 종류 타일)의 한 변
+const THUMB: f32 = 48.0;
 pub const SEARCH_BOX: &str = "search_box";
 const CARD_W: f32 = 168.0;
 
@@ -29,51 +30,88 @@ impl GemmaApp {
         let ctx = ui.ctx().clone();
         let running = self.search_rx.is_some();
 
-        // ── 질의 입력 ──
-        ui.add_space(space::XS);
+        // ── 질의 입력: 돋보기 · 입력칸 · 이미지로 검색 · 검색 버튼을 한 칸에 ──
+        let p = palette(ui.visuals());
+        let box_id = egui::Id::unique(SEARCH_BOX);
+        let focused = ctx.memory(|m| m.has_focus(box_id));
+        let ring = ctx.animate_bool_with_time(box_id.with("ring"), focused, 0.12);
         let (mut submit, mut pick_image) = (false, false);
-        ui.horizontal(|ui| {
-            // 버튼 두 개 자리를 남기고 입력칸이 나머지를 채운다
-            let w = (ui.available_width() - 236.0).max(200.0);
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .id(egui::Id::unique(SEARCH_BOX))
-                    .hint_text("찾고 싶은 내용을 적어 보세요 (예: 바다가 보이는 사진, 예산 회의록, 고양이 영상)")
-                    .font(theme::query_font())
-                    .desired_width(w)
-                    .margin(egui::vec2(10.0, 8.0)),
-            );
-            if self.focus_search {
-                resp.request_focus();
-                self.focus_search = false;
-            }
-            if self.select_query {
-                // 단축키로 불렀을 때: 이전 질의를 전부 선택해 바로 새로 입력
-                self.select_query = false;
-                let id = egui::Id::unique(SEARCH_BOX);
-                if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id) {
-                    let n = self.query.chars().count();
-                    st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
-                        egui::text::CCursor::new(0),
-                        egui::text::CCursor::new(n),
-                    )));
-                    st.store(ui.ctx(), id);
+        let mut frame = egui::Frame::new()
+            .fill(p.field_fill)
+            .stroke(egui::Stroke::new(
+                1.0 + 0.5 * ring,
+                widgets::mix(p.control_stroke, p.accent, ring),
+            ))
+            .corner_radius(14)
+            .inner_margin(egui::Margin {
+                left: 14,
+                right: 7,
+                top: 7,
+                bottom: 7,
+            });
+        if ring > 0.0 {
+            // 입력 중이면 둘레에 옅은 강조색 테
+            frame = frame.shadow(egui::Shadow {
+                offset: [0, 0],
+                blur: 0,
+                spread: 3,
+                color: p.accent.gamma_multiply(0.22 * ring),
+            });
+        }
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if running {
+                    ui.add(egui::Spinner::new().size(18.0));
+                } else {
+                    widgets::icon(ui, Icon::Search, 18.0, widgets::mix(p.muted, p.accent_text, ring));
                 }
-            }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                submit = true;
-                resp.request_focus();
-            }
-            if widgets::button_enabled(ui, Btn::Primary, !running, "검색").clicked() {
-                submit = true;
-            }
-            if widgets::button_enabled(ui, Btn::Secondary, !running, "이미지로 검색…")
-                .on_hover_text("이미지 파일을 고르거나 창에 끌어다 놓으면 비슷한 이미지·영상을 찾습니다")
-                .clicked()
-            {
-                pick_image = true;
-            }
+                // 오른쪽 버튼 두 개 자리를 남기고 입력칸이 나머지를 채운다
+                let w = (ui.available_width() - 116.0).max(120.0);
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .id(box_id)
+                        .hint_text("찾고 싶은 내용을 적어 보세요 (예: 바다가 보이는 사진, 예산 회의록, 고양이 영상)")
+                        .font(theme::query_font())
+                        .frame(egui::Frame::NONE)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(w),
+                );
+                if self.focus_search {
+                    resp.request_focus();
+                    self.focus_search = false;
+                }
+                if self.select_query {
+                    // 단축키로 불렀을 때: 이전 질의를 전부 선택해 바로 새로 입력
+                    self.select_query = false;
+                    if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), box_id) {
+                        let n = self.query.chars().count();
+                        st.cursor.set_char_range(Some(egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(n),
+                        )));
+                        st.store(ui.ctx(), box_id);
+                    }
+                }
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                    resp.request_focus();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if widgets::button_enabled(ui, Btn::Primary, !running, "검색").clicked() {
+                        submit = true;
+                    }
+                    if widgets::icon_button_enabled(ui, Btn::Ghost, !running, Icon::ImagePlus, "")
+                        .on_hover_text("이미지로 검색: 이미지 파일을 고르거나 창에 끌어다 놓으면 비슷한 이미지·영상을 찾습니다")
+                        .clicked()
+                    {
+                        pick_image = true;
+                    }
+                });
+            });
         });
+        ui.add_space(space::XS);
         if pick_image {
             if let Some(p) = rfd::FileDialog::new()
                 .add_filter("이미지", &["jpg", "jpeg", "png", "webp", "bmp", "gif", "tif", "tiff", "heic", "avif"])
@@ -89,6 +127,7 @@ impl GemmaApp {
 
         // ── 필터 한 줄 ──
         self.filter_bar(ui);
+        ui.add_space(space::XS);
 
         // ── 지금 검색할 수 없는 이유와 해결 방법 ──
         let server_state = self.server.state();
@@ -100,7 +139,7 @@ impl GemmaApp {
         let (mut go_settings, mut start_server) = (false, false);
         if loading {
             ui.horizontal(|ui| {
-                ui.spinner();
+                widgets::spinner(ui);
                 let s = self.store_status.lock().clone();
                 ui.label(if s.is_empty() { "인덱스를 불러오는 중…".to_string() } else { s });
             });
@@ -126,11 +165,11 @@ impl GemmaApp {
         // ── 요약 줄 ──
         ui.horizontal(|ui| {
             if running {
-                ui.spinner();
+                widgets::spinner(ui);
                 let secs = self.search_started.map(|t| t.elapsed().as_secs_f32()).unwrap_or(0.0);
                 ui.label(format!("검색 중… {secs:.1}초"));
             } else if self.pending_search_waiting() || (server_state.is_running() && !server_state.is_ready()) {
-                ui.spinner();
+                widgets::spinner(ui);
                 ui.label("서버를 준비하는 중…");
             } else if let Some(o) = &self.outcome {
                 if let Some(e) = &o.error {
@@ -176,8 +215,16 @@ impl GemmaApp {
             ui.add_space(space::M);
             ui.vertical_centered(|ui| {
                 widgets::caption(ui, "이렇게 찾아 보세요");
+            });
+            ui.add_space(space::XS);
+            let gap = 8.0;
+            let total: f32 = EXAMPLES.iter().map(|ex| widgets::chip_width(ui, ex)).sum::<f32>()
+                + gap * (EXAMPLES.len() - 1) as f32;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.add_space(((ui.available_width() - total) / 2.0).max(0.0));
                 for ex in EXAMPLES {
-                    if widgets::chip(ui, false, ex).clicked() {
+                    if widgets::icon_chip(ui, false, Icon::Search, ex).clicked() {
                         example = Some(ex);
                     }
                 }
@@ -210,7 +257,8 @@ impl GemmaApp {
         let all = unified(&visible, &outcome.kind_hints);
         if !visible.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                if widgets::chip(ui, self.result_view.is_none(), &format!("전체 {}", all.len()))
+                let all_text = format!("전체 {}", all.len());
+                if widgets::icon_chip(ui, self.result_view.is_none(), Icon::LayoutGrid, &all_text)
                     .on_hover_text("파일 종류와 상관없이 관련도가 높은 순서 (같은 파일은 한 번만)")
                     .clicked()
                 {
@@ -218,12 +266,13 @@ impl GemmaApp {
                 }
                 for (sec, hits) in &visible {
                     let sel = self.result_view == Some(*sec);
-                    if widgets::chip(ui, sel, &format!("{} {}", sec.label(), hits.len())).clicked() {
+                    let text = format!("{} {}", sec.label(), hits.len());
+                    if widgets::icon_chip(ui, sel, section_icon(*sec), &text).clicked() {
                         self.result_view = Some(*sec);
                     }
                 }
             });
-            ui.add_space(space::XS);
+            ui.add_space(space::S);
         }
 
         // 화면에 보이는 순서 (키보드로 이동)
@@ -236,6 +285,11 @@ impl GemmaApp {
                 .collect(),
         };
         self.reconcile_selection(&shown);
+        // 화면 확인용 (`--shot … --select`): 첫 결과를 고른 상태로
+        if self.shot.as_mut().is_some_and(|s| !shown.is_empty() && std::mem::take(&mut s.select)) {
+            let (sec, hv) = shown[0];
+            self.user_select(sec, hv.hit.file_id);
+        }
         self.handle_result_keys(&ctx, &shown);
         self.note_selected_row(&shown);
         // 선택한 결과는 오른쪽에 크게
@@ -245,11 +299,16 @@ impl GemmaApp {
                 .find(|(ss, hv)| *ss == s && hv.hit.file_id == f)
                 .map(|(_, hv)| *hv)
         });
-        if let Some(hv) = selected {
+        // 창이 아주 좁으면 목록만 보여 준다 (Enter·더블클릭으로 여는 것은 그대로). 넓어도 본문의 절반 남짓까지만.
+        let avail = ui.available_width();
+        if let (Some(hv), true) = (selected, avail >= 600.0) {
+            let max_w = (avail * 0.55).clamp(280.0, 800.0);
             egui::Panel::right("preview_panel")
                 .resizable(true)
-                .default_size(420.0)
-                .size_range(300.0..=800.0)
+                .show_separator_line(false)
+                .default_size(430.0_f32.min(max_w))
+                .size_range(280.0..=max_w)
+                .frame(preview_frame(ui))
                 .show(ui, |ui| self.preview_panel(ui, &ctx, hv, outcome.expr.as_deref()));
         }
 
@@ -277,6 +336,7 @@ impl GemmaApp {
                     widgets::empty_state(ui, "결과가 없습니다", "필터 줄의 종류·폴더·경로를 확인하세요.");
                 }
             }
+            ui.add_space(space::L);
         });
         self.outcome = Some(outcome);
     }
@@ -284,16 +344,18 @@ impl GemmaApp {
     /// 필터 한 줄: 종류 · 폴더(둘 다 체크 드롭다운) · 경로 · 관련도
     fn filter_bar(&mut self, ui: &mut egui::Ui) {
         use crate::search::store::OTHER_FOLDER_KEY;
+        let p = palette(ui.visuals());
         let folders = self.folders.lock().clone();
         let has_folders = !(folders.list.is_empty() && folders.other == 0);
         let (mut folders_changed, mut reset) = (false, false);
 
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             // 종류
             let on = self.filter_sections.iter().filter(|b| **b).count();
             let total = self.filter_sections.len();
-            let summary = if on == total { "종류: 전체".to_string() } else { format!("종류: {on}/{total}") };
-            widgets::multi_dropdown(ui, "filter_kinds", &summary, on != total, |ui| {
+            let summary = if on == total { "종류 전체".to_string() } else { format!("종류 {on}/{total}") };
+            widgets::multi_dropdown(ui, "filter_kinds", Icon::Shapes, &summary, on != total, |ui| {
                 for s in Section::ALL {
                     ui.checkbox(&mut self.filter_sections[s as usize], s.label());
                 }
@@ -311,40 +373,78 @@ impl GemmaApp {
                 let n_total = folders.list.len() + usize::from(folders.other > 0);
                 let n_on = folders.list.iter().filter(|f| !excluded.contains(&f.key)).count() + usize::from(other_on);
                 folders_filtered = n_on != n_total;
-                let summary = if folders_filtered { format!("폴더: {n_on}/{n_total}") } else { "폴더: 전체".to_string() };
-                widgets::multi_dropdown(ui, "filter_folders", &summary, folders_filtered, |ui| {
+                let summary = if folders_filtered { format!("폴더 {n_on}/{n_total}") } else { "폴더 전체".to_string() };
+                widgets::multi_dropdown(ui, "filter_folders", Icon::Folder, &summary, folders_filtered, |ui| {
                     folders_changed |= self.folder_menu(ui, &folders);
                 });
             }
 
-            // 경로
-            ui.add(
-                egui::TextEdit::singleline(&mut self.path_filter)
-                    .hint_text("경로에 포함된 글자")
-                    .desired_width(170.0),
-            )
-            .on_hover_text("경로에 이 글자가 들어 있는 결과만 보여줍니다 (예: 사진 2024)");
+            // 경로: 칩 모양의 작은 입력칸
+            let path_on = !self.path_filter.trim().is_empty();
+            egui::Frame::new()
+                .fill(p.field_fill)
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    if path_on { p.accent.gamma_multiply(0.55) } else { p.control_stroke },
+                ))
+                .corner_radius(14)
+                .inner_margin(egui::Margin {
+                    left: 11,
+                    right: 10,
+                    top: 0,
+                    bottom: 0,
+                })
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_height(26.0);
+                        // 입력칸의 최소 높이(버튼 높이)를 칩 높이에 맞춘다
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        widgets::icon(ui, Icon::ListFilter, 14.0, if path_on { p.accent_text } else { p.muted });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.path_filter)
+                                .hint_text("경로에 포함된 글자")
+                                .font(egui::FontId::proportional(13.0))
+                                .frame(egui::Frame::NONE)
+                                .align(egui::Align2::LEFT_CENTER)
+                                .desired_width(136.0),
+                        );
+                    });
+                })
+                .response
+                .on_hover_text("경로에 이 글자가 들어 있는 결과만 보여줍니다 (예: 사진 2024)");
 
-            // 관련도: 줄이 바뀔 때 슬라이더와 "끄기"가 떨어지지 않게 한 덩어리로 놓는다
-            let group = egui::vec2(310.0, ui.spacing().interact_size.y);
+            // 관련도: 줄이 바뀔 때 막대와 "끄기"가 떨어지지 않게 한 덩어리로 놓는다
+            let group = egui::vec2(262.0, 28.0);
             ui.allocate_ui_with_layout(group, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.add_space(4.0);
                 ui.label(RichText::new("관련도").weak());
                 let mut v = self.cfg.min_relevance;
-                let r = ui
-                    .scope(|ui| {
-                        ui.spacing_mut().slider_width = 120.0;
-                        ui.add(egui::Slider::new(&mut v, 0.0..=12.0).step_by(0.1).fixed_decimals(1))
-                    })
-                    .inner
-                    .on_hover_text(
-                        "이 관련도보다 낮은 결과를 숨깁니다 (다시 검색하지 않고 바로 적용).\n관련도 = 이 검색에서 대부분의 파일(중앙값)보다 표준편차 몇 배만큼 튀는지.\n대략 7 이상 뚜렷함, 5.5 이상 관련 있음. 맞는 파일이 없는 검색은 보통 5.5 아래라 결과가 비게 됩니다.",
-                    );
+                let r = widgets::slider(ui, &mut v, 0.0..=12.0, 0.1, 120.0).on_hover_text(
+                    "이 관련도보다 낮은 결과를 숨깁니다 (다시 검색하지 않고 바로 적용).\n관련도 = 이 검색에서 대부분의 파일(중앙값)보다 표준편차 몇 배만큼 튀는지.\n대략 7 이상 뚜렷함, 5.5 이상 관련 있음. 맞는 파일이 없는 검색은 보통 5.5 아래라 결과가 비게 됩니다.",
+                );
                 if r.changed() {
                     self.cfg.min_relevance = v;
                 }
                 let mut persist = r.drag_stopped() || (r.changed() && !r.dragged());
+                // 숫자 폭이 바뀌어도(5.5 → 10.0) 옆의 버튼이 움직이지 않게 자리를 고정한다
+                ui.allocate_ui_with_layout(
+                    egui::vec2(30.0, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let text = if self.cfg.min_relevance > 0.0 {
+                            RichText::new(format!("{:.1}", self.cfg.min_relevance)).text_style(theme::ts_strong())
+                        } else {
+                            RichText::new("끔").weak()
+                        };
+                        ui.label(text);
+                    },
+                );
                 if self.cfg.min_relevance > 0.0
-                    && ui.small_button("끄기").on_hover_text("관련도와 상관없이 모두 보여줍니다").clicked()
+                    && widgets::small_button(ui, Btn::Ghost, "끄기")
+                        .on_hover_text("관련도와 상관없이 모두 보여줍니다")
+                        .clicked()
                 {
                     self.cfg.min_relevance = 0.0;
                     persist = true;
@@ -355,9 +455,7 @@ impl GemmaApp {
             });
 
             // 걸러내는 중일 때만 초기화 링크
-            if (on != total || folders_filtered || !self.path_filter.trim().is_empty())
-                && ui.link("필터 초기화").clicked()
-            {
+            if (on != total || folders_filtered || path_on) && ui.link("필터 초기화").clicked() {
                 reset = true;
             }
         });
@@ -573,7 +671,7 @@ impl GemmaApp {
         if is_media(sec) {
             // 카드 폭을 알고 있으니 한 줄에 들어갈 개수를 계산해 줄 단위로 배치
             let gap = ui.spacing().item_spacing.x;
-            let cols = ((ui.available_width() + gap) / (CARD_W + 12.0 + gap)).floor().max(1.0) as usize;
+            let cols = ((ui.available_width() + gap) / (CARD_W + 16.0 + gap)).floor().max(1.0) as usize;
             for row in hits.chunks(cols) {
                 ui.horizontal(|ui| {
                     for hv in row {
@@ -588,13 +686,30 @@ impl GemmaApp {
         }
     }
 
-    /// 결과 카드·줄의 틀: 선택된 것은 강조색 테두리와 옅은 강조 배경
-    fn hit_frame(ui: &egui::Ui, selected: bool) -> egui::Frame {
+    /// 결과 줄·카드의 틀: 평소에는 바탕이 없고, 마우스를 올리면 카드 색, 고르면 강조색 테두리와 옅은 강조 배경.
+    /// 내용을 먼저 놓은 뒤 그 자리에 마우스가 있는지 보고 바탕을 칠한다.
+    pub(crate) fn hit_box(
+        ui: &mut egui::Ui,
+        selected: bool,
+        margin: egui::Margin,
+        add: impl FnOnce(&mut egui::Ui),
+    ) -> egui::Response {
         let p = palette(ui.visuals());
-        egui::Frame::new()
-            .fill(if selected { p.accent_soft } else { p.card_fill })
-            .stroke(egui::Stroke::new(1.0, if selected { p.accent } else { p.card_stroke }))
-            .corner_radius(egui::CornerRadius::same(theme::RADIUS))
+        let mut prepared = egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, egui::Color32::TRANSPARENT))
+            .corner_radius(theme::RADIUS)
+            .inner_margin(margin)
+            .begin(ui);
+        add(&mut prepared.content_ui);
+        let rect = prepared.frame.widget_rect(prepared.content_ui.min_rect());
+        if selected {
+            prepared.frame.fill = p.accent_soft;
+            prepared.frame.stroke = egui::Stroke::new(1.0, p.accent.gamma_multiply(0.65));
+        } else if ui.rect_contains_pointer(rect) {
+            prepared.frame.fill = p.card_fill;
+            prepared.frame.stroke = egui::Stroke::new(1.0, p.card_stroke);
+        }
+        prepared.end(ui).interact(egui::Sense::click())
     }
 
     /// 이미지·영상용 썸네일 카드
@@ -603,42 +718,38 @@ impl GemmaApp {
         const H: f32 = 118.0;
         let tex = hv.thumb_chunk.and_then(|c| self.thumb_texture(ctx, c));
         let is_sel = self.selected == Some((sec, hv.hit.file_id));
-        let resp = Self::hit_frame(ui, is_sel)
-            .inner_margin(egui::Margin::same(6))
-            .show(ui, |ui| {
-                ui.set_width(W);
-                ui.vertical(|ui| {
-                    match &tex {
-                        Some(t) => {
-                            ui.add_sized([W, H], egui::Image::new(t).max_size(egui::vec2(W, H)).corner_radius(4));
-                        }
-                        None => {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 4.0, palette(ui.visuals()).inset_fill);
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                kind_tag(hv.hit.kind),
-                                egui::FontId::proportional(13.0),
-                                ui.visuals().weak_text_color(),
-                            );
-                        }
+        let resp = Self::hit_box(ui, is_sel, egui::Margin::same(7), |ui| {
+            ui.set_width(W);
+            ui.vertical(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(W, H), egui::Sense::hover());
+                match &tex {
+                    Some(t) => {
+                        egui::Image::new(t)
+                            .uv(cover_uv(t.size_vec2(), W / H))
+                            .corner_radius(8)
+                            .paint_at(ui, rect);
                     }
-                    ui.add(egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_strong()).strong()).truncate());
-                    ui.horizontal(|ui| {
-                        widgets::score_bar(ui, hv.hit.score, ScoreStyle::Compact);
-                        if let Some(loc) = locator_label(hv) {
-                            ui.label(RichText::new(loc).small().color(Tone::Info.fg(ui.visuals())));
-                        }
-                        if hv.keyword_match() {
-                            ui.label(RichText::new("검색어").small().color(Tone::Ok.fg(ui.visuals())))
-                                .on_hover_text("파일 이름이나 폴더 이름에 검색어가 들어 있습니다");
-                        }
-                    });
+                    None => {
+                        let (hue, glyph) = kind_look(hv);
+                        let v = ui.visuals();
+                        ui.painter().rect_filled(rect, 8.0, hue.bg(v));
+                        widgets::paint_icon(ui.painter(), rect.center(), glyph, 30.0, hue.fg(v));
+                    }
+                }
+                ui.add(egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_strong()).strong()).truncate());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    widgets::score_bar(ui, hv.hit.score, ScoreStyle::Compact);
+                    if let Some(loc) = locator_label(hv) {
+                        ui.label(RichText::new(loc).small().color(Tone::Info.fg(ui.visuals())));
+                    }
+                    if hv.keyword_match() {
+                        ui.label(RichText::new("검색어").small().color(Tone::Ok.fg(ui.visuals())))
+                            .on_hover_text("파일 이름이나 폴더 이름에 검색어가 들어 있습니다");
+                    }
                 });
-            })
-            .response
-            .interact(egui::Sense::click());
+            });
+        });
         self.after_hit_response(ctx, sec, hv, &resp);
         resp.on_hover_text(format!("{}\n클릭: 미리보기 · 더블클릭: 열기 · 우클릭: 메뉴", hv.hit.path));
     }
@@ -678,61 +789,154 @@ impl GemmaApp {
     /// show_kind: 통합 목록에서 어떤 종류의 결과인지 표시
     fn result_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sec: Section, hv: &HitView, show_kind: bool) {
         let is_sel = self.selected == Some((sec, hv.hit.file_id));
-        let resp = Self::hit_frame(ui, is_sel)
-            .inner_margin(egui::Margin::symmetric(10, 8))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    // 썸네일 또는 종류 표시
-                    let tex = hv.thumb_chunk.and_then(|c| self.thumb_texture(ctx, c));
-                    match tex {
-                        Some(t) => {
-                            ui.add(egui::Image::new(&t).max_size(egui::vec2(THUMB, THUMB)).corner_radius(4));
+        let tex = hv.thumb_chunk.and_then(|c| self.thumb_texture(ctx, c));
+        let resp = Self::hit_box(ui, is_sel, egui::Margin::symmetric(12, 10), |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                // 썸네일 또는 종류 타일
+                hit_visual(ui, tex.as_ref(), hv, THUMB);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let p = palette(ui.visuals());
+                    let loc = locator_label(hv);
+                    let keyword = hv.keyword_match();
+                    // 어디가 맞았는지 알리는 꼬리표들
+                    let tags = |ui: &mut egui::Ui| {
+                        if show_kind {
+                            widgets::tag(ui, sec.label(), p.muted, p.stripe);
                         }
-                        None => {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(THUMB, 44.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 4.0, palette(ui.visuals()).inset_fill);
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                kind_tag(hv.hit.kind),
-                                egui::FontId::proportional(12.0),
-                                ui.visuals().weak_text_color(),
-                            );
+                        if let Some(loc) = &loc {
+                            widgets::tone_tag(ui, Tone::Info, loc);
+                        }
+                        if keyword {
+                            widgets::tone_tag(ui, Tone::Ok, "검색어 포함")
+                                .on_hover_text("파일 이름이나 내용에 검색어가 그대로 들어 있습니다");
+                        }
+                    };
+                    let mut tags_w = 0.0;
+                    for (on, text) in [
+                        (show_kind, sec.label()),
+                        (loc.is_some(), loc.as_deref().unwrap_or_default()),
+                        (keyword, "검색어 포함"),
+                    ] {
+                        if on {
+                            tags_w += widgets::tag_width(ui, text) + 6.0;
                         }
                     }
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 3.0;
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&hv.file_name).text_style(theme::ts_item()).strong());
-                            if show_kind {
-                                widgets::caption(ui, sec.label());
-                            }
-                            // 어디가 맞았는지: 작은 색 글자로 (배지는 제목보다 눈에 띄어서 쓰지 않는다)
-                            if let Some(loc) = locator_label(hv) {
-                                ui.label(RichText::new(loc).small().color(Tone::Info.fg(ui.visuals())));
-                            }
-                            if hv.keyword_match() {
-                                ui.label(RichText::new("검색어 포함").small().color(Tone::Ok.fg(ui.visuals())))
-                                    .on_hover_text("파일 이름이나 내용에 검색어가 그대로 들어 있습니다");
-                            }
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                widgets::score_bar(ui, hv.hit.score, ScoreStyle::Row);
-                            });
+                    // 이름 · 꼬리표 · 점수가 한 줄에 다 들어가지 않으면(창이 좁거나 이름이 길면) 꼬리표를 다음 줄로 내린다
+                    const SCORE_W: f32 = 112.0;
+                    let name_font = theme::ts_item().resolve(ui.style());
+                    let natural = ui
+                        .painter()
+                        .layout_no_wrap(hv.file_name.clone(), name_font, egui::Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    let inline = natural + 8.0 + tags_w + SCORE_W <= ui.available_width();
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let name_w = (ui.available_width() - SCORE_W - if inline { tags_w + 8.0 } else { 0.0 }).max(40.0);
+                        ui.scope(|ui| {
+                            ui.set_max_width(name_w);
+                            ui.add(
+                                egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_item()).strong())
+                                    .truncate(),
+                            );
                         });
-                        ui.add(egui::Label::new(RichText::new(&hv.hit.path).small().weak()).truncate());
-                        if let Some(h) = &hv.highlight {
-                            ui.add(egui::Label::new(highlight_job(ui, h, 13.0)).wrap());
-                        } else if !hv.snippet.is_empty() && hv.hit.modality == Modality::Text {
-                            ui.add(egui::Label::new(RichText::new(&hv.snippet).size(13.0)).wrap());
+                        if inline {
+                            ui.add_space(2.0);
+                            tags(ui);
                         }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            widgets::score_bar(ui, hv.hit.score, ScoreStyle::Row);
+                        });
                     });
+                    if !inline && tags_w > 0.0 {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().interact_size.y = 20.0;
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                            tags(ui);
+                        });
+                    }
+                    ui.add(egui::Label::new(RichText::new(&hv.hit.path).small().weak()).truncate());
+                    if let Some(h) = &hv.highlight {
+                        ui.add(egui::Label::new(highlight_job(ui, h, 13.0)).wrap());
+                    } else if !hv.snippet.is_empty() && hv.hit.modality == Modality::Text {
+                        ui.add(egui::Label::new(RichText::new(&hv.snippet).size(13.0)).wrap());
+                    }
                 });
-            })
-            .response
-            .interact(egui::Sense::click());
+            });
+        });
         self.after_hit_response(ctx, sec, hv, &resp);
         ui.add_space(2.0);
+    }
+}
+
+/// 미리보기 패널의 틀: 본문 안에 놓인 카드 (왼쪽·아래에 바깥 여백)
+fn preview_frame(ui: &egui::Ui) -> egui::Frame {
+    widgets::card_frame(ui).outer_margin(egui::Margin {
+        left: 14,
+        right: 0,
+        top: 0,
+        bottom: 16,
+    })
+}
+
+/// 파일 종류를 알리는 색과 아이콘 (썸네일이 없는 결과의 타일, 미리보기 머리)
+pub fn kind_look(hv: &HitView) -> (Hue, Icon) {
+    match hv.hit.kind {
+        Kind::Text if is_code(&hv.file_name) => (Hue::Teal, Icon::FileCode),
+        Kind::Text => (Hue::Indigo, Icon::FileText),
+        Kind::Doc => (Hue::Coral, Icon::BookOpen),
+        Kind::Image => (Hue::Amber, Icon::Image),
+        Kind::Video => (Hue::Violet, Icon::Film),
+        Kind::Audio => (Hue::Green, Icon::AudioLines),
+        Kind::Other => (Hue::Gray, Icon::File),
+    }
+}
+
+fn is_code(name: &str) -> bool {
+    const CODE: [&str; 36] = [
+        "rs", "py", "js", "ts", "tsx", "jsx", "c", "h", "cpp", "hpp", "cc", "cs", "java", "kt", "go", "rb", "php",
+        "swift", "sh", "ps1", "bat", "cmd", "sql", "html", "css", "scss", "json", "yaml", "yml", "toml", "xml", "lua",
+        "vue", "dart", "ini", "gradle",
+    ];
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| CODE.iter().any(|c| ext.eq_ignore_ascii_case(c)))
+}
+
+/// 섹션 칩의 아이콘
+fn section_icon(s: Section) -> Icon {
+    match s {
+        Section::Docs => Icon::FileText,
+        Section::Images => Icon::Image,
+        Section::Videos => Icon::Film,
+        Section::Audio => Icon::AudioLines,
+        Section::Names => Icon::Type,
+    }
+}
+
+/// 그림을 가로/세로 비율이 `aspect`인 칸에 꽉 차게 넣을 때 쓸 가운데 부분 (넘치는 쪽을 잘라 낸다)
+fn cover_uv(tex: egui::Vec2, aspect: f32) -> egui::Rect {
+    let ta = tex.x / tex.y.max(1.0);
+    let (w, h) = if ta > aspect { (aspect / ta, 1.0) } else { (1.0, ta / aspect) };
+    egui::Rect::from_center_size(egui::pos2(0.5, 0.5), egui::vec2(w, h))
+}
+
+/// 결과 왼쪽의 그림: 썸네일이 있으면 정사각형으로 잘라 보여주고, 없으면 종류 타일
+pub fn hit_visual(ui: &mut egui::Ui, tex: Option<&egui::TextureHandle>, hv: &HitView, size: f32) {
+    match tex {
+        Some(t) => {
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover());
+            egui::Image::new(t)
+                .uv(cover_uv(t.size_vec2(), 1.0))
+                .corner_radius(size * 0.22)
+                .paint_at(ui, rect);
+        }
+        None => {
+            let (hue, glyph) = kind_look(hv);
+            widgets::kind_tile(ui, hue, glyph, size);
+        }
     }
 }
 
@@ -765,8 +969,9 @@ pub fn highlight_job(ui: &egui::Ui, text: &str, size: f32) -> egui::text::Layout
             ..Default::default()
         };
         if hot {
-            fmt.color = ui.visuals().strong_text_color();
-            fmt.background = palette(ui.visuals()).highlight_bg;
+            let p = palette(ui.visuals());
+            fmt.color = p.highlight_fg;
+            fmt.background = p.highlight_bg;
         }
         job.append(&part, 0.0, fmt);
     }
@@ -815,17 +1020,6 @@ pub fn open_label(hv: &HitView) -> String {
 
 fn is_media(s: Section) -> bool {
     matches!(s, Section::Images | Section::Videos)
-}
-
-fn kind_tag(k: Kind) -> &'static str {
-    match k {
-        Kind::Text => "TEXT",
-        Kind::Doc => "DOC",
-        Kind::Image => "IMG",
-        Kind::Video => "VIDEO",
-        Kind::Audio => "AUDIO",
-        Kind::Other => "FILE",
-    }
 }
 
 pub fn locator_label(hv: &HitView) -> Option<String> {

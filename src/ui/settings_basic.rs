@@ -349,7 +349,7 @@ impl GemmaApp {
                 match &plan {
                     _ if probing => {
                         ui.horizontal(|ui| {
-                            ui.spinner();
+                            widgets::spinner(ui);
                             ui.label("PC 사양을 확인하는 중…");
                         });
                     }

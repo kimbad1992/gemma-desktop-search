@@ -77,7 +77,7 @@ impl GemmaApp {
             ui.horizontal(|ui| {
                 widgets::tone_badge(ui, widgets::server_tone(&state), state.label(), true, busy);
                 if busy {
-                    ui.spinner();
+                    widgets::spinner(ui);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // 오른쪽부터 놓인다: 가장 중요한 버튼을 먼저
@@ -89,17 +89,17 @@ impl GemmaApp {
                             act = Act::Stop;
                         }
                     } else if running {
-                        if widgets::button(ui, Btn::Secondary, "■ 중지")
+                        if widgets::icon_button(ui, Btn::Secondary, widgets::Icon::Square, "중지")
                             .on_hover_text("llama-server 프로세스를 종료합니다")
                             .clicked()
                         {
                             act = Act::Stop;
                         }
-                        if widgets::button(ui, Btn::Secondary, "⟳ 재시작").clicked() {
+                        if widgets::icon_button(ui, Btn::Secondary, widgets::Icon::RotateCw, "재시작").clicked() {
                             act = Act::Restart;
                         }
                     } else {
-                        if widgets::button(ui, Btn::Primary, "▶ 서버 시작").clicked() {
+                        if widgets::icon_button(ui, Btn::Primary, widgets::Icon::Play, "서버 시작").clicked() {
                             act = Act::Start;
                         }
                         if widgets::button(ui, Btn::Ghost, "외부 서버 연결")
@@ -160,7 +160,7 @@ impl GemmaApp {
                 SelfTest::NotRun => widgets::help(ui, "서버가 준비되면 자동으로 확인합니다."),
                 SelfTest::Running => {
                     ui.horizontal(|ui| {
-                        ui.spinner();
+                        widgets::spinner(ui);
                         ui.label("텍스트 · 이미지 · 오디오 임베딩을 확인하는 중…");
                     });
                 }
@@ -197,7 +197,7 @@ impl GemmaApp {
                     "실행 파일",
                     &format!("{}{}", p.display(), if serve { "  (llama serve 모드)" } else { "" }),
                 ),
-                Err(e) => detail_row(ui, "실행 파일", &format!("✖ {e}")),
+                Err(e) => detail_row(ui, "실행 파일", &e.to_string()),
             }
             detail_row(ui, "모델", &self.cfg.model_path);
             detail_row(
@@ -220,7 +220,7 @@ impl GemmaApp {
             );
             if !cmdline.is_empty() {
                 widgets::collapsing_section(ui, "server_cmdline", "명령줄", false, |ui| {
-                    if ui.small_button("복사").clicked() {
+                    if widgets::small_button(ui, Btn::Secondary, "복사").clicked() {
                         ui.ctx().copy_text(cmdline.clone());
                     }
                     ui.add(egui::Label::new(RichText::new(&cmdline).monospace()).wrap());
@@ -237,8 +237,8 @@ impl GemmaApp {
             "서버 로그",
             |ui| {
                 // 오른쪽부터 놓인다
-                let clear = ui.small_button("지우기").clicked();
-                let copy = ui.small_button("복사").clicked();
+                let clear = widgets::small_button(ui, Btn::Secondary, "지우기").clicked();
+                let copy = widgets::small_button(ui, Btn::Secondary, "복사").clicked();
                 (copy, clear)
             },
             |ui| {

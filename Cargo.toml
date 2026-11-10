@@ -1,6 +1,6 @@
 [package]
 name = "gemma-search"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "EmbeddingGemma 2 + llama.cpp 기반 로컬 의미 검색기"
 license = "MIT"
@@ -28,9 +28,12 @@ parking_lot = "0.13"
 half = "2"
 sha2 = "0.10"
 raw-window-handle = "0.6"
+# 아이콘 글꼴 (Lucide, ISC). 글꼴 파일과 아이콘 이름만 쓴다.
+lucide-icons = "1.71"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",

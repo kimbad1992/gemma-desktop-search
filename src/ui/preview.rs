@@ -3,7 +3,7 @@
 use crate::app::GemmaApp;
 use crate::extract::{Kind, Modality};
 use crate::search::query::HitView;
-use crate::ui::search_panel::{highlight_job, locator_label, open_label};
+use crate::ui::search_panel::{highlight_job, kind_look, locator_label, open_label};
 use crate::ui::widgets;
 use crate::util::fmt_ts;
 use eframe::egui::{self, RichText};
@@ -58,12 +58,32 @@ pub fn make_preview(
 impl GemmaApp {
     pub fn preview_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, hv: &HitView, expr: Option<&str>) {
         use crate::ui::theme::{self, Tone};
-        use crate::ui::widgets::{Btn, ScoreStyle};
-        ui.add_space(4.0);
+        use crate::ui::widgets::{Btn, Icon, ScoreStyle};
+        // 빠른 검색창은 고른 줄의 미리보기를 늘 보여 주므로 닫기 버튼을 두지 않는다
+        // (선택을 풀어도 바로 첫 줄이 다시 선택돼 아무 일도 일어나지 않는다). 큰 창에서만 보인다.
+        let show_close = self.quick.is_none();
+        // 머리: 종류 타일 · 이름과 경로 · 닫기
         ui.horizontal(|ui| {
-            ui.add(egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_item()).strong()).truncate());
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (hue, glyph) = kind_look(hv);
+            widgets::kind_tile(ui, hue, glyph, 38.0);
+            let close_w = if show_close { theme::CONTROL_H + 10.0 } else { 0.0 };
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - close_w).max(60.0));
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.add(egui::Label::new(RichText::new(&hv.file_name).text_style(theme::ts_item()).strong()).truncate());
+                ui.add(egui::Label::new(RichText::new(&hv.hit.path).small().weak()).truncate())
+                    .on_hover_text(&hv.hit.path);
+            });
+            if show_close
+                && widgets::icon_button(ui, Btn::Ghost, Icon::X, "")
+                    .on_hover_text("미리보기 닫기")
+                    .clicked()
+            {
+                self.selected = None;
+            }
         });
-        ui.add(egui::Label::new(RichText::new(&hv.hit.path).small().weak()).wrap());
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             widgets::score_bar(ui, hv.hit.score, ScoreStyle::Labeled).on_hover_text(format!(
                 "관련도 {:.1} = 의미 {:.1} + 검색어 {:.1}\n\n관련도는 이 검색에서 대부분의 파일(중앙값)보다 표준편차 몇 배만큼 튀는지입니다.\n어떤 검색어에나 잘 걸리는 파일(밋밋한 스크린샷 등)은 그만큼 빼고 계산합니다.\n대략 7 이상 뚜렷함, 5.5 이상 관련 있음, 그 아래는 약함.\n(코사인 유사도 원래 값 {:.3})",
@@ -74,25 +94,30 @@ impl GemmaApp {
             ));
             widgets::tone_label(ui, Tone::Info, why(hv));
         });
+        ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            if widgets::button(ui, Btn::Primary, &open_label(hv)).on_hover_text("Enter").clicked() {
+            if widgets::icon_button(ui, Btn::Primary, Icon::ExternalLink, &open_label(hv))
+                .on_hover_text("Enter")
+                .clicked()
+            {
                 self.open_hit(hv);
             }
-            if widgets::button(ui, Btn::Secondary, "폴더에서 보기").on_hover_text("Ctrl+Enter").clicked() {
+            if widgets::icon_button(ui, Btn::Secondary, Icon::FolderOpen, "폴더에서 보기")
+                .on_hover_text("Ctrl+Enter")
+                .clicked()
+            {
                 crate::util::reveal_path(&hv.hit.path);
             }
-            if widgets::button(ui, Btn::Secondary, "파일 복사").on_hover_text("Ctrl+C").clicked() {
+            if widgets::icon_button(ui, Btn::Secondary, Icon::Copy, "파일 복사")
+                .on_hover_text("Ctrl+C")
+                .clicked()
+            {
                 self.copy_file(&hv.hit.path);
             }
-            // 빠른 검색창은 고른 줄의 미리보기를 늘 보여 주므로 닫기 버튼을 두지 않는다
-            // (선택을 풀어도 바로 첫 줄이 다시 선택돼 아무 일도 일어나지 않는다). 큰 창에서만 보인다.
-            if self.quick.is_none()
-                && widgets::button(ui, Btn::Ghost, "✕").on_hover_text("미리보기 닫기").clicked()
-            {
-                self.selected = None;
-            }
         });
-        ui.separator();
+        ui.add_space(6.0);
+        widgets::hairline(ui);
+        ui.add_space(4.0);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // 그림: 사진은 원본에서, 영상은 그 장면을 ffmpeg로 (불러오는 동안은 썸네일)
@@ -106,10 +131,10 @@ impl GemmaApp {
                     Some(t) => {
                         let size = t.size_vec2();
                         let scale = (w / size.x).min(520.0 / size.y).min(2.0);
-                        ui.add(egui::Image::new(&t).fit_to_exact_size(size * scale).corner_radius(6));
+                        ui.add(egui::Image::new(&t).fit_to_exact_size(size * scale).corner_radius(10));
                     }
                     None => {
-                        ui.spinner();
+                        widgets::spinner(ui);
                     }
                 }
                 if self.preview_loading(hv) {
@@ -138,12 +163,15 @@ impl GemmaApp {
                     }
                 }
             }
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Ctrl+C 파일 복사 · Esc 검색창")
-                    .small()
-                    .weak(),
-            );
+            // 빠른 검색창은 아래에 단축키 안내가 늘 보인다
+            if self.quick.is_none() {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("↑↓ 이동 · Enter 열기 · Ctrl+Enter 폴더에서 보기 · Ctrl+C 파일 복사 · Esc 검색창")
+                        .small()
+                        .weak(),
+                );
+            }
         });
     }
 }
