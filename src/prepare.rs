@@ -5,7 +5,7 @@
 //!   gemma-search download --list            고를 수 있는 llama.cpp 판과 크기, 이 기기의 추천
 //!   gemma-search download --llama vulkan    판을 직접 고른다 (cpu, vulkan, cuda13, cuda12)
 //!   gemma-search download --only model      모델만 (또는 --only llama)
-//!   gemma-search download --dir <폴더>      받을 곳 (기본: 실행 파일이 있는 폴더)
+//!   gemma-search download --dir <폴더>      받을 곳 (기본: 데이터 위치. `gemma-search data`로 확인)
 //!   gemma-search download --yes             묻지 않고 받는다 (-y)
 //!
 //! 권한: 관리자 권한(sudo)을 쓰지 않고 시스템 폴더·패키지·그룹을 건드리지 않는다. 받을 곳은 이 계정이 쓸 수 있는
@@ -56,7 +56,7 @@ pub fn download(args: &[String]) -> i32 {
             Ok(p) => p,
             Err(e) => return usage_error(&format!("--dir 경로가 잘못됐습니다: {e}")),
         },
-        None => config::app_dir(),
+        None => config::prep_dir(),
     };
     let picked = match a.value("--llama") {
         None => None,
@@ -282,7 +282,7 @@ fn list(root: &Path) -> i32 {
 // ── 판 고르기 ──
 
 fn auto_choice() -> Choice {
-    let info = crate::sysinfo::probe(&config::app_dir(), false);
+    let info = crate::sysinfo::probe(&config::prep_dir(), false);
     let plan = crate::sysinfo::recommend(&info);
     if let Some(g) = info.gpus.iter().find(|g| g.vendor == Vendor::Nvidia) {
         let driver = g.driver.clone().unwrap_or_else(|| "?".into());
@@ -490,7 +490,7 @@ fn title(p: Pack) -> String {
 }
 
 /// 안내에 쓸 이 프로그램의 이름: 경로로 실행했으면 그 경로(복사해 그대로 칠 수 있게), 아니면 gemma-search
-fn me() -> String {
+pub(crate) fn me() -> String {
     std::env::args()
         .next()
         .filter(|a| a.contains('/') || a.contains('\\'))

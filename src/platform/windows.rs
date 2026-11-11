@@ -64,6 +64,32 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) {
     }
 }
 
+// ── 데이터 위치 (location.rs) ──
+
+/// 데이터의 고정 위치: `%LOCALAPPDATA%\GemmaSearch`. 인덱스가 크고 PC마다 다르므로 Roaming이 아닌 Local에 둔다.
+/// 알 수 없으면 None (그때는 실행 파일 옆을 쓴다).
+pub fn data_home() -> Option<PathBuf> {
+    let local = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    local.is_absolute().then(|| local.join("GemmaSearch"))
+}
+
+/// 두 경로가 같은 드라이브에 있는지 (같으면 폴더 이름만 바꿔 옮길 수 있다). 모르면 false.
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    fn volume(p: &Path) -> Option<String> {
+        let p = std::path::absolute(p).ok()?;
+        let Some(Component::Prefix(pre)) = p.components().next() else { return None };
+        Some(match pre.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => (d as char).to_ascii_lowercase().to_string(),
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy()).to_lowercase()
+            }
+            _ => pre.as_os_str().to_string_lossy().to_lowercase(),
+        })
+    }
+    matches!((volume(a), volume(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// PATH에 없을 때 더 찾아볼 설치 위치: winget(Gyan.FFmpeg 등)의 기본 위치
 pub fn find_installed_tool(exe: &str) -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;

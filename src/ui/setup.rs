@@ -22,7 +22,7 @@ pub struct SetupState {
     pub pack: Option<Pack>,
     pub apply_plan: bool,
     pub start_index: bool,
-    /// "위치 직접 지정" 칸을 처음부터 펼쳐 둘지 (프로그램 폴더 밖의 파일을 이미 쓰고 있을 때)
+    /// "위치 직접 지정" 칸을 처음부터 펼쳐 둘지 (데이터 위치·프로그램 폴더 밖의 파일을 이미 쓰고 있을 때)
     pub own_files: bool,
 }
 
@@ -50,11 +50,11 @@ impl GemmaApp {
     pub fn open_setup(&mut self, ctx: &egui::Context) {
         self.setup_open = true;
         self.setup = SetupState::default();
-        // 프로그램 폴더 밖의 llama.cpp·모델을 쓰고 있으면 직접 지정한 것이므로 그 칸을 펼쳐 보여 준다
-        let app_dir = crate::config::app_dir().display().to_string().to_lowercase();
+        // 데이터 위치(받은 준비물)와 실행 파일 폴더 밖의 llama.cpp·모델을 쓰고 있으면 직접 지정한 것이므로 그 칸을 펼쳐 보여 준다
+        let ours = [crate::config::prep_dir(), crate::config::app_dir()].map(|d| d.display().to_string().to_lowercase());
         let outside = |p: &str| {
             let p = p.trim().to_lowercase();
-            !p.is_empty() && !p.starts_with(&app_dir)
+            !p.is_empty() && !ours.iter().any(|d| p.starts_with(d.as_str()))
         };
         self.setup.own_files = outside(&self.cfg.llama_path) || outside(&self.cfg.model_path);
         let ffmpeg = self.cfg.ffmpeg().is_some();
@@ -132,10 +132,20 @@ impl GemmaApp {
             widgets::help(
                 ui,
                 &format!(
-                    "설치 없이 이 폴더({})에서 바로 씁니다. 필요한 파일을 준비하고 검색할 폴더만 고르면 됩니다.",
-                    crate::config::app_dir().display()
+                    "설치 없이 바로 씁니다. 필요한 파일을 준비하고 검색할 폴더만 고르면 됩니다. \
+                     설정·인덱스와 받는 파일은 {}에 둡니다.",
+                    crate::config::prep_dir().display()
                 ),
             );
+            // 새 버전을 새 폴더에 푼 경우: 예전 폴더의 인덱스를 가져온다
+            if crate::location::current().kind == crate::location::Kind::Home {
+                if widgets::small_button(ui, Btn::Ghost, "예전 버전에서 쓰던 인덱스 가져오기…")
+                    .on_hover_text("예전 버전을 풀어 둔 폴더(또는 그 data 폴더)를 고르면 설정·인덱스를 가져와 다시 시작합니다")
+                    .clicked()
+                {
+                    self.pick_import();
+                }
+            }
 
             // ── 1. PC 확인 ──
             widgets::step_section(ui, 1, "PC 확인", plan.is_some(), None, |ui| match &plan {
@@ -165,7 +175,7 @@ impl GemmaApp {
                 2,
                 "필요한 파일 준비",
                 files_ok,
-                Some("AI 모델(EmbeddingGemma 2)과 그 모델을 돌리는 프로그램(llama.cpp)이 필요합니다. 받으면 이 프로그램 폴더 아래에 놓이고, 폴더째 옮겨도 그대로 씁니다."),
+                Some("AI 모델(EmbeddingGemma 2)과 그 모델을 돌리는 프로그램(llama.cpp)이 필요합니다. 받으면 데이터 위치 아래에 놓이고, 새 버전을 다른 폴더에 풀어도 그대로 씁니다."),
                 |ui| {
                     // AI 모델
                     if !model_ok {

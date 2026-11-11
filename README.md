@@ -16,7 +16,7 @@ EmbeddingGemma 2와 llama.cpp로 만든 Windows용 **로컬 의미 검색기**(R
 
 ## 준비물
 
-**설정 탭 → 일반 → 지금 상태**의 "필요한 것 모두 받기"를 누르면 모델과 llama.cpp를 프로그램 폴더 아래(`models\`, `llama.cpp\`)로 바로 받습니다. 체크섬을 확인하고, 끊기면 이어서 받습니다. 폴더째 옮겨도 그대로 쓰는 포터블 구성입니다.
+**설정 탭 → 일반 → 지금 상태**의 "필요한 것 모두 받기"를 누르면 모델과 llama.cpp를 [데이터 위치](#데이터-위치) 아래(`models\`, `llama.cpp\`)로 바로 받습니다. 체크섬을 확인하고, 끊기면 이어서 받습니다. 새 버전을 다른 폴더에 풀어도 받은 것을 그대로 씁니다.
 - 모델: EmbeddingGemma 2 Q8 (865MB)
 - llama.cpp: 검증한 빌드 b12201로 고정. CUDA 13 / CUDA 12 / Vulkan / CPU 중에서 이 PC에 맞는 판을 골라 줍니다. 직접 고르려면 **설정 → 고급 → 준비물 받기 (수동)**을 쓰세요.
 
@@ -28,7 +28,7 @@ EmbeddingGemma 2와 llama.cpp로 만든 Windows용 **로컬 의미 검색기**(R
 | EmbeddingGemma 2 GGUF | [ggml-org/embeddinggemma-2-GGUF](https://huggingface.co/ggml-org/embeddinggemma-2-GGUF) | 기본은 `embeddinggemma-2-Q8_0.gguf`(310MB)와 이미지·오디오용 `mmproj-embeddinggemma-2-Q8_0.gguf`(555MB). BF16도 됩니다. fp16은 쓰지 마세요(모델 카드 경고) |
 | ffmpeg / ffprobe | `winget install Gyan.FFmpeg` 등 | 선택 사항. 영상·오디오·HEIC 인덱싱에 필요 |
 
-기본 경로는 프로그램 폴더 아래 `llama.cpp\`와 `models\embeddinggemma-2\`입니다. 다른 곳에 두었다면 **설정 → 고급 → llama.cpp 서버 · 경로**에서 바꾸면 됩니다.
+기본 경로는 데이터 위치 아래 `llama.cpp\`와 `models\embeddinggemma-2\`입니다. 다른 곳에 두었다면 **설정 → 고급 → llama.cpp 서버 · 경로**에서 바꾸면 됩니다.
 
 ## 실행
 
@@ -36,13 +36,30 @@ EmbeddingGemma 2와 llama.cpp로 만든 Windows용 **로컬 의미 검색기**(R
 
 - exe는 코드 서명이 되어 있지 않습니다. 처음 실행할 때 Windows SmartScreen이 "PC 보호" 경고를 띄우면 **추가 정보 → 실행**을 누르세요.
 
-- 설정·인덱스는 exe 옆의 `data\` 폴더에 저장됩니다 (`config.toml`, `index.db`).
-- `cargo run`이나 `target\release\gemma-search.exe`로 실행하면 프로젝트 루트의 `data\`를 씁니다.
-- 환경 변수 `GEMMA_SEARCH_DATA`로 데이터 폴더를 바꿀 수 있습니다.
+- 설정·인덱스와 앱이 받은 준비물은 사용자 폴더의 한곳([데이터 위치](#데이터-위치))에 둡니다. 새 버전을 다른 폴더에 풀어도 같은 인덱스를 씁니다.
+
+### 데이터 위치
+
+| OS | 위치 |
+|---|---|
+| Windows | `%LOCALAPPDATA%\GemmaSearch` (예: `C:\Users\<이름>\AppData\Local\GemmaSearch`) |
+| Linux | `$XDG_DATA_HOME/gemma-search` (보통 `~/.local/share/gemma-search`) |
+| macOS | `~/Library/Application Support/GemmaSearch` |
+
+- 그 안에 `data\`(설정 `config.toml`, 인덱스 `index.db`, 로그)와 앱이 받은 준비물(`llama.cpp\`, `models\`)이 있습니다. 인덱스가 크고 PC마다 다르므로 Roaming이 아닌 Local에 둡니다.
+- **다른 드라이브로 옮기기**: **설정 → 일반 → 데이터 위치**의 "다른 곳으로 옮기기"로 폴더를 고릅니다. 고른 폴더가 비어 있지 않으면 그 아래 `GemmaSearch` 폴더로 옮깁니다. 기본 위치에는 옮긴 곳을 적은 `location.txt`만 남습니다.
+- **예전 버전(v0.8.0까지)의 데이터**: 예전 버전은 exe 옆 `data\`에 저장했습니다.
+  - 예전 폴더에서 새 버전을 실행하면(앱 안 업데이트 포함) 처음 한 번 옮길지 묻습니다. "옮기기"를 고르면 `data\`와, 설정이 가리키는 그 폴더의 `llama.cpp\`·`models\`를 함께 옮기고 설정의 경로도 고칩니다. 직접 지정한 다른 곳의 경로는 그대로 둡니다.
+  - 새 폴더에 풀었다면 처음 설정 화면이나 **설정 → 일반 → 데이터 위치**의 "예전 데이터 가져오기"로 예전 폴더(또는 그 `data` 폴더)를 고릅니다. 새 위치에 이미 인덱스가 있으면 지우지 않고 `data.before-import-<시각>`으로 이름을 바꿔 둡니다.
+  - 같은 드라이브면 폴더 이름만 바꿔 바로 옮깁니다. 다른 드라이브면 복사한 뒤 새 위치에서 인덱스가 열리고 파일 수가 같은지 확인하고 원래 것을 지웁니다. 설정에서 옮기면 앱이 다시 시작하면서 옮깁니다.
+- **포터블로 쓰기**: exe 옆에 `portable.txt`를 두면 예전처럼 exe 옆의 `data\`와 준비물을 씁니다. 옮길지 묻는 화면에서 "이 폴더에서 계속 쓰기"를 고르면 이 파일이 생깁니다.
+- `cargo run`이나 `target\release\gemma-search.exe`로 실행해도 같은 위치를 씁니다. 이때 "exe 옆"은 프로젝트 루트입니다.
+- 환경 변수 `GEMMA_SEARCH_DATA`를 주면 데이터 폴더만 그곳을 씁니다 (시험용).
+- 명령줄: `gemma-search data`(지금 위치), `data move`(exe 옆의 예전 데이터를 옮기기), `data move-to <폴더>`, `data import <폴더>`. 옮기는 동안에는 앱과 서비스를 꺼 둡니다.
 
 ## 처음 사용 순서
 
-zip을 풀고 `gemma-search.exe`를 실행하면 **처음 설정 마법사**가 뜹니다. 설치 없이 그 폴더에서 바로 쓰는 포터블이고, 마법사는 처음 한 번만 뜹니다. 설정 탭의 "처음 설정 다시 열기"로 다시 열 수 있습니다.
+zip을 풀고 `gemma-search.exe`를 실행하면 **처음 설정 마법사**가 뜹니다. 설치 없이 바로 쓰고, 마법사는 처음 한 번만 뜹니다. 설정 탭의 "처음 설정 다시 열기"로 다시 열 수 있습니다.
 
 1. **PC 확인**: 다음을 확인해 ✔/⚠/✖로 보여줍니다.
    - Windows 버전, 메모리
@@ -54,7 +71,7 @@ zip을 풀고 `gemma-search.exe`를 실행하면 **처음 설정 마법사**가 
    - NVIDIA 드라이버 551 이상: CUDA 12
    - AMD·Intel 그래픽: Vulkan
    - 그래픽카드가 없거나 VRAM이 부족하면: CPU
-   - "필요한 것 모두 받기"를 누르면 모델과 llama.cpp를 프로그램 폴더 아래로 받습니다. ffmpeg는 winget 설치 버튼을 누르면 됩니다.
+   - "필요한 것 모두 받기"를 누르면 모델과 llama.cpp를 데이터 위치 아래로 받습니다. ffmpeg는 winget 설치 버튼을 누르면 됩니다.
    - 이미 받아 둔 llama.cpp 폴더와 모델 파일(.gguf)이 있으면 "위치 직접 지정"을 펼쳐 그대로 쓸 수 있습니다. 고르면 llama.cpp를 실제로 실행해 보고(버전 확인) 모델 파일의 종류를 읽어, 쓸 수 있으면 ✔로 알려 줍니다. llama.cpp(llama-server)만 지원하고 vLLM·Ollama 같은 다른 서버는 쓸 수 없습니다.
 3. **이 PC에 맞추기**: VRAM에 맞춰 입력 크기를 정합니다. 실측 VRAM은 다음과 같습니다.
    - `-ub 8192`: 3.6GB (VRAM 6GB 이상일 때)
@@ -265,7 +282,7 @@ zip을 풀고 `gemma-search.exe`를 실행하면 **처음 설정 마법사**가 
   - 인덱싱 중 llama-server가 비정상 종료되면 자동으로 다시 띄우고 변경분 인덱싱으로 이어갑니다(작업당 최대 5회).
   - 충돌 때 처리 중이던 파일을 기록해 두고, 같은 파일이 두 번 걸리면 그 파일의 내용 인덱싱은 건너뜁니다(이름만).
   - 이 기능은 설정에서 끌 수 있습니다.
-- **서버 로그 파일**: `data\logs\llama-server.log`에 남습니다. 20MB를 넘으면 `.old.log`로 교체됩니다.
+- **서버 로그 파일**: 데이터 위치의 `data\logs\llama-server.log`에 남습니다. 20MB를 넘으면 `.old.log`로 교체됩니다.
 - **Flash Attention은 기본으로 꺼 둡니다** (`-fa off`)
   - Windows 릴리스 빌드에서 RTX 40 계열 GPU로 Gemma 4 계열 모델과 mmproj를 쓰면, Flash Attention이 켜져 있을 때 llama-server가 `CUDA error: an illegal memory access`로 죽는 문제가 있습니다([llama.cpp #30436](https://github.com/ggml-org/llama.cpp/issues/30436)).
   - 이미지를 많이 인덱싱할 때 실제로 재현됐고, 꺼도 속도 차이는 거의 없었습니다. 설정에서 바꿀 수 있습니다.
@@ -344,7 +361,7 @@ mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz
 ./gemma-search search 예산 회의록
 ```
 
-- **`download`**: llama.cpp와 모델(865MB)을 실행 파일 옆(`llama.cpp/`, `models/`)으로 받습니다.
+- **`download`**: llama.cpp와 모델(865MB)을 데이터 위치(`~/.local/share/gemma-search`의 `llama.cpp/`, `models/`)로 받습니다.
   - 이 기기에 맞는 llama.cpp 판을 고릅니다. NVIDIA가 있으면 CUDA판, 그래픽을 Vulkan으로 쓸 수 있으면 Vulkan판, 아니면 CPU판입니다. 받을 것과 크기를 먼저 보여 주고 묻습니다.
   - SHA-256을 확인하고, 끊기면 다시 실행해 이어서 받습니다.
   - 판을 바꿀 때는 새 판을 옆 폴더에 다 푼 뒤 바꿔 넣으므로, 받다가 끊겨도 쓰던 llama.cpp는 그대로입니다. 이 명령으로 받지 않은 `llama.cpp/` 폴더는 지우지 않고 `llama.cpp.old-<시각>`으로 옮겨 둡니다.
@@ -355,7 +372,9 @@ mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz
   - 인덱스가 비어 있으면 바로 처음 인덱싱을 시작합니다. 폴더 감시는 기본으로 켜져 있습니다(`--no-watch`로 끔).
   - llama-server는 검색·인덱싱할 때 켜고, 10분 동안 쓰지 않으면 끕니다.
   - Ctrl+C나 SIGTERM으로 끝내면 llama-server도 함께 끝납니다. 서비스가 비정상 종료돼도 llama-server는 남지 않습니다.
-  - 데이터 폴더는 실행 파일 옆의 `data/`이고, 환경 변수 `GEMMA_SEARCH_DATA`로 바꿀 수 있습니다.
+  - 데이터 폴더는 `~/.local/share/gemma-search/data/`입니다(`./gemma-search data`로 확인). [데이터 위치](#데이터-위치)를 보세요.
+  - 예전 버전처럼 실행 파일 옆에 `data/`가 있고 새 위치가 비어 있으면, 묻지 않고 실행 파일 옆을 그대로 쓰면서 옮기는 명령을 알려 줍니다. 서비스를 끄고 `./gemma-search data move`를 실행하면 옮깁니다(같은 디스크면 바로, 다른 디스크면 복사해 확인한 뒤).
+  - 실행 파일 옆에 `portable.txt`를 두면 늘 실행 파일 옆의 `data/`를 씁니다. 환경 변수 `GEMMA_SEARCH_DATA`를 주면 데이터 폴더만 그곳을 씁니다.
   - 한 데이터 폴더는 하나만 씁니다. 창 있는 앱, 서비스, `--index-once`는 같은 데이터 폴더로 함께 실행되지 않습니다.
 
 ### 명령
@@ -370,6 +389,7 @@ mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz
 | `rescan` | 폴더를 지금 훑어 바뀐 파일을 찾음 (폴더 감시가 켜져 있을 때) |
 | `lend --server <주소>` | 다른 기기의 서비스가 인덱싱할 때 이 기기의 그래픽으로 나눠 처리 (아래 [여러 기기의 그래픽 나눠 쓰기](#여러-기기의-그래픽-나눠-쓰기-계산-빌려주기) 참고) |
 | `update [--check] [--restart]` | 새 버전으로 바꾸기 (아래 [업데이트](#업데이트) 참고) |
+| `data` | 데이터 위치 보기. `data move`(실행 파일 옆의 예전 데이터를 옮기기), `data move-to <폴더>`(다른 디스크로), `data import <폴더>`(예전 폴더에서 가져오기), `-y`(묻지 않기) |
 
 - 종류는 `docs`(문서 내용), `images`(이미지), `videos`(영상), `audio`(오디오), `names`(파일 이름)입니다. `--kinds 문서,사진`처럼 한글로도 됩니다.
 - 결과는 표준 출력, 진행과 오류는 표준 오류로 나옵니다. 종료 코드는 0 성공, 1 실패, 2 인자가 잘못됨입니다. `index --wait`는 인덱싱이 실패하거나 서버를 켜지 못하면 1로 끝나므로 스크립트에 쓸 수 있습니다.

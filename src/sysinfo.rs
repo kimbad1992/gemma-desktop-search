@@ -242,7 +242,7 @@ pub fn recommend(info: &SysInfo) -> Plan {
         },
         "디스크".to_string(),
         format!(
-            "프로그램 폴더 드라이브에 {:.1}GB 남음 (준비물 약 {:.1}GB + 인덱스)",
+            "데이터 위치 드라이브에 {:.1}GB 남음 (준비물 약 {:.1}GB + 인덱스)",
             info.free_disk_mb as f64 / 1024.0,
             need_mb as f64 / 1024.0
         ),

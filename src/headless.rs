@@ -129,7 +129,7 @@ pub fn stress(args: &[String]) -> i32 {
 }
 
 /// 창 없이 변경분 인덱싱 한 번: 서버 시작 → 인덱싱(모델이 바뀌었으면 호환성 검사 포함) → 결과 출력 → 서버 중지
-///   gemma-search.exe --index-once   (데이터 폴더는 GEMMA_SEARCH_DATA로 바꿀 수 있음)
+///   gemma-search.exe --index-once   (데이터 폴더는 location.rs, 시험할 때는 GEMMA_SEARCH_DATA로 바꿀 수 있음)
 /// 서비스나 창이 있는 앱이 같은 데이터 폴더를 쓰는 중이면 하지 않는다 (인덱스를 둘이 함께 고치지 않게).
 pub fn index_once() -> i32 {
     let data_dir = crate::config::data_dir();
@@ -298,7 +298,7 @@ pub fn query_once(args: &[String]) -> i32 {
 pub fn sysinfo() -> i32 {
     let cfg = Config::load(&crate::config::data_dir());
     let t = Instant::now();
-    let info = crate::sysinfo::probe(&crate::config::app_dir(), cfg.ffmpeg().is_some());
+    let info = crate::sysinfo::probe(&crate::config::prep_dir(), cfg.ffmpeg().is_some());
     let plan = crate::sysinfo::recommend(&info);
     println!("확인 {:.1}초", t.elapsed().as_secs_f32());
     for g in &info.gpus {

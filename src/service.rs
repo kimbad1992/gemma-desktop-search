@@ -54,7 +54,7 @@ pub const USAGE: &str = "\
       --list                      고를 수 있는 llama.cpp 판과 이 기기의 추천
       --llama <판>                판을 직접 고른다: cpu, vulkan, cuda13, cuda12
       --only <model|llama>        하나만 받는다
-      --dir <폴더>                받을 곳 (기본: 실행 파일이 있는 폴더). 관리자 권한은 쓰지 않는다
+      --dir <폴더>                받을 곳 (기본: 데이터 위치). 관리자 권한은 쓰지 않는다
       -y, --yes                   묻지 않고 받는다
   gemma-search serve --root <검색할 폴더>
 
@@ -74,7 +74,9 @@ pub const USAGE: &str = "\
       --embed-key <키>            그 서버를 --api-key로 켰을 때의 키
 
   serve에 준 값은 설정 파일(data/config.toml)에 저장되므로 다음부터는 `gemma-search serve`만 쓰면 됩니다.
-  데이터 폴더는 실행 파일 옆의 data 폴더이고, 환경 변수 GEMMA_SEARCH_DATA로 바꿀 수 있습니다.
+  설정·인덱스와 받은 준비물은 사용자 폴더의 고정 위치에 둡니다 (Linux ~/.local/share/gemma-search,
+  Windows %LOCALAPPDATA%\\GemmaSearch). `gemma-search data`로 확인하고 옮깁니다.
+  실행 파일 옆에 portable.txt를 두면 실행 파일 옆의 data/를 씁니다.
 
 떠 있는 서비스에 묻는 명령:
   gemma-search search <질의…>     검색해서 결과를 출력한다
@@ -239,6 +241,16 @@ pub fn serve(args: &[String]) -> i32 {
 
     println!("Gemma Search v{} 서비스", env!("CARGO_PKG_VERSION"));
     println!("데이터 폴더: {}", data_dir.display());
+    // 예전 버전처럼 실행 파일 옆의 data/를 쓰는 중: 묻지 않고 그대로 쓰고, 옮기는 방법만 알린다
+    let loc = crate::location::current();
+    if let (crate::location::Kind::Legacy, Some(home)) = (loc.kind, &loc.home) {
+        println!(
+            "참고: 실행 파일 옆의 예전 데이터를 그대로 씁니다. 새 버전은 {}에 둡니다.\n  \
+             옮기려면 서비스를 끄고 `{} data move`를 실행하세요 (같은 디스크면 바로, 다른 디스크면 복사해 확인한 뒤 옮깁니다).",
+            home.display(),
+            crate::prepare::me()
+        );
+    }
     if let Some(Ok(t)) = cfg.external_server() {
         println!("임베딩: 외부 llama-server {t} (이 기기에서는 llama-server를 켜지 않습니다)");
         if !t.is_loopback() && t.base.starts_with("http://") {

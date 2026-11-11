@@ -1,7 +1,8 @@
 //! 설정 > 일반: 전문 지식 없이도 쓸 수 있게 쉬운 말로 쓴 화면.
 //!
 //! 이 화면만으로 검색을 시작할 수 있어야 한다: 지금 상태(무엇이 빠졌는지와 해결 버튼),
-//! 검색할 폴더, 살펴볼 파일 종류, PC에 맞춘 성능, 앱 동작. 전문 항목은 `settings_advanced.rs`에 있다.
+//! 검색할 폴더, 살펴볼 파일 종류, PC에 맞춘 성능, 앱 동작, 업데이트, 데이터 위치(`data_location.rs`).
+//! 전문 항목은 `settings_advanced.rs`에 있다.
 
 use crate::app::{GemmaApp, SettingsView};
 use crate::sysinfo::Level;
@@ -47,6 +48,7 @@ impl GemmaApp {
         self.basic_performance(ui);
         self.basic_behavior(ui);
         self.basic_update(ui);
+        self.basic_location(ui);
 
         ui.add_space(space::M);
         ui.horizontal(|ui| {
@@ -58,7 +60,6 @@ impl GemmaApp {
                 self.open_setup(&ctx);
             }
         });
-        widgets::caption(ui, &format!("설정과 검색 자료가 저장되는 곳: {}", self.data_dir.display()));
     }
 
     /// 지금 바로 검색할 수 있는지, 아니면 무엇이 빠졌는지
@@ -109,7 +110,7 @@ impl GemmaApp {
                 } else if probing {
                     ui.label(RichText::new("PC 사양 확인 중…").weak());
                 } else if widgets::button(ui, Btn::Primary, "필요한 것 모두 받기")
-                    .on_hover_text("이 PC에 맞는 것을 골라 프로그램 폴더 아래에 받습니다")
+                    .on_hover_text("이 PC에 맞는 것을 골라 데이터 위치 아래에 받습니다")
                     .clicked()
                 {
                     fix = Fix::Download;

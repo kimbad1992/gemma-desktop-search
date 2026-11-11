@@ -53,6 +53,32 @@ pub fn wait_for_process_exit(pid: u32, timeout: Duration) {
     }
 }
 
+// ── 데이터 위치 (location.rs) ──
+
+/// 데이터의 고정 위치. Linux는 `$XDG_DATA_HOME/gemma-search`(없으면 `~/.local/share/gemma-search`),
+/// macOS는 `~/Library/Application Support/GemmaSearch`. 홈 폴더를 알 수 없으면 None (그때는 실행 파일 옆을 쓴다).
+/// 상대 경로로 적힌 환경 변수는 무시한다 (XDG 규칙).
+pub fn data_home() -> Option<PathBuf> {
+    let absolute = |v: std::ffi::OsString| Some(PathBuf::from(v)).filter(|p| p.is_absolute());
+    let home = std::env::var_os("HOME").and_then(absolute);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library").join("Application Support").join("GemmaSearch"));
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .and_then(absolute)
+        .or_else(|| home.map(|h| h.join(".local").join("share")))
+        .map(|d| d.join("gemma-search"))
+}
+
+/// 두 경로가 같은 파일 시스템에 있는지 (같으면 폴더 이름만 바꿔 옮길 수 있다). 아직 없는 경로는 있는 윗폴더로 본다.
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fn device(p: &Path) -> Option<u64> {
+        p.ancestors().find_map(|q| std::fs::metadata(q).ok()).map(|m| m.dev())
+    }
+    matches!((device(a), device(b)), (Some(x), Some(y)) if x == y)
+}
+
 /// PATH에 없을 때 더 찾아볼 흔한 설치 위치
 pub fn find_installed_tool(exe: &str) -> Option<PathBuf> {
     ["/usr/local/bin", "/usr/bin", "/snap/bin", "/opt/homebrew/bin"]

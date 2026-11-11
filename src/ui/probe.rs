@@ -20,7 +20,7 @@ impl ProbeState {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let info = crate::sysinfo::probe(&crate::config::app_dir(), ffmpeg);
+            let info = crate::sysinfo::probe(&crate::config::prep_dir(), ffmpeg);
             let plan = crate::sysinfo::recommend(&info);
             let _ = tx.send((info, plan));
             ctx.request_repaint();

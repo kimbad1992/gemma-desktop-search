@@ -64,7 +64,7 @@ impl GemmaApp {
     /// 준비물 수동 받기: 모델과 llama.cpp 판을 직접 고른다
     fn advanced_downloads(&mut self, ui: &mut egui::Ui) {
         use crate::download::{Pack, LLAMA_BUILD};
-        let app_dir = crate::config::app_dir();
+        let prep_dir = crate::config::prep_dir();
         let running = self.dl.lock().running;
         let model_ok = Path::new(self.cfg.model_path.trim()).is_file();
         let llama_ok = crate::server::resolve_binary(&self.cfg.llama_path).is_ok();
@@ -75,8 +75,8 @@ impl GemmaApp {
             ui,
             "준비물 받기 (수동)",
             Some(&format!(
-                "모델과 llama.cpp를 프로그램 폴더({}) 아래에 받고 경로를 맞춥니다. 폴더째 옮겨도 그대로 씁니다.",
-                app_dir.display()
+                "모델과 llama.cpp를 데이터 위치({}) 아래에 받고 경로를 맞춥니다. 설정 → 일반 → 데이터 위치에서 옮겨도 그대로 씁니다.",
+                prep_dir.display()
             )),
             |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -116,7 +116,7 @@ impl GemmaApp {
 
         if let Some(pack) = start {
             self.dl_queue.clear();
-            crate::download::start(pack, app_dir, self.dl.clone(), self.dl_cancel.clone(), crate::app::waker(ui.ctx()));
+            crate::download::start(pack, prep_dir, self.dl.clone(), self.dl_cancel.clone(), crate::app::waker(ui.ctx()));
         }
     }
 

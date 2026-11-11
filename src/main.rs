@@ -15,6 +15,7 @@ mod extract;
 mod headless;
 mod index;
 mod lend;
+mod location;
 #[cfg(feature = "gui")]
 mod open;
 mod paths;
@@ -44,19 +45,38 @@ fn main() {
         }
         args.drain(i..(i + 2).min(args.len()));
     }
+    let move_job = take_move_job(&mut args);
     if let Some(code) = command(&args) {
         std::process::exit(code);
     }
     #[cfg(feature = "gui")]
-    if let Err(e) = gui(&args) {
+    if let Err(e) = gui(&args, move_job) {
         eprintln!("창을 띄우지 못했습니다: {e}");
         std::process::exit(1);
     }
     #[cfg(not(feature = "gui"))]
     {
-        eprintln!("Gemma Search v{} (창 없는 서비스판)\n\n{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE, USAGE);
+        let _ = move_job;
+        eprintln!(
+            "Gemma Search v{} (창 없는 서비스판)\n\n{}\n\n{}\n\n{}",
+            env!("CARGO_PKG_VERSION"),
+            service::USAGE,
+            location::USAGE,
+            USAGE
+        );
         std::process::exit(2);
     }
+}
+
+/// 데이터를 옮기려고 다시 시작한 경우 (`--move-data <import|to> <경로> <이전 pid>`, app.rs의 `restart_to_move`):
+/// 이전 프로세스가 끝나기를 기다리고 할 일을 돌려준다. 옮기기는 창에서 한다 (`ui::launch`).
+fn take_move_job(args: &mut Vec<String>) -> Option<location::Job> {
+    let i = args.iter().position(|a| a == "--move-data")?;
+    let taken: Vec<String> = args.drain(i..(i + 4).min(args.len())).collect();
+    if let Some(pid) = taken.get(3).and_then(|p| p.parse::<u32>().ok()) {
+        platform::wait_for_process_exit(pid, std::time::Duration::from_secs(20));
+    }
+    location::Job::from_args(taken.get(1)?, taken.get(2)?)
 }
 
 /// 창 없이 도는 명령이면 실행하고 종료 코드를 돌려준다. 아니면 None (창을 띄운다).
@@ -77,8 +97,10 @@ fn command(args: &[String]) -> Option<i32> {
         #[cfg(feature = "gui")]
         "lend" if !rest.iter().any(|a| a == "--console") => return gui_lend(rest),
         "lend" => lend::lend(rest),
+        // 데이터 위치 확인·옮기기 (location.rs)
+        "data" => location::cli(rest),
         "help" | "--help" | "-h" => {
-            println!("Gemma Search v{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE);
+            println!("Gemma Search v{}\n\n{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE, location::USAGE);
             #[cfg(not(feature = "gui"))]
             println!("\n{USAGE}");
             0
@@ -140,20 +162,30 @@ fn gui_lend(args: &[String]) -> Option<i32> {
 
 /// 창이 있는 앱
 #[cfg(feature = "gui")]
-fn gui(args: &[String]) -> eframe::Result {
+fn gui(args: &[String], move_job: Option<location::Job>) -> eframe::Result {
     use eframe::egui;
+    use ui::launch::{First, Launcher};
     // 화면 확인용 --shot <png>: 창을 화면에 띄우지 않고 그려서 PNG로 저장하고 끝낸다 (app::Shot)
     let shot = args.iter().any(|a| a == "--shot");
+    let loc = location::current();
+    // 앱을 열기 전에 할 일: 이전 프로세스가 맡긴 옮기기, 또는 실행 파일 옆의 예전 데이터를 옮길지 묻기
+    let first = match move_job {
+        Some(job) => Some(First::Move(job)),
+        None if loc.kind == location::Kind::Legacy => Some(First::Ask),
+        None => None,
+    };
+    // 옮기는 경우에는 옮긴 뒤의 데이터 폴더로 아래 두 가지를 본다 (ui::launch)
+    let moving = matches!(first, Some(First::Move(_)));
     // 이미 실행 중이면 그 창을 띄우고 끝낸다 (로그인 시 자동 실행 + 직접 실행이 겹쳐도 하나만)
     let lend_on_start = app::LEND_ON_START.load(std::sync::atomic::Ordering::SeqCst);
-    if !shot && shell::already_running(&config::data_dir(), lend_on_start) {
+    if !shot && !moving && shell::already_running(&loc.data, lend_on_start) {
         return Ok(());
     }
     // 서비스(gemma-search serve)가 이 데이터 폴더를 쓰는 중이면 띄우지 않는다: 인덱스를 둘이 함께 고치면 안 된다
-    let _lock = if shot {
+    let mut lock = if shot || moving {
         None
     } else {
-        match config::instance_lock(&config::data_dir()) {
+        match config::instance_lock(&loc.data) {
             Ok(lock) => Some(lock),
             Err(why) => {
                 rfd::MessageDialog::new()
@@ -180,7 +212,8 @@ fn gui(args: &[String]) -> eframe::Result {
         .with_inner_size(size)
         .with_min_inner_size([640.0, 420.0])
         .with_drag_and_drop(true)
-        .with_visible(!background && !shot);
+        // 옮길지 묻거나 옮기는 화면은 트레이로 시작(--background)했어도 보여 준다
+        .with_visible(!shot && (!background || first.is_some()));
     if shot {
         // 숨긴 채로 그리지만, eframe이 첫 그림 뒤에 창을 한 번 보이게 하므로 화면 밖에 두고 포커스도 받지 않게 한다
         viewport = viewport
@@ -195,9 +228,17 @@ fn gui(args: &[String]) -> eframe::Result {
         viewport,
         ..Default::default()
     };
+    // 옮기는 화면을 거치면 잠금을 그 화면이 들고 있다가 옮길 때 놓고, 옮긴 뒤 새 폴더를 잠근다
+    let launcher_lock = if first.is_some() { lock.take() } else { None };
+    let _lock = lock;
     eframe::run_native(
         "Gemma Search",
         options,
-        Box::new(|cc| Ok(Box::new(app::GemmaApp::new(cc)))),
+        Box::new(move |cc| {
+            Ok(match first {
+                Some(first) => Box::new(Launcher::new(cc, first, launcher_lock)) as Box<dyn eframe::App>,
+                None => Box::new(app::GemmaApp::new(cc)),
+            })
+        }),
     )
 }

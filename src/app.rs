@@ -128,6 +128,9 @@ pub struct QuickState {
 /// `--open filter_kinds`(필터 드롭다운을 펼친 채로), `--update-on-start`(업데이트를 누른 것처럼. 다시 시작은 하지 않는다),
 /// `--fake-update v9.9.9`(새 버전이 있는 것처럼).
 /// 쓰는 인덱스와 섞이지 않게 `GEMMA_SEARCH_DATA`로 별도 데이터 폴더를 준다.
+/// 예전 데이터를 옮길지 묻는 화면(`ui::launch`)은 `GEMMA_SEARCH_DATA` 대신 실행 파일을 시험 폴더에 복사하고
+/// `LOCALAPPDATA`를 시험 폴더로 바꿔 찍는다. `--shot-move`면 "옮기기"를 누른 것처럼 옮긴 뒤 열린 앱을 찍는다.
+/// 설정의 옮기기 확인 창은 `--propose-import <폴더>`, `--propose-move-to <폴더>` (폴더를 고른 것처럼. 옮기지는 않는다).
 pub struct Shot {
     path: PathBuf,
     /// 화면이 자리 잡은 뒤 이만큼 더 기다렸다가 찍는다
@@ -145,7 +148,40 @@ pub struct Shot {
 }
 
 impl Shot {
-    fn from_args() -> Option<Self> {
+    /// 한 프레임마다: 화면이 `busy`가 아닌 채로 자리 잡으면 찍는다. 다 찍었으면 true (창을 닫는다).
+    pub(crate) fn tick(&mut self, ctx: &egui::Context, busy: bool) -> bool {
+        if self.done.load(Ordering::SeqCst) {
+            return true;
+        }
+        if self.started.elapsed() > Duration::from_secs(120) {
+            // 서버가 뜨지 않는 등으로 끝나지 않는 경우
+            eprintln!("--shot: 화면이 준비되지 않아 찍지 못했습니다");
+            std::process::exit(2);
+        }
+        // 숨긴 창은 eframe이 그리지 않으므로 매번 그려 달라고 한다 (배치가 몇 프레임에 걸쳐 자리 잡는다)
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        ctx.request_repaint_after(Duration::from_millis(50));
+        if busy {
+            self.settled = None;
+            return false;
+        }
+        let since = *self.settled.get_or_insert_with(Instant::now);
+        if !self.requested && since.elapsed() >= self.wait {
+            self.requested = true;
+            let (path, done, ctx2) = (self.path.clone(), self.done.clone(), ctx.clone());
+            ctx.request_screenshot(move |img| {
+                let [w, h] = img.size;
+                if let Err(e) = image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
+                    eprintln!("--shot: 저장 실패: {e}");
+                }
+                done.store(true, Ordering::SeqCst);
+                ctx2.request_repaint();
+            });
+        }
+        false
+    }
+
+    pub(crate) fn from_args() -> Option<Self> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let value = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
         let path = PathBuf::from(value("--shot")?);
@@ -343,6 +379,8 @@ pub struct GemmaApp {
 
     pub notice: Option<Notice>,
     pub confirm_rebuild: bool,
+    /// 데이터 옮기기·가져오기 확인 창에 띄운 계획 (`ui::data_location`)
+    pub data_move: Option<crate::location::Plan>,
     last_title: String,
     last_index_state: RunState,
 
@@ -358,12 +396,21 @@ pub struct GemmaApp {
 /// 한 번의 인덱싱 작업에서 서버 자동 재시작 최대 횟수
 pub const MAX_RECOVER_ATTEMPTS: u32 = 5;
 
+/// 글꼴과 테마 (창을 만들 때 한 번). 글꼴을 먼저: 테마의 굵은 글자 스타일이 "bold" 패밀리를 쓴다.
+pub fn install_look(ctx: &egui::Context) {
+    setup_fonts(ctx);
+    crate::ui::theme::install(ctx);
+}
+
 impl GemmaApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 글꼴을 먼저 (테마의 굵은 글자 스타일이 "bold" 패밀리를 쓴다)
-        setup_fonts(&cc.egui_ctx);
-        crate::ui::theme::install(&cc.egui_ctx);
+        install_look(&cc.egui_ctx);
+        Self::start(&cc.egui_ctx, crate::platform::native_window(cc))
+    }
 
+    /// 앱을 연다: 데이터 폴더의 설정·인덱스를 읽고 트레이·단축키 등을 시작한다.
+    /// 데이터를 옮긴 뒤에 여는 경우(`ui::launch`)에는 창이 이미 있으므로 따로 부른다. `install_look`은 먼저 해 둔다.
+    pub fn start(egui_ctx: &egui::Context, main_hwnd: usize) -> Self {
         let data_dir = config::data_dir();
         let _ = std::fs::create_dir_all(&data_dir);
         let cfg = Config::load(&data_dir);
@@ -437,7 +484,7 @@ impl GemmaApp {
             shot_view: None,
             logo: None,
             titlebar_dark: None,
-            main_hwnd: crate::platform::native_window(cc),
+            main_hwnd,
             force_foreground: None,
             quick: None,
             parked_shape: None,
@@ -473,6 +520,7 @@ impl GemmaApp {
             new_root: String::new(),
             notice: None,
             confirm_rebuild: false,
+            data_move: None,
             last_title: String::new(),
             last_index_state: RunState::Idle,
             auto_index: false,
@@ -490,7 +538,7 @@ impl GemmaApp {
         // → 숨긴 동안 0.5초마다 깨운다
         {
             let flag = app.hidden_flag.clone();
-            let ctx = cc.egui_ctx.clone();
+            let ctx = egui_ctx.clone();
             std::thread::Builder::new()
                 .name("hidden-ticker".into())
                 .spawn(move || loop {
@@ -506,7 +554,7 @@ impl GemmaApp {
         let shell = if app.shot.is_some() {
             Err(String::new())
         } else {
-            Shell::start(cc.egui_ctx.clone(), app.cfg.global_hotkey).map_err(|e| e.to_string())
+            Shell::start(egui_ctx.clone(), app.cfg.global_hotkey).map_err(|e| e.to_string())
         };
         match shell {
             Ok(s) => {
@@ -548,7 +596,7 @@ impl GemmaApp {
             .unwrap_or(0);
         if app.shot.is_none() && app.cfg.check_updates && now.saturating_sub(app.cfg.last_update_check) > 24 * 3600 {
             let (tx, rx) = crossbeam_channel::bounded(1);
-            let ctx = cc.egui_ctx.clone();
+            let ctx = egui_ctx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(crate::update::check().ok().flatten());
                 ctx.request_repaint();
@@ -575,7 +623,7 @@ impl GemmaApp {
         app.auto_query = value("--query");
         // gemma-search.exe lend …: 설정에 저장된 주소로 바로 빌려주기
         if LEND_ON_START.load(Ordering::SeqCst) {
-            if let Err(e) = app.start_lending(&cc.egui_ctx) {
+            if let Err(e) = app.start_lending(egui_ctx) {
                 app.notify(e, true);
             }
         }
@@ -601,10 +649,10 @@ impl GemmaApp {
                     app.saved_cfg = s;
                 }
             } else {
-                app.open_setup(&cc.egui_ctx);
+                app.open_setup(egui_ctx);
                 // 트레이로 시작했어도 마법사는 보여야 한다
                 if !app.window_visible && app.shot.is_none() {
-                    cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    egui_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     app.window_visible = true;
                     app.hidden_flag.store(false, Ordering::SeqCst);
                 }
@@ -616,14 +664,14 @@ impl GemmaApp {
         }
         if flag("--probe") {
             let ffmpeg = app.cfg.ffmpeg().is_some();
-            app.probe.start(ffmpeg, &cc.egui_ctx);
+            app.probe.start(ffmpeg, egui_ctx);
         }
         if flag("--after-update") {
             app.notify(format!("v{} 버전으로 업데이트했습니다.", env!("CARGO_PKG_VERSION")), false);
         }
         // 화면 확인용: "업데이트"를 누른 것처럼 시작한다
         if flag("--update-on-start") {
-            app.start_update(&cc.egui_ctx);
+            app.start_update(egui_ctx);
         }
         // 화면 확인용: 빠른 검색창·처음 설정 화면을 창 모양을 바꾸지 않고 그린다 (크기는 --size로 맞춘다)
         if app.shot.is_some() {
@@ -637,13 +685,20 @@ impl GemmaApp {
                 });
             }
             if flag("--setup") && !app.setup_open {
-                app.open_setup(&cc.egui_ctx);
+                app.open_setup(egui_ctx);
             }
             *widgets::TEST_OPEN.lock() = value("--open");
             // 새 버전이 있는 것처럼 ("업데이트 가능" 표시 확인)
             if let Some(tag) = value("--fake-update") {
                 let page = format!("https://github.com/{}/releases", crate::update::REPO);
                 app.update_available = Some((tag, page));
+            }
+            // 데이터 옮기기·가져오기 확인 창 (폴더를 고른 것처럼. 옮기지는 않는다)
+            if let Some(dir) = value("--propose-import") {
+                app.propose_move(crate::location::Job::Import(dir.into()));
+            }
+            if let Some(dir) = value("--propose-move-to") {
+                app.propose_move(crate::location::Job::MoveTo(dir.into()));
             }
             app.shot_view = match value("--view").as_deref() {
                 Some("docs") => Some(Section::Docs),
@@ -658,8 +713,8 @@ impl GemmaApp {
         }
         // 화면 확인용: 시스템 테마와 상관없이 밝은/어두운 테마로 고정
         match value("--theme").as_deref() {
-            Some("light") => cc.egui_ctx.set_theme(egui::ThemePreference::Light),
-            Some("dark") => cc.egui_ctx.set_theme(egui::ThemePreference::Dark),
+            Some("light") => egui_ctx.set_theme(egui::ThemePreference::Light),
+            Some("dark") => egui_ctx.set_theme(egui::ThemePreference::Dark),
             _ => {}
         }
         if let Some(t) = value("--tab") {
@@ -928,7 +983,7 @@ impl GemmaApp {
         }
         let first = todo.remove(0);
         self.dl_queue = todo;
-        crate::download::start(first, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
+        crate::download::start(first, config::prep_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
     }
 
     /// 받기가 끝날 때마다 대기열의 다음 준비물을 받는다 (실패했으면 대기열을 비운다)
@@ -939,7 +994,7 @@ impl GemmaApp {
         }
         if !self.dl_queue.is_empty() {
             let next = self.dl_queue.remove(0);
-            crate::download::start(next, config::app_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
+            crate::download::start(next, config::prep_dir(), self.dl.clone(), self.dl_cancel.clone(), waker(ctx));
         }
     }
 
@@ -2222,6 +2277,25 @@ impl GemmaApp {
         }
     }
 
+    /// 데이터를 옮기려고 다시 시작한다: 새 프로세스가 이 프로세스가 끝나기를 기다렸다가 옮기고 앱을 연다
+    /// (`--move-data`, main.rs와 `ui::launch`). 인덱스가 열려 있는 동안에는 폴더를 옮길 수 없다.
+    pub fn restart_to_move(&mut self, ctx: &egui::Context, job: &crate::location::Job) {
+        let [kind, path] = job.to_args();
+        let spawned = std::process::Command::new(crate::update::exe_path())
+            .arg("--move-data")
+            .arg(kind)
+            .arg(path)
+            .arg(std::process::id().to_string())
+            .spawn();
+        match spawned {
+            Ok(_) => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => self.notify(format!("다시 시작하지 못해 옮기지 않았습니다: {e}"), true),
+        }
+    }
+
     /// 업데이트 단계가 바뀌었을 때 한 번씩: 결과를 알리고, 바꾸기가 끝났으면 다시 시작한다
     fn poll_update(&mut self, ctx: &egui::Context) {
         use crate::update::Stage;
@@ -2377,41 +2451,16 @@ impl GemmaApp {
             || self.pending_search.is_some()
             || self.store_loading.load(Ordering::SeqCst)
             || !self.preview_pending.is_empty();
-        let Some(s) = &mut self.shot else { return };
-        if s.when_indexing {
-            // 인덱싱이 어느 정도 돈 순간에 바로 찍는다
-            busy = !indexing;
-            s.wait = Duration::ZERO;
-        }
-        if s.done.load(Ordering::SeqCst) {
-            self.quitting = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-        if s.started.elapsed() > Duration::from_secs(120) {
-            // 서버가 뜨지 않는 등으로 끝나지 않는 경우
-            eprintln!("--shot: 화면이 준비되지 않아 찍지 못했습니다");
-            std::process::exit(2);
-        }
-        // 숨긴 창은 eframe이 그리지 않으므로 매번 그려 달라고 한다 (배치가 몇 프레임에 걸쳐 자리 잡는다)
-        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
-        ctx.request_repaint_after(Duration::from_millis(50));
-        if busy {
-            s.settled = None;
-            return;
-        }
-        let since = *s.settled.get_or_insert_with(Instant::now);
-        if !s.requested && since.elapsed() >= s.wait {
-            s.requested = true;
-            let (path, done, ctx2) = (s.path.clone(), s.done.clone(), ctx.clone());
-            ctx.request_screenshot(move |img| {
-                let [w, h] = img.size;
-                if let Err(e) = image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
-                    eprintln!("--shot: 저장 실패: {e}");
-                }
-                done.store(true, Ordering::SeqCst);
-                ctx2.request_repaint();
-            });
+        if let Some(s) = &mut self.shot {
+            if s.when_indexing {
+                // 인덱싱이 어느 정도 돈 순간에 바로 찍는다
+                busy = !indexing;
+                s.wait = Duration::ZERO;
+            }
+            if s.tick(ctx, busy) {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -2514,6 +2563,7 @@ impl eframe::App for GemmaApp {
         // 토스트·대화상자는 숨김 상태의 이른 반환 뒤에만 그린다 (숨긴 창에서 즉시형 창을 띄우면 패닉)
         if self.setup_open {
             egui::CentralPanel::default().frame(body).show(ui, |ui| self.setup_ui(ui));
+            self.data_move_dialog(&ctx);
             self.show_toast(&ctx);
             return;
         }
@@ -2541,6 +2591,7 @@ impl eframe::App for GemmaApp {
             }
         });
         self.rebuild_dialog(&ctx);
+        self.data_move_dialog(&ctx);
         self.show_toast(&ctx);
     }
 }

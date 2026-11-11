@@ -1,4 +1,4 @@
-//! 포터블 준비물 받기: EmbeddingGemma 2 Q8 모델과 llama.cpp(b12201 고정)를 프로그램 폴더 아래로.
+//! 준비물 받기: EmbeddingGemma 2 Q8 모델과 llama.cpp(b12201 고정)를 데이터 위치(`config::prep_dir`) 아래로.
 //!
 //! - 받는 중에는 `.part` 파일에 쓰고, 끝나면 SHA-256을 확인한 뒤 이름을 바꾼다.
 //! - 끊겼던 `.part`가 있으면 이어서 받는다 (Range 요청, 서버가 지원하지 않으면 처음부터).
@@ -78,7 +78,7 @@ impl Pack {
         self.assets().iter().map(|a| a.size).sum()
     }
 
-    /// 받을 폴더 (프로그램 폴더 기준)
+    /// 받을 폴더 (데이터 위치 기준: `config::prep_dir`)
     pub fn dest(self, app_dir: &Path) -> PathBuf {
         match self {
             Pack::Model => app_dir.join("models").join("embeddinggemma-2"),

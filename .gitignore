@@ -22,3 +22,6 @@ desktop.ini
 # 포터블 준비물 (설정 → 준비물 받기)
 /models/
 /llama.cpp/
+# 포터블 표시 (exe 옆 data/를 쓰기. 개발 빌드는 저장소 루트가 exe 옆이다)
+/portable.txt
+/portable

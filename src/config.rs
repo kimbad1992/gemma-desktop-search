@@ -119,15 +119,22 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            llama_path: default_path(&[app_dir().join("llama.cpp"), PathBuf::from(r"F:\Tools\llama.cpp-embed")]),
+            // 데이터 위치의 llama.cpp\ (설정 → 준비물 받기). 없으면 실행 파일 옆(예전 포터블), 그다음 예전 위치.
+            llama_path: default_path(&[
+                prep_dir().join("llama.cpp"),
+                app_dir().join("llama.cpp"),
+                PathBuf::from(r"F:\Tools\llama.cpp-embed"),
+            ]),
             // ggml-org의 Q8_0 (310MB + 555MB). BF16과 벡터가 사실상 같다 (실측 코사인 0.997 이상)
-            // 포터블: 프로그램 폴더의 models\ 아래 (설정 → 준비물 받기). 없으면 예전 위치.
+            // 데이터 위치의 models\ 아래 (설정 → 준비물 받기). 없으면 실행 파일 옆, 그다음 예전 위치.
             model_path: default_path(&[
-                model_dir().join("embeddinggemma-2-Q8_0.gguf"),
+                model_dir(&prep_dir()).join("embeddinggemma-2-Q8_0.gguf"),
+                model_dir(&app_dir()).join("embeddinggemma-2-Q8_0.gguf"),
                 PathBuf::from(r"F:\Tools\models\embeddinggemma-2\embeddinggemma-2-Q8_0.gguf"),
             ]),
             mmproj_path: default_path(&[
-                model_dir().join("mmproj-embeddinggemma-2-Q8_0.gguf"),
+                model_dir(&prep_dir()).join("mmproj-embeddinggemma-2-Q8_0.gguf"),
+                model_dir(&app_dir()).join("mmproj-embeddinggemma-2-Q8_0.gguf"),
                 PathBuf::from(r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
             ]),
             extra_dll_dir: String::new(),
@@ -240,15 +247,15 @@ impl Config {
             Err(_) => return Self::default(),
         };
         cfg.migrate();
-        cfg.reanchor_portable(&app_dir());
+        cfg.reanchor_portable(&[prep_dir(), app_dir()]);
         cfg
     }
 
-    /// 포터블 폴더를 통째로 옮긴 경우: 설정에는 절대 경로가 저장돼 있어 예전 위치를 가리킨다.
-    /// 저장된 경로가 없어졌고 지금 프로그램 폴더 아래에 같은 꼬리 경로가 있으면 그쪽으로 바꾼다.
-    fn reanchor_portable(&mut self, base: &Path) {
+    /// 준비물 폴더를 통째로 옮긴 경우(포터블 폴더 이동, 데이터 위치 옮기기): 설정에는 절대 경로가 저장돼 있어 예전 위치를 가리킨다.
+    /// 저장된 경로가 없어졌고 지금 데이터 위치(없으면 실행 파일 폴더) 아래에 같은 꼬리 경로가 있으면 그쪽으로 바꾼다.
+    fn reanchor_portable(&mut self, bases: &[PathBuf]) {
         for p in [&mut self.llama_path, &mut self.model_path, &mut self.mmproj_path] {
-            if let Some(moved) = reanchor(p.as_str(), base) {
+            if let Some(moved) = bases.iter().find_map(|base| reanchor(p.as_str(), base)) {
                 *p = moved;
             }
         }
@@ -361,7 +368,7 @@ impl Config {
     }
 }
 
-/// 후보 중 실제로 있는 첫 경로, 없으면 첫 후보 (프로그램 폴더 기준)
+/// 후보 중 실제로 있는 첫 경로, 없으면 첫 후보 (데이터 위치 기준)
 fn default_path(candidates: &[PathBuf]) -> String {
     candidates
         .iter()
@@ -450,9 +457,9 @@ fn existing(p: &str) -> Option<PathBuf> {
     pb.is_file().then_some(pb)
 }
 
-/// 포터블 준비물 가운데 모델이 놓이는 폴더: 프로그램 폴더의 `models/embeddinggemma-2`
-fn model_dir() -> PathBuf {
-    app_dir().join("models").join("embeddinggemma-2")
+/// 준비물 가운데 모델이 놓이는 폴더: `root/models/embeddinggemma-2` (`download::Pack::dest`)
+fn model_dir(root: &Path) -> PathBuf {
+    root.join("models").join("embeddinggemma-2")
 }
 
 /// 다른 프로세스가 데이터 폴더를 잠가 두었을 때의 안내 첫머리 (`instance_lock`의 오류가 이것으로 시작한다)
@@ -481,15 +488,19 @@ pub fn instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
     }
 }
 
-/// 데이터 폴더: exe 옆의 `data`. cargo로 실행 중(target\debug|release)이면 프로젝트 루트의 `data`.
+/// 데이터 폴더(설정·인덱스): 보통 사용자 폴더의 고정 위치 아래 `data` (Windows `%LOCALAPPDATA%\GemmaSearch\data`).
+/// 정하는 순서는 `location.rs`. 환경 변수 `GEMMA_SEARCH_DATA`가 있으면 그 폴더.
 pub fn data_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("GEMMA_SEARCH_DATA") {
-        return PathBuf::from(d);
-    }
-    app_dir().join("data")
+    crate::location::current().data
 }
 
-/// 프로그램 폴더: exe가 있는 폴더 (cargo로 실행 중이면 프로젝트 루트). 포터블 준비물(모델·llama.cpp)도 여기 아래.
+/// 앱이 받은 준비물(`llama.cpp/`, `models/`)을 두는 폴더: 데이터 위치(보통 고정 위치, 포터블이면 실행 파일 폴더)
+pub fn prep_dir() -> PathBuf {
+    crate::location::current().root
+}
+
+/// 프로그램 폴더: exe가 있는 폴더 (cargo로 실행 중이면 프로젝트 루트).
+/// 포터블(`portable.txt`)이거나 예전 데이터를 옮기기 전이면 데이터와 준비물도 여기 아래다 (`location.rs`).
 pub fn app_dir() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     let mut dir = exe.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
