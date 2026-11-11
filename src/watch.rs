@@ -459,33 +459,36 @@ fn scan(roots: &[String], filter: &PathFilter, db_path: &Path) -> Result<(Vec<St
 mod tests {
     use super::*;
 
+    use crate::paths::os_path as os;
+
     fn filter() -> PathFilter {
         PathFilter::new(
-            &[r"C:\Docs".to_string(), r"\\nas\share\Photos\".to_string()],
+            &[os(r"C:\Docs"), os(r"\\nas\share\Photos\")],
             &["node_modules".to_string(), ".git".to_string()],
-            Path::new(r"C:\Docs\app\data"),
+            Path::new(&os(r"C:\Docs\app\data")),
         )
     }
 
     #[test]
     fn keeps_only_paths_the_indexer_would_index() {
         let f = filter();
-        assert!(!f.ignores(r"C:\Docs\report.txt"));
-        assert!(!f.ignores(r"c:\docs\Sub\Report.TXT"));
-        assert!(!f.ignores(r"\\NAS\share\Photos\2024\IMG_0001.jpg"));
+        let ignores = |p: &str| f.ignores(&os(p));
+        assert!(!ignores(r"C:\Docs\report.txt"));
+        assert!(!ignores(r"c:\docs\Sub\Report.TXT"));
+        assert!(!ignores(r"\\NAS\share\Photos\2024\IMG_0001.jpg"));
         // 대상 폴더 밖, 대상 폴더 자체
-        assert!(f.ignores(r"C:\Other\report.txt"));
-        assert!(f.ignores(r"C:\Docs"));
-        assert!(f.ignores(r"C:\Docs2\report.txt"));
+        assert!(ignores(r"C:\Other\report.txt"));
+        assert!(ignores(r"C:\Docs"));
+        assert!(ignores(r"C:\Docs2\report.txt"));
         // 제외 폴더 아래 (폴더 이름일 때만: 같은 이름의 파일은 대상)
-        assert!(f.ignores(r"C:\Docs\proj\node_modules\x\index.js"));
-        assert!(!f.ignores(r"C:\Docs\proj\node_modules"));
+        assert!(ignores(r"C:\Docs\proj\node_modules\x\index.js"));
+        assert!(!ignores(r"C:\Docs\proj\node_modules"));
         // 데이터 폴더 아래
-        assert!(f.ignores(r"C:\Docs\app\data\index.db-wal"));
+        assert!(ignores(r"C:\Docs\app\data\index.db-wal"));
         // 저장·다운로드 중의 임시 파일
-        assert!(f.ignores(r"C:\Docs\~$report.docx"));
-        assert!(f.ignores(r"C:\Docs\movie.mp4.crdownload"));
-        assert!(f.ignores(r"C:\Docs\a1b2.tmp"));
+        assert!(ignores(r"C:\Docs\~$report.docx"));
+        assert!(ignores(r"C:\Docs\movie.mp4.crdownload"));
+        assert!(ignores(r"C:\Docs\a1b2.tmp"));
     }
 
     #[test]

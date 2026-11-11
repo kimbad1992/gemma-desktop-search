@@ -7,6 +7,7 @@
 mod app;
 #[cfg(feature = "gui")]
 mod autostart;
+mod cli;
 mod config;
 mod download;
 mod embed;
@@ -18,6 +19,7 @@ mod open;
 mod paths;
 mod platform;
 mod precheck;
+mod prepare;
 mod search;
 mod server;
 mod service;
@@ -61,7 +63,19 @@ fn command(args: &[String]) -> Option<i32> {
     let rest = args.get(1..).unwrap_or_default();
     Some(match args.first()?.as_str() {
         "serve" | "--serve" => service::serve(rest),
-        "search" | "--search" => service::search_cli(rest),
+        // 준비물(llama.cpp, 모델) 받기 (prepare.rs)
+        "download" => prepare::download(rest),
+        // 떠 있는 서비스에 묻는 명령 (cli.rs)
+        "search" | "--search" => cli::search(rest),
+        "status" => cli::status(rest),
+        "index" => cli::index(rest),
+        "rescan" => cli::rescan(rest),
+        "help" | "--help" | "-h" => {
+            println!("Gemma Search v{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE);
+            #[cfg(not(feature = "gui"))]
+            println!("\n{USAGE}");
+            0
+        }
         "--update" => update::run_cli(),
         "--check-update" => {
             println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
@@ -91,6 +105,7 @@ const USAGE: &str = "\
 그 밖의 명령:
   gemma-search --sysinfo          사양 확인과 추천 설정
   gemma-search --index-once       바뀐 파일을 한 번 인덱싱하고 끝낸다
+                                  (서비스가 떠 있을 때는 `gemma-search index`)
   gemma-search --check-update     새 버전 확인";
 
 /// 창이 있는 앱

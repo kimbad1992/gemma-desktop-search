@@ -116,8 +116,21 @@ pub fn stress(args: &[String]) -> i32 {
 
 /// 창 없이 변경분 인덱싱 한 번: 서버 시작 → 인덱싱(모델이 바뀌었으면 호환성 검사 포함) → 결과 출력 → 서버 중지
 ///   gemma-search.exe --index-once   (데이터 폴더는 GEMMA_SEARCH_DATA로 바꿀 수 있음)
+/// 서비스나 창이 있는 앱이 같은 데이터 폴더를 쓰는 중이면 하지 않는다 (인덱스를 둘이 함께 고치지 않게).
 pub fn index_once() -> i32 {
     let data_dir = crate::config::data_dir();
+    let _lock = match crate::config::instance_lock(&data_dir) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            if e.starts_with(crate::config::LOCK_BUSY) {
+                eprintln!(
+                    "서비스가 떠 있으면 `gemma-search index --wait`로, 창이 있는 앱이 떠 있으면 앱의 인덱스 화면에서 인덱싱하세요."
+                );
+            }
+            return 1;
+        }
+    };
     let mut cfg = Config::load(&data_dir);
     println!("데이터 폴더: {}", data_dir.display());
     let server = ServerManager::default();
@@ -141,18 +154,21 @@ pub fn index_once() -> i32 {
     let store = Arc::new(RwLock::new(VectorStore::new(cfg.search_dim)));
     store.write().loaded = true;
     let mut indexer = Indexer::default();
-    indexer
-        .start(IndexParams {
-            cfg: cfg.clone(),
-            caps,
-            port: cfg.port,
-            db_path: data_dir.join("index.db"),
-            data_dir: data_dir.clone(),
-            store,
-            full_rebuild: false,
-            only: None,
-        })
-        .unwrap();
+    if let Err(e) = indexer.start(IndexParams {
+        cfg: cfg.clone(),
+        caps,
+        port: cfg.port,
+        db_path: data_dir.join("index.db"),
+        data_dir: data_dir.clone(),
+        store,
+        full_rebuild: false,
+        only: None,
+    }) {
+        // 검색할 폴더가 없는 경우 등
+        println!("인덱싱을 시작하지 못했습니다: {e}");
+        server.stop();
+        return 1;
+    }
     let mut last = Instant::now();
     while indexer.is_active() {
         std::thread::sleep(Duration::from_millis(300));

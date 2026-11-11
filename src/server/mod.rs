@@ -568,11 +568,17 @@ pub fn explain_exit(status: ExitStatus, logs: &VecDeque<String>) -> String {
         Some(0xC000_0005) => "접근 위반으로 종료되었습니다 (0xC0000005)".to_string(),
         Some(0xC000_0409) => "비정상 종료 (0xC0000409)".to_string(),
         Some(c) => format!("종료 코드 {} (0x{c:08X})", c as i32),
-        None => "알 수 없는 이유로 종료".to_string(),
+        None => killed_by_signal(status).unwrap_or_else(|| "알 수 없는 이유로 종료".to_string()),
     };
     let tail: Vec<&String> = logs.iter().rev().take(40).collect();
     let has = |pat: &str| tail.iter().any(|l| l.to_lowercase().contains(pat));
-    if has("unknown model architecture") {
+    if has("error while loading shared libraries") {
+        // Linux: 실행 파일이 쓰는 .so가 없다 (Vulkan판인데 Vulkan 드라이버가 없거나, CUDA판인데 CUDA 런타임이 없는 경우)
+        msg.push_str(
+            " — 필요한 공유 라이브러리(.so)가 없습니다. Vulkan판이면 libvulkan1과 mesa-vulkan-drivers를, \
+             CUDA판이면 CUDA 런타임을 설치하거나 CPU판 llama.cpp를 쓰세요",
+        );
+    } else if has("unknown model architecture") {
         msg.push_str(" — 이 llama.cpp 빌드가 모델 아키텍처를 지원하지 않습니다. 더 최신 빌드가 필요합니다");
     } else if has("out of memory") || has("failed to allocate") {
         msg.push_str(" — 메모리(VRAM) 부족: -ngl 값을 줄이거나 컨텍스트를 줄이세요");
@@ -586,21 +592,68 @@ pub fn explain_exit(status: ExitStatus, logs: &VecDeque<String>) -> String {
     msg
 }
 
+/// Unix: 신호로 끝났으면 그 설명 (종료 코드가 없는 경우)
+#[cfg(unix)]
+fn killed_by_signal(status: ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    let sig = status.signal()?;
+    let why = match sig {
+        9 => "SIGKILL: 메모리가 모자라 OS가 끝냈을 수 있습니다 (dmesg에서 oom-killer 확인)",
+        11 => "SIGSEGV: 비정상 종료",
+        6 => "SIGABRT: 비정상 종료",
+        15 => "SIGTERM: 다른 프로세스가 끝냈습니다",
+        _ => "신호로 종료",
+    };
+    Some(format!("신호 {sig}로 종료 ({why})"))
+}
+
+#[cfg(not(unix))]
+fn killed_by_signal(_status: ExitStatus) -> Option<String> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::windows::process::ExitStatusExt;
 
+    /// 종료 코드로 끝난 상태를 만든다 (OS마다 원래 값의 모양이 다르다)
+    fn exited(code: u32) -> ExitStatus {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // waitpid 상태: 종료 코드는 8~15번째 비트
+            ExitStatus::from_raw(((code & 0xff) as i32) << 8)
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn dll_not_found_is_explained() {
-        let st = ExitStatus::from_raw(0xC000_0135);
-        let m = explain_exit(st, &VecDeque::new());
+        let m = explain_exit(exited(0xC000_0135), &VecDeque::new());
         assert!(m.contains("DLL"), "{m}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signals_and_missing_libraries_are_explained() {
+        use std::os::unix::process::ExitStatusExt;
+        let m = explain_exit(ExitStatus::from_raw(9), &VecDeque::new());
+        assert!(m.contains("신호 9") && m.contains("메모리"), "{m}");
+        let logs: VecDeque<String> =
+            ["./llama-server: error while loading shared libraries: libvulkan.so.1: cannot open shared object file".to_string()]
+                .into();
+        let m = explain_exit(exited(127), &logs);
+        assert!(m.contains("종료 코드 127") && m.contains("mesa-vulkan-drivers"), "{m}");
     }
 
     #[test]
     fn unknown_arch_hint() {
-        let st = ExitStatus::from_raw(1);
+        let st = exited(1);
         let logs: VecDeque<String> =
             ["llama_model_load: error loading model: unknown model architecture: 'gemma-embedding2'".to_string()]
                 .into();

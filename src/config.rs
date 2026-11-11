@@ -430,7 +430,10 @@ fn model_dir() -> PathBuf {
     app_dir().join("models").join("embeddinggemma-2")
 }
 
-/// 한 데이터 폴더를 한 프로세스만 쓰게 하는 잠금 (창이 있는 앱과 서비스판이 같은 인덱스를 함께 고치지 않게).
+/// 다른 프로세스가 데이터 폴더를 잠가 두었을 때의 안내 첫머리 (`instance_lock`의 오류가 이것으로 시작한다)
+pub const LOCK_BUSY: &str = "다른 Gemma Search가 이미 이 데이터 폴더를 쓰고 있습니다";
+
+/// 한 데이터 폴더를 한 프로세스만 쓰게 하는 잠금 (창이 있는 앱, 서비스판, `--index-once`가 같은 인덱스를 함께 고치지 않게).
 /// 돌려받은 파일을 들고 있는 동안 잠겨 있고, 프로세스가 끝나면 풀린다.
 pub fn instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
     let path = data_dir.join("instance.lock");
@@ -445,7 +448,7 @@ pub fn instance_lock(data_dir: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| format!("데이터 폴더에 쓸 수 없습니다 ({}): {e}", path.display()))?;
     match file.try_lock() {
         Err(std::fs::TryLockError::WouldBlock) => Err(format!(
-            "다른 Gemma Search가 이미 이 데이터 폴더를 쓰고 있습니다 ({}).\n창이 있는 앱과 서비스(gemma-search serve)는 같은 데이터 폴더로 함께 띄울 수 없습니다.",
+            "{LOCK_BUSY} ({}).\n창이 있는 앱, 서비스(gemma-search serve), --index-once는 같은 데이터 폴더로 함께 실행할 수 없습니다.",
             data_dir.display()
         )),
         // 잠금을 지원하지 않는 파일 시스템이면 잠그지 않고 쓴다

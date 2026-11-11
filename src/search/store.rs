@@ -596,9 +596,12 @@ mod tests {
 
     #[test]
     fn folder_filter_selects_roots_and_other() {
-        assert_eq!(folder_key(r"C:\Users\Me\Photos\"), r"c:\users\me\photos\");
-        assert_eq!(folder_key(r"C:\"), r"c:\");
-        assert_eq!(folder_key(r"\\NAS\Share"), r"\\nas\share\");
+        use crate::paths::os_path as os;
+        assert_eq!(folder_key(&os(r"C:\Users\Me\Photos\")), os(r"c:\users\me\photos\"));
+        assert_eq!(folder_key(&os(r"C:\")), os(r"c:\"));
+        assert_eq!(folder_key(&os(r"\\NAS\Share")), os(r"\\nas\share\"));
+        #[cfg(unix)]
+        assert_eq!(folder_key("/"), "/");
 
         let mut s = VectorStore::new(8);
         s.loaded = true;
@@ -611,11 +614,11 @@ mod tests {
         for (id, p) in files {
             s.replace_file(
                 id,
-                FileInfo::new(p.into(), Kind::Image),
+                FileInfo::new(os(p), Kind::Image),
                 vec![(Entry { chunk_id: id * 10, file_id: id, modality: Modality::Image, locator: 0 }, unit(8, 1))],
             );
         }
-        let known = vec![folder_key(r"D:\Photos"), folder_key(r"\\NAS\Share")];
+        let known = vec![folder_key(&os(r"D:\Photos")), folder_key(&os(r"\\NAS\Share"))];
         let run = |selected: Vec<String>, include_other: bool| {
             let f = Filter {
                 folders: Some(FolderFilter { selected, known: known.clone(), include_other }),
@@ -626,8 +629,8 @@ mod tests {
             ids.sort();
             ids
         };
-        assert_eq!(run(vec![folder_key(r"D:\Photos")], false), vec![1]);
-        assert_eq!(run(vec![folder_key(r"\\NAS\Share")], true), vec![2, 3, 4]);
+        assert_eq!(run(vec![folder_key(&os(r"D:\Photos"))], false), vec![1]);
+        assert_eq!(run(vec![folder_key(&os(r"\\NAS\Share"))], true), vec![2, 3, 4]);
         assert_eq!(run(vec![], true), vec![3, 4]);
         assert!(run(vec![], false).is_empty());
     }

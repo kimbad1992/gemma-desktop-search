@@ -87,7 +87,7 @@ fn vendor_of(name: &str) -> Vendor {
 }
 
 /// "621.14" → 621
-fn driver_major(v: &str) -> Option<u32> {
+pub(crate) fn driver_major(v: &str) -> Option<u32> {
     v.split('.').next()?.trim().parse().ok()
 }
 
@@ -253,7 +253,15 @@ pub fn recommend(info: &SysInfo) -> Plan {
         if info.ffmpeg {
             "있음 (영상·오디오·HEIC 사용 가능)".to_string()
         } else {
-            "없음 — 영상·오디오·HEIC 사진은 이름만 색인됩니다. 아래 버튼으로 설치할 수 있습니다".to_string()
+            // 창이 있는 앱의 마법사·설정에는 설치 단추가 있다. 명령줄(서비스판, Linux)에는 없다.
+            let how = if cfg!(all(windows, feature = "gui")) {
+                "아래 버튼으로 설치할 수 있습니다"
+            } else if cfg!(windows) {
+                "winget install Gyan.FFmpeg로 설치할 수 있습니다"
+            } else {
+                "패키지 관리자로 설치하세요 (예: sudo apt install ffmpeg)"
+            };
+            format!("없음 — 영상·오디오·HEIC 사진은 이름만 색인됩니다. {how}")
         },
     ));
     let summary = format!(

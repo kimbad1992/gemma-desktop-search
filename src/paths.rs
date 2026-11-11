@@ -27,6 +27,20 @@ pub fn parts(path: &str) -> impl Iterator<Item = &str> {
     path.split(is_sep).filter(|s| !s.is_empty())
 }
 
+/// 시험용: Windows 모양으로 적은 경로를 이 OS의 모양으로 바꾼다.
+/// Windows는 그대로, 그 밖에서는 `C:\Docs\a` → `/C/Docs/a`, `\\nas\share` → `/nas/share`.
+#[cfg(test)]
+pub fn os_path(p: &str) -> String {
+    if cfg!(windows) {
+        return p.to_string();
+    }
+    let mut s = p.replace('\\', "/");
+    if s.as_bytes().get(1) == Some(&b':') {
+        s.remove(1);
+    }
+    format!("/{}", s.trim_start_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +57,17 @@ mod tests {
         assert!(!under(&base, &base));
         let rel = format!("{sep}sub{sep}{sep}a.txt");
         assert_eq!(parts(&rel).collect::<Vec<_>>(), vec!["sub", "a.txt"]);
+    }
+
+    #[test]
+    fn test_paths_follow_the_os() {
+        if cfg!(windows) {
+            assert_eq!(os_path(r"C:\Docs\a.txt"), r"C:\Docs\a.txt");
+        } else {
+            assert_eq!(os_path(r"C:\Docs\a.txt"), "/C/Docs/a.txt");
+            assert_eq!(os_path(r"\\nas\share\Photos\"), "/nas/share/Photos/");
+            assert_eq!(os_path(r"C:\Docs\~$report.docx"), "/C/Docs/~$report.docx");
+        }
     }
 
     #[cfg(windows)]

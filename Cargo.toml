@@ -44,6 +44,9 @@ ctrlc = { version = "3", features = ["termination"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Linux용 llama.cpp 묶음(.tar.gz) 풀기 (gemma-search download)
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

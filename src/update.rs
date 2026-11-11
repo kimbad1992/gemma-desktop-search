@@ -419,6 +419,11 @@ pub fn spawn_restart(background: bool) -> Result<(), String> {
 /// 창 없이 업데이트 (`gemma-search.exe --update`): 새 버전이 있으면 받아서 바꾼다.
 pub fn run_cli() -> i32 {
     println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
+    // 릴리스에는 Windows판(zip 안의 gemma-search.exe)만 있다. 다른 OS에서 받으면 실행 파일을 Windows판으로 바꿔 버린다.
+    if !cfg!(windows) {
+        eprintln!("자동 업데이트는 Windows판에만 있습니다. 새로 빌드한 실행 파일로 바꾼 뒤 서비스를 다시 띄우세요.");
+        return 1;
+    }
     let report = |s: Stage| match s {
         Stage::Checking => println!("새 버전 확인 중…"),
         Stage::Downloading { tag, done: 0, total } => {

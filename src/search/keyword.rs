@@ -443,7 +443,7 @@ mod tests {
         assert_eq!(pattern("grok", true), "\"grok\"*");
         assert!(may_widen("grok") && !may_widen("2047") && !may_widen("ab"));
         assert_eq!(
-            name_body(r"\\nas\share\사진\2023 제주도\여름\IMG_1234.jpg"),
+            name_body(&crate::paths::os_path(r"\\nas\share\사진\2023 제주도\여름\IMG_1234.jpg")),
             "IMG_1234.jpg 여름 2023 제주도 사진"
         );
         assert_eq!(

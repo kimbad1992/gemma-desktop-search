@@ -2,11 +2,13 @@
 
 # Gemma Search
 
-> Local multimodal semantic file search for Windows — Rust + egui GUI on top of Google's **EmbeddingGemma 2** running in **llama.cpp**. Search documents, code, PDFs, photos, video and audio by meaning, fully offline.
+> Local multimodal semantic file search for Windows — Rust + egui GUI on top of Google's **EmbeddingGemma 2** running in **llama.cpp**. Search documents, code, PDFs, photos, video and audio by meaning, fully offline. A headless service build runs on Linux servers.
 
 EmbeddingGemma 2와 llama.cpp로 만든 Windows용 **로컬 의미 검색기**(Rust, egui)입니다.
 문서·코드·PDF·DOCX·사진·영상·오디오를 하나의 768차원 공간에 임베딩해서, 자연어나 이미지로 검색합니다.
 모든 처리는 PC 안에서 이뤄지고, 외부로 전송되는 데이터는 없습니다.
+
+화면 없는 Linux 서버에서 도는 **서비스판**도 있습니다. 서버가 폴더를 감시하고 인덱싱하며, 검색은 명령줄이나 다른 PC의 브라우저로 합니다. [Linux 서버에서 쓰기](#linux-서버에서-쓰기-서비스판)를 보세요.
 
 | 검색 | 인덱싱 진행 상태 | 서버 관리·자가진단 |
 |---|---|---|
@@ -241,7 +243,7 @@ zip을 풀고 `gemma-search.exe`를 실행하면 **처음 설정 마법사**가 
 
 - **서버**
   - `llama-server --embeddings --pooling mean`을 콘솔 창 없이 직접 실행·중지합니다.
-  - 서버는 Windows Job Object에 묶여 있어서, 앱이 비정상 종료돼도 함께 종료됩니다.
+  - 서버는 Windows Job Object에 묶여 있어서, 앱이 비정상 종료돼도 함께 종료됩니다. Linux 서비스판에서는 서비스 프로세스가 끝나면 함께 끝나도록(`PR_SET_PDEATHSIG`) 띄웁니다.
 - **접두사**: 모델 카드에 정의된 접두사를 텍스트에만 붙입니다.
   - 질의: `task: search result | query: …`
   - 문서: `title: 파일명 | text: …`
@@ -291,7 +293,7 @@ gemma-search.exe --query "회의록 예산"     # 서버 준비(및 인덱싱 �
 gemma-search.exe --tab index|server|settings|search
 gemma-search.exe --headless-test <폴더> [질의...]   # GUI 없이 전체 흐름 점검 (개발용, 임시 DB 사용)
 gemma-search.exe --bench <텍스트파일>              # 실행 중인 서버의 임베딩 처리량 측정
-gemma-search.exe --index-once                      # 창 없이 변경분 인덱싱 한 번 (서버 시작·중지 포함)
+gemma-search.exe --index-once                      # 창 없이 변경분 인덱싱 한 번 (서버 시작·중지 포함, 앱이 같은 데이터 폴더로 떠 있으면 하지 않음)
 gemma-search.exe --compat <포트>                   # 인덱스 표본을 그 포트의 서버로 다시 임베딩해 벡터 비교
 gemma-search.exe --sysinfo                         # 사양 확인과 추천 설정 (마법사와 같은 내용)
 gemma-search.exe --check-update                    # 새 버전이 있는지 확인만
@@ -313,6 +315,147 @@ RTX 4090에서 측정한 처리량은 다음과 같고, 그중 가장 빨랐던 
 
 예: 로그인할 때 `--index`로 실행하면 인덱스를 늘 최신으로 유지할 수 있습니다.
 
+서비스판 명령(`download`, `serve`, `status`, `search`, `index`, `rescan`)은 [Linux 서버에서 쓰기](#linux-서버에서-쓰기-서비스판)에 있습니다. Windows에서도 같은 명령을 쓸 수 있지만, 창 있는 빌드는 콘솔이 없어 출력이 보이지 않습니다. 명령줄로 쓰려면 서비스판으로 빌드하세요([빌드](#빌드)).
+
+## Linux 서버에서 쓰기 (서비스판)
+
+화면 없는 Linux 서버나 NAS에서 폴더를 감시하고 인덱싱합니다. 검색은 명령줄이나 다른 PC의 브라우저로 합니다. 인덱스 형식과 검색 방식은 창 있는 앱과 같습니다.
+
+- Linux x64, glibc 2.34 이상(Ubuntu 22.04 이상 등)에서 돕니다.
+- 관리자 권한(sudo) 없이 한 계정 안에서 설치하고 돌립니다. 프로그램이 시스템 폴더·패키지·그룹을 건드리지 않습니다.
+- 릴리스에는 아직 Linux 실행 파일이 없습니다. [빌드](#빌드)를 보고 직접 빌드하세요.
+
+### 설치와 첫 실행
+
+실행 파일을 계정이 쓸 수 있는 폴더에 두고, 준비물을 받은 뒤 서비스를 띄웁니다.
+
+```bash
+mkdir -p ~/gemma-search && cp gemma-search ~/gemma-search/ && cd ~/gemma-search
+./gemma-search download
+./gemma-search serve --root ~/문서 --root /mnt/nas/사진
+```
+
+다른 터미널에서 상태를 보고 검색합니다.
+
+```bash
+./gemma-search status
+./gemma-search search 예산 회의록
+```
+
+- **`download`**: llama.cpp와 모델(865MB)을 실행 파일 옆(`llama.cpp/`, `models/`)으로 받습니다.
+  - 이 기기에 맞는 llama.cpp 판을 고릅니다. NVIDIA가 있으면 CUDA판, 그래픽을 Vulkan으로 쓸 수 있으면 Vulkan판, 아니면 CPU판입니다. 받을 것과 크기를 먼저 보여 주고 묻습니다.
+  - SHA-256을 확인하고, 끊기면 다시 실행해 이어서 받습니다.
+  - 판을 바꿀 때는 새 판을 옆 폴더에 다 푼 뒤 바꿔 넣으므로, 받다가 끊겨도 쓰던 llama.cpp는 그대로입니다. 이 명령으로 받지 않은 `llama.cpp/` 폴더는 지우지 않고 `llama.cpp.old-<시각>`으로 옮겨 둡니다.
+  - 받은 위치는 설정에 적어 두므로 `serve`가 바로 찾습니다.
+  - 옵션: `--list`(고를 수 있는 판과 이 기기의 추천), `--llama cpu|vulkan|cuda13|cuda12`(직접 고르기), `--only model|llama`, `--dir <폴더>`(받을 곳), `-y`(묻지 않기)
+- **`serve`**: 서비스를 띄웁니다.
+  - 옵션으로 준 값(`--root`, `--bind`, `--token`, `--llama`, `--model`, `--mmproj`)은 설정(`data/config.toml`)에 저장됩니다. 다음부터는 `./gemma-search serve`만 쓰면 됩니다.
+  - 인덱스가 비어 있으면 바로 처음 인덱싱을 시작합니다. 폴더 감시는 기본으로 켜져 있습니다(`--no-watch`로 끔).
+  - llama-server는 검색·인덱싱할 때 켜고, 10분 동안 쓰지 않으면 끕니다.
+  - Ctrl+C나 SIGTERM으로 끝내면 llama-server도 함께 끝납니다. 서비스가 비정상 종료돼도 llama-server는 남지 않습니다.
+  - 데이터 폴더는 실행 파일 옆의 `data/`이고, 환경 변수 `GEMMA_SEARCH_DATA`로 바꿀 수 있습니다.
+  - 한 데이터 폴더는 하나만 씁니다. 창 있는 앱, 서비스, `--index-once`는 같은 데이터 폴더로 함께 실행되지 않습니다.
+
+### 명령
+
+| 명령 | 하는 일 |
+|---|---|
+| `download` | llama.cpp와 모델 받기 (위 참고) |
+| `serve` | 서비스 띄우기 (위 참고) |
+| `status [--json]` | 검색 서버, 인덱스, 인덱싱 진행, 폴더 감시 상태, 빠진 준비물 |
+| `search <질의…>` | 검색. `--kinds docs,images`(종류), `--path <글자>`(경로에 든 글자, 여러 번 쓰면 모두), `--min <관련도>`, `--limit <개수>`(기본 20, 0이면 모두), `--json` |
+| `index [--rebuild] [--wait]` | 바뀐 파일을 지금 인덱싱. `--rebuild`는 전체 재구축, `--wait`는 끝날 때까지 진행을 보여 줌 |
+| `rescan` | 폴더를 지금 훑어 바뀐 파일을 찾음 (폴더 감시가 켜져 있을 때) |
+
+- 종류는 `docs`(문서 내용), `images`(이미지), `videos`(영상), `audio`(오디오), `names`(파일 이름)입니다. `--kinds 문서,사진`처럼 한글로도 됩니다.
+- 결과는 표준 출력, 진행과 오류는 표준 오류로 나옵니다. 종료 코드는 0 성공, 1 실패, 2 인자가 잘못됨입니다. `index --wait`는 인덱싱이 실패하거나 서버를 켜지 못하면 1로 끝나므로 스크립트에 쓸 수 있습니다.
+- `./gemma-search --help`로 전체 사용법을 봅니다.
+
+### 다른 기기에서 검색하기
+
+기본은 그 기기에서만 접속할 수 있습니다(`127.0.0.1:8787`).
+
+- **SSH 터널 (권장)**: 서버 포트를 열지 않고, 노트북 브라우저로 검색 페이지를 씁니다.
+  ```bash
+  ssh -L 8787:localhost:8787 <서버>
+  ```
+  노트북에서 http://localhost:8787 을 엽니다.
+- **네트워크에 열기**: `./gemma-search serve --bind 0.0.0.0:8787`
+  - 이때는 접속 토큰이 있어야 합니다. 검색 결과로 파일 내용까지 받을 수 있기 때문입니다. 토큰을 정하지 않았으면 새로 만들어 설정에 저장하고, 시작할 때 출력합니다(`--token`으로 직접 정할 수도 있습니다).
+  - 브라우저: 처음 열 때 토큰을 묻습니다. `http://<서버>:8787/?token=<토큰>`으로 열어도 됩니다(토큰은 기억하고 주소에서 지웁니다).
+  - 다른 기기의 명령줄: `GEMMA_SEARCH_URL=http://<서버>:8787 GEMMA_SEARCH_TOKEN=<토큰> ./gemma-search search 질의`. `--url`, `--token`으로 줘도 됩니다. 설정 파일에 있는 이 기기의 토큰은 다른 기기의 서비스로 보내지 않습니다.
+  - 통신을 암호화(HTTPS)하지 않습니다. 믿을 수 있는 내부망에서만 열고, 밖에서 쓰려면 SSH 터널이나 VPN을 쓰세요.
+- **검색 페이지**: 검색, 종류·경로 거르기, 최소 관련도, 미리보기(이미지·영상·소리·PDF·글), 상태를 볼 수 있습니다. 외부에서 받아 오는 것이 없어 인터넷 없이도 뜹니다.
+  - 브라우저가 재생하지 못하는 형식(mkv, avi, heic 등)은 미리보기 대신 썸네일과 내려받기 안내가 나옵니다.
+- **막는 것**: 다른 사이트의 페이지가 보내는 요청은 거절합니다. 토큰 없이 쓸 때는 주소(`Host`)가 이 기기를 가리키는 요청만 받으므로, 역방향 프록시처럼 다른 이름으로 접속하려면 토큰을 정하세요.
+
+### 계속 띄워 두기 (systemd 사용자 서비스)
+
+sudo 없이 자기 계정의 서비스로 등록합니다. 먼저 `serve`를 한 번 직접 실행해 옵션을 설정에 저장해 두면, 유닛에는 `serve`만 적으면 됩니다.
+
+`~/.config/systemd/user/gemma-search.service`:
+
+```ini
+[Unit]
+Description=Gemma Search
+
+[Service]
+ExecStart=%h/gemma-search/gemma-search serve
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now gemma-search
+systemctl --user status gemma-search
+journalctl --user -u gemma-search -f
+```
+
+- `systemctl --user stop gemma-search`은 SIGTERM을 보내므로 llama-server까지 정리됩니다.
+- 사용자 서비스는 그 계정이 로그인해 있는 동안만 돕니다. 로그아웃한 뒤에도 돌게 하려면 `loginctl enable-linger`를 한 번 실행합니다. SSH로 접속한 경우처럼 배포판 설정에 따라 관리자 인증을 물을 수 있습니다.
+
+### 그래픽 쓰기 (Vulkan, NVIDIA)
+
+`download`는 다음 기준으로 llama.cpp 판을 고릅니다.
+
+| 기기 | 판 |
+|---|---|
+| NVIDIA, 드라이버 580 이상 | CUDA 13 (614MB) |
+| NVIDIA, 드라이버 570~579 | CUDA 12 (783MB) |
+| NVIDIA, 드라이버가 그보다 오래됨 | Vulkan (36MB) |
+| Intel·AMD 그래픽, Vulkan을 쓸 수 있을 때 | Vulkan (36MB) |
+| 그래픽을 쓸 수 없을 때 | CPU (23MB) |
+
+- Vulkan판은 다음이 있어야 씁니다. 빠졌으면 `download`가 무엇이 필요한지 알려 주고 CPU판을 고릅니다. 프로그램이 직접 설치하거나 권한을 바꾸지는 않습니다.
+  - Vulkan 라이브러리와 그래픽 드라이버. Ubuntu에서는 관리자가 `sudo apt install libvulkan1 mesa-vulkan-drivers`로 설치합니다.
+  - 그래픽 장치(`/dev/dri/renderD*`) 접근 권한. 서비스를 돌리는 계정이 `render` 그룹에 있어야 합니다.
+- 갖춘 뒤 `./gemma-search download --llama vulkan`으로 바꿉니다. 서비스는 다시 띄워야 적용됩니다.
+- llama-server가 켜지자마자 끝나면 `status`와 `data/logs/llama-server.log`에 까닭이 나옵니다. 빠진 공유 라이브러리(`.so`)나, 메모리가 모자라 OS가 끝낸 경우(SIGKILL) 등을 알려 줍니다.
+
+### CPU로 돌릴 때의 속도
+
+CPU판 llama.cpp로 잰 값입니다(Core Ultra 9 275HX 24스레드, WSL).
+
+| 내용 | 시간 |
+|---|---|
+| 한글 2,000자 글 200개 (벡터 800개) | 343초 (초당 약 2.3벡터) |
+| 작은 그림 40장 (320×240) | 41초 (장당 약 1초) |
+| 검색 한 번 | 0.2~0.9초 (서버를 켠 뒤 첫 검색은 수 초) |
+
+- 처음 인덱싱이 가장 오래 걸리고, 그 뒤로는 바뀐 파일만 처리합니다. 문서 1만 개쯤이면 처음 인덱싱에 몇 시간이 걸리는 규모입니다.
+- 서버를 켤 때마다 자가진단에 CPU로 20초쯤 걸립니다.
+- 참고로 RTX 4090(CUDA)에서는 기본 설정으로 초당 약 91벡터를 처리했습니다([명령줄 옵션](#명령줄-옵션)의 표, 측정한 내용은 다름). 그래픽을 쓸 수 있으면 Vulkan판이나 CUDA판이 낫습니다.
+
+### Linux에서 아직 안 되는 것
+
+- 자동 업데이트(`--update`)는 Windows판에만 있습니다. 새로 빌드한 실행 파일로 바꾼 뒤 서비스를 다시 띄우세요.
+- 창 있는 앱은 Windows판만 있습니다.
+- 경로를 대소문자 구분 없이 비교합니다. 한 폴더에 이름이 대소문자만 다른 파일(`A.txt`, `a.txt`)이 함께 있으면 폴더 감시가 둘을 섞을 수 있습니다.
+- macOS용 llama.cpp 받기는 아직 없습니다.
+
 ## 지원 형식
 
 | 종류 | 확장자 | 처리 |
@@ -329,11 +472,15 @@ RTX 4090에서 측정한 처리량은 다음과 같고, 그중 가장 빨랐던 
 ## 빌드
 
 ```
-cargo build --release
-cargo test
+cargo build --release                          # 창 있는 앱 (Windows)
+cargo build --release --no-default-features    # 창 없는 서비스판 (Linux, Windows)
+cargo test --release
 ```
 
-- 필요한 것: Rust(stable, MSVC), Visual Studio C++ 빌드 도구
+- Windows: Rust(stable, MSVC), Visual Studio C++ 빌드 도구
+- Linux: Rust(stable)와 C 컴파일러(gcc). SQLite와 TLS 라이브러리 일부를 C로 컴파일하기 때문입니다.
+  - Rust는 [rustup](https://rustup.rs)이 홈 폴더에 설치하므로 sudo가 필요 없습니다. gcc는 Ubuntu라면 `build-essential` 패키지입니다.
+  - 실행 파일은 `target/release/gemma-search`입니다. 다른 기기로 옮겨 쓸 때는 그 기기의 glibc가 실행 파일이 요구하는 버전 이상이어야 합니다. Ubuntu 24.04에서 빌드한 것은 glibc 2.34 이상(Ubuntu 22.04 이상)을 요구합니다.
 - 테스트 샘플 만들기: `powershell -ExecutionPolicy Bypass -File testdata\make-testdata.ps1`
 
 ## 참고한 프로젝트
