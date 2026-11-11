@@ -120,7 +120,8 @@ pub struct OsInfo {
     /// 화면에 보여 줄 이름 ("Ubuntu 26.04 LTS (커널 6.8.0)")
     pub name: String,
     pub build: u32,
-    /// 그래픽카드: (이름, VRAM 바이트). 여기서는 찾지 않는다: NVIDIA는 nvidia-smi가 따로 찾는다.
+    /// 그래픽카드: (이름, VRAM 바이트). Vulkan으로 쓸 수 있는 것만 넣는다 (`vulkan_gpu`).
+    /// NVIDIA는 nvidia-smi가 따로 찾아 이름·VRAM·드라이버를 덮어쓴다.
     pub adapters: Vec<(String, u64)>,
 }
 
@@ -141,8 +142,76 @@ pub fn os_and_adapters() -> OsInfo {
     OsInfo {
         name,
         build: 0,
-        adapters: Vec::new(),
+        adapters: vulkan_gpu().ok().into_iter().collect(),
     }
+}
+
+/// Vulkan으로 쓸 수 있는 그래픽 장치. 아무것도 바꾸지 않고 보기만 한다.
+/// 그래픽 장치(/dev/dri/renderD*)에 이 계정이 접근할 수 있고, Vulkan 라이브러리와 드라이버(ICD)가 깔려 있어야 한다.
+/// 쓸 수 있으면 (이름, 쓸 수 있는 메모리 바이트), 아니면 쓸 수 없는 까닭들.
+/// 메모리: 전용 메모리를 알려 주는 카드(AMD)는 그 값, 내장 그래픽은 시스템 메모리를 나눠 쓰므로 설치된 메모리의 절반.
+pub fn vulkan_gpu() -> Result<(String, u64), Vec<String>> {
+    let nodes: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+        .map(|d| {
+            let mut v: Vec<PathBuf> = d
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("renderD")))
+                .collect();
+            v.sort();
+            v
+        })
+        .unwrap_or_default();
+    if nodes.is_empty() {
+        return Err(vec!["그래픽 장치(/dev/dri/renderD*)가 보이지 않습니다.".to_string()]);
+    }
+    let usable = nodes.iter().find(|n| std::fs::OpenOptions::new().read(true).write(true).open(n).is_ok());
+    let mut why = Vec::new();
+    if usable.is_none() {
+        let user = std::env::var("USER").unwrap_or_else(|_| "<계정>".into());
+        why.push(format!(
+            "이 계정이 그래픽 장치({})를 쓸 수 없습니다. 그래픽을 쓰려면 관리자가 이 계정을 render 그룹에 넣어야 합니다 \
+             (예: sudo usermod -aG render {user}, 그다음 다시 로그인).",
+            nodes[0].display()
+        ));
+    }
+    let lib = [
+        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/lib/x86_64-linux-gnu/libvulkan.so.1",
+        "/usr/lib64/libvulkan.so.1",
+        "/usr/lib/libvulkan.so.1",
+    ]
+    .iter()
+    .any(|p| Path::new(p).exists());
+    let icd = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d", "/usr/local/share/vulkan/icd.d"].iter().any(|d| {
+        std::fs::read_dir(d)
+            .map(|r| r.flatten().any(|e| e.path().extension().is_some_and(|x| x == "json")))
+            .unwrap_or(false)
+    });
+    if !lib || !icd {
+        why.push(
+            "Vulkan 라이브러리나 그래픽 드라이버가 없습니다. 그래픽을 쓰려면 관리자가 설치해야 합니다 \
+             (Ubuntu: sudo apt install libvulkan1 mesa-vulkan-drivers)."
+                .to_string(),
+        );
+    }
+    let Some(node) = usable.filter(|_| why.is_empty()) else {
+        return Err(why);
+    };
+    let dev = Path::new("/sys/class/drm").join(node.file_name().unwrap_or_default()).join("device");
+    let vendor = std::fs::read_to_string(dev.join("vendor")).unwrap_or_default();
+    let name = match vendor.trim() {
+        "0x8086" => "Intel 그래픽",
+        "0x1002" => "AMD 그래픽",
+        "0x10de" => "NVIDIA 그래픽",
+        _ => "그래픽",
+    };
+    let mem = std::fs::read_to_string(dev.join("mem_info_vram_total"))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|b| *b > 0)
+        .unwrap_or(total_memory_mb() / 2 * 1_048_576);
+    Ok((name.to_string(), mem))
 }
 
 // ── 경로 ──

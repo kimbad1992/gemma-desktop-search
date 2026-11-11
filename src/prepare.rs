@@ -298,86 +298,27 @@ fn auto_choice() -> Choice {
     other_gpu_choice(&plan)
 }
 
-#[cfg(target_os = "linux")]
-fn other_gpu_choice(_plan: &crate::sysinfo::Plan) -> Choice {
-    match linux_vulkan() {
-        Ok(dev) => Choice {
-            pack: Pack::LlamaVulkan,
-            why: format!("{dev}를 Vulkan으로 씁니다 (CPU판과 견주려면 --llama cpu)"),
-            notes: Vec::new(),
-        },
-        Err(notes) => Choice { pack: Pack::LlamaCpu, why: "그래픽을 쓸 수 없어 CPU로 돌립니다".to_string(), notes },
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
+/// NVIDIA가 아닐 때: `--sysinfo`(앱의 처음 설정)와 같은 추천을 따른다. Linux에서는 Vulkan으로 쓸 수 있는 그래픽만
+/// 그래픽카드 목록에 들어가므로(`platform::vulkan_gpu`), CPU판이 됐으면 그 까닭을 함께 알려 준다.
 fn other_gpu_choice(plan: &crate::sysinfo::Plan) -> Choice {
-    let why = match plan.llama {
-        Pack::LlamaCpu => "쓸 수 있는 그래픽카드가 없어 CPU로 돌립니다".to_string(),
-        _ => format!("{}를 Vulkan으로 씁니다", plan.device),
-    };
-    Choice { pack: plan.llama, why, notes: Vec::new() }
-}
-
-/// Linux에서 Vulkan으로 그래픽을 쓸 수 있는지: 그래픽 장치에 이 계정이 접근할 수 있고, Vulkan 라이브러리와
-/// 드라이버(ICD)가 깔려 있어야 한다. 아무것도 바꾸지 않고 보기만 한다. 쓸 수 있으면 장치 이름, 아니면 필요한 것.
-#[cfg(target_os = "linux")]
-fn linux_vulkan() -> Result<String, Vec<String>> {
-    let nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("renderD")))
-                .collect()
-        })
-        .unwrap_or_default();
-    if nodes.is_empty() {
-        return Err(vec!["그래픽 장치(/dev/dri/renderD*)가 보이지 않아 CPU로 돌립니다.".to_string()]);
+    if plan.llama != Pack::LlamaCpu {
+        return Choice {
+            pack: plan.llama,
+            why: format!("{}, Vulkan으로 씀 (CPU판과 견주려면 --llama cpu)", plan.device),
+            notes: Vec::new(),
+        };
     }
-    let usable = nodes.iter().find(|n| std::fs::OpenOptions::new().read(true).write(true).open(n).is_ok());
-    let mut notes = Vec::new();
-    if usable.is_none() {
-        let user = std::env::var("USER").unwrap_or_else(|_| "<계정>".into());
-        notes.push(format!(
-            "이 계정이 그래픽 장치({})를 쓸 수 없습니다. 그래픽을 쓰려면 관리자가 이 계정을 render 그룹에 넣어야 합니다 \
-             (예: sudo usermod -aG render {user}, 그다음 다시 로그인).",
-            nodes[0].display()
-        ));
+    #[allow(unused_mut)]
+    let mut notes: Vec<String> = Vec::new();
+    #[cfg(target_os = "linux")]
+    {
+        match crate::platform::vulkan_gpu() {
+            Err(why) => notes = why,
+            Ok((dev, _)) => notes.push(format!("{dev}: 쓸 수 있는 메모리가 2GB보다 적어 CPU판을 고릅니다.")),
+        }
+        notes.push(format!("그래픽을 쓰려면 `{} download --llama vulkan`으로 바꿀 수 있습니다.", me()));
     }
-    let lib = [
-        "/usr/lib/x86_64-linux-gnu/libvulkan.so.1",
-        "/lib/x86_64-linux-gnu/libvulkan.so.1",
-        "/usr/lib64/libvulkan.so.1",
-        "/usr/lib/libvulkan.so.1",
-    ]
-    .iter()
-    .any(|p| Path::new(p).exists());
-    let icd = ["/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d", "/usr/local/share/vulkan/icd.d"].iter().any(|d| {
-        std::fs::read_dir(d)
-            .map(|r| r.flatten().any(|e| e.path().extension().is_some_and(|x| x == "json")))
-            .unwrap_or(false)
-    });
-    if !lib || !icd {
-        notes.push(
-            "Vulkan 라이브러리나 그래픽 드라이버가 없습니다. 그래픽을 쓰려면 관리자가 설치해야 합니다 \
-             (Ubuntu: sudo apt install libvulkan1 mesa-vulkan-drivers)."
-                .to_string(),
-        );
-    }
-    if !notes.is_empty() {
-        notes.push(format!("준비가 되면 `{} download --llama vulkan`으로 바꿀 수 있습니다.", me()));
-        return Err(notes);
-    }
-    let node = usable.expect("위에서 확인함");
-    let name = node.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let vendor = std::fs::read_to_string(format!("/sys/class/drm/{name}/device/vendor")).unwrap_or_default();
-    Ok(match vendor.trim() {
-        "0x8086" => "Intel 그래픽",
-        "0x1002" => "AMD 그래픽",
-        "0x10de" => "NVIDIA 그래픽",
-        _ => "그래픽",
-    }
-    .to_string())
+    Choice { pack: Pack::LlamaCpu, why: "쓸 수 있는 그래픽이 없어 CPU로 돌립니다".to_string(), notes }
 }
 
 // ── 받는 동안 ──
