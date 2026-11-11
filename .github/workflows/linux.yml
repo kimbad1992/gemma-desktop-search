@@ -1,0 +1,80 @@
+# Linux판 빌드: 릴리스를 올리면(published) Linux x64 실행 파일을 빌드해 그 릴리스에 붙인다.
+# - Ubuntu 22.04에서 빌드하므로 glibc 2.35 이상(Ubuntu 22.04 이상)에서 돈다.
+# - 묶음: gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz (폴더 없이 gemma-search, LICENSE, README.md)와 .sha256.
+#   앱의 `gemma-search update`가 이 두 파일을 받아 해시를 대조한 뒤 실행 파일을 바꾼다.
+# - 수동 실행(Actions → Linux 빌드 → Run workflow)은 시험과 빌드만 하고 결과를 Artifacts로 남긴다.
+#   태그를 주면 그 릴리스에 붙인다 (이미 올린 릴리스에 다시 붙일 때).
+# - Windows판은 지금처럼 직접 빌드해 올린다.
+name: Linux 빌드
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "붙일 릴리스 태그 (예: v0.8.0). 비우면 빌드만 한다"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || github.ref }}
+
+      - name: 태그와 Cargo.toml 버전이 같은지
+        if: env.TAG != ''
+        run: |
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$ver" != "$TAG" ]; then
+            echo "태그 $TAG 와 Cargo.toml 버전 v$ver 이 다릅니다"
+            exit 1
+          fi
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          cargo --version
+
+      - name: 시험
+        run: cargo test --release --no-default-features --locked
+
+      - name: 빌드
+        run: cargo build --release --no-default-features --locked
+
+      - name: 묶기
+        run: |
+          name="gemma-desktop-search-${TAG:-dev-${GITHUB_SHA::7}}-linux-x64.tar.gz"
+          mkdir -p dist/pkg
+          cp target/release/gemma-search LICENSE README.md dist/pkg/
+          tar -czf "dist/$name" -C dist/pkg gemma-search LICENSE README.md
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          echo "NAME=$name" >> "$GITHUB_ENV"
+          echo "실행 파일이 꼭 필요로 하는 glibc:"
+          objdump -T target/release/gemma-search | awk '$2 != "w"' | grep -o 'GLIBC_[0-9.]*' | sort -V | uniq | tail -1
+          ./target/release/gemma-search --help | head -3
+          tar -tzvf "dist/$name"
+          cat "dist/$name.sha256"
+
+      - name: Artifacts에 남기기
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: |
+            dist/${{ env.NAME }}
+            dist/${{ env.NAME }}.sha256
+
+      - name: 릴리스에 붙이기
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "dist/$NAME" "dist/$NAME.sha256" --clobber --repo "$GITHUB_REPOSITORY"

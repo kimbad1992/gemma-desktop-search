@@ -465,6 +465,9 @@ fn status_text(base: &str, v: &Value) -> String {
         out.push('\n');
     };
     line(format!("Gemma Search v{} 서비스 · {base}", v["version"].as_str().unwrap_or("?")));
+    if let Some(tag) = v["update"]["tag"].as_str() {
+        line(format!("새 버전: {tag}이 나왔습니다. `gemma-search update`로 바꿉니다 (서비스가 돌고 있는 기기에서)"));
+    }
     let sv = &v["server"];
     line(format!(
         "검색 서버: {}",

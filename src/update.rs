@@ -2,10 +2,13 @@
 //!
 //! - 확인: 하루 한 번(설정에서 끌 수 있음) 또는 "업데이트"를 눌렀을 때 GitHub의 최신 릴리스를 본다.
 //!   파일 정보는 보내지 않는다.
-//! - 업데이트: 릴리스의 zip과 `.sha256`을 받아 해시를 대조하고, zip 안의 exe를 꺼내 지금 exe와 바꾼다.
-//!   실행 중인 exe는 덮어쓸 수 없지만 이름은 바꿀 수 있으므로, 지금 exe를 `gemma-search.old.exe`로 옮기고
-//!   새 exe를 그 자리에 둔다. 다시 시작하면 새 버전이 뜬다. `data\` 폴더는 건드리지 않는다.
-//! - 해시 확인은 받다가 깨진 파일을 걸러 준다. exe에 코드 서명이 없으므로, 사용자가 눌렀을 때만 바꾼다.
+//! - 업데이트: 릴리스에서 이 OS용 묶음과 `.sha256`을 받아 해시를 대조하고, 묶음 안의 실행 파일을 꺼내 지금 것과 바꾼다.
+//!   - Windows: `…-windows-x64.zip` 안의 `gemma-search.exe`
+//!   - Linux x64: `…-linux-x64.tar.gz` 안의 `gemma-search` (릴리스를 올리면 GitHub Actions가 빌드해 붙인다)
+//!   실행 중인 파일은 덮어쓸 수 없어도 이름은 바꿀 수 있으므로, 지금 것을 `.old`(Windows는 `.old.exe`)로 옮기고
+//!   새 것을 그 자리에 둔다. 다시 시작하면 새 버전이 뜬다. 데이터 폴더와 준비물은 건드리지 않는다.
+//!   모두 실행 파일이 있는 폴더 안의 일이라 관리자 권한이 필요 없다.
+//! - 해시 확인은 받다가 깨진 파일을 걸러 준다. 실행 파일에 코드 서명이 없으므로, 사용자가 시켰을 때만 바꾼다.
 
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -15,7 +18,15 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub const REPO: &str = "kimbad1992/gemma-desktop-search";
-const EXE_NAME: &str = "gemma-search.exe";
+const EXE_NAME: &str = if cfg!(windows) { "gemma-search.exe" } else { "gemma-search" };
+/// 이 OS용 릴리스 묶음 이름의 끝. 없으면 이 OS는 자동으로 바꾸지 않는다 (릴리스 페이지를 안내).
+const PACKAGE_SUFFIX: Option<&str> = if cfg!(windows) {
+    Some("-windows-x64.zip")
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("-linux-x64.tar.gz")
+} else {
+    None
+};
 /// 받는 동안 쓰는 임시 폴더 (프로그램 폴더 아래)
 const WORK_DIR: &str = "update-tmp";
 
@@ -34,9 +45,9 @@ pub fn is_newer(tag: &str) -> bool {
     }
 }
 
-/// 릴리스에 붙은 Windows용 zip과 그 체크섬 파일
+/// 릴리스에 붙은 이 OS용 묶음(zip, tar.gz)과 그 체크섬 파일
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZipAsset {
+pub struct Package {
     pub name: String,
     pub url: String,
     pub size: u64,
@@ -49,11 +60,16 @@ pub struct Release {
     pub tag: String,
     /// 릴리스 페이지 주소
     pub page: String,
-    /// 받아서 바꿀 수 있는 파일. zip이나 체크섬 파일이 없으면 None (그때는 페이지를 안내한다)
-    pub zip: Option<ZipAsset>,
+    /// 받아서 바꿀 수 있는 묶음. 이 OS용 묶음이나 체크섬 파일이 없으면 None (그때는 페이지를 안내한다)
+    pub package: Option<Package>,
 }
 
 fn release_from_json(v: &serde_json::Value) -> Release {
+    release_for(v, PACKAGE_SUFFIX)
+}
+
+/// `suffix`로 끝나는 묶음을 고른다 (시험에서 OS와 상관없이 부를 수 있게 나눠 둠)
+fn release_for(v: &serde_json::Value, suffix: Option<&str>) -> Release {
     let s = |x: &serde_json::Value| x.as_str().unwrap_or_default().to_string();
     let assets: Vec<(String, String, u64)> = v["assets"]
         .as_array()
@@ -65,23 +81,25 @@ fn release_from_json(v: &serde_json::Value) -> Release {
         .unwrap_or_default();
     // 우리 저장소의 릴리스 파일만 받는다
     let ours = |url: &str| url.starts_with(&format!("https://github.com/{REPO}/releases/download/"));
-    let zip = assets
-        .iter()
-        .find(|(n, _, _)| n.ends_with("-windows-x64.zip") && !n.contains(['/', '\\']))
-        .and_then(|(name, url, size)| {
-            let sha_name = format!("{name}.sha256");
-            let sha_url = assets.iter().find(|(n, _, _)| *n == sha_name)?.1.clone();
-            (ours(url) && ours(&sha_url)).then(|| ZipAsset {
-                name: name.clone(),
-                url: url.clone(),
-                size: *size,
-                sha_url,
+    let package = suffix.and_then(|suffix| {
+        assets
+            .iter()
+            .find(|(n, _, _)| n.ends_with(suffix) && !n.contains(['/', '\\']))
+            .and_then(|(name, url, size)| {
+                let sha_name = format!("{name}.sha256");
+                let sha_url = assets.iter().find(|(n, _, _)| *n == sha_name)?.1.clone();
+                (ours(url) && ours(&sha_url)).then(|| Package {
+                    name: name.clone(),
+                    url: url.clone(),
+                    size: *size,
+                    sha_url,
+                })
             })
-        });
+    });
     Release {
         tag: s(&v["tag_name"]),
         page: s(&v["html_url"]),
-        zip,
+        package,
     }
 }
 
@@ -195,11 +213,15 @@ pub fn run(report: &dyn Fn(Stage)) -> Result<Outcome, Failure> {
         message,
         page: page.clone(),
     };
-    let Some(zip) = rel.zip.clone() else {
-        return Err(fail(format!(
-            "{} 릴리스에 자동으로 받을 파일이 없습니다. 릴리스 페이지에서 받아 주세요.",
-            rel.tag
-        )));
+    let Some(pkg) = rel.package.clone() else {
+        return Err(fail(match PACKAGE_SUFFIX {
+            None => format!("이 OS용 자동 업데이트는 없습니다. {} 릴리스 페이지에서 받아 주세요.", rel.tag),
+            Some(_) if !cfg!(windows) => format!(
+                "{} 릴리스에 아직 이 OS용 파일이 없습니다. Linux판은 릴리스가 올라간 뒤 몇 분 안에 붙으니 잠시 뒤 다시 해 보세요.",
+                rel.tag
+            ),
+            Some(_) => format!("{} 릴리스에 자동으로 받을 파일이 없습니다. 릴리스 페이지에서 받아 주세요.", rel.tag),
+        }));
     };
     let exe = exe_path();
     let Some(dir) = exe.parent().map(Path::to_path_buf) else {
@@ -216,7 +238,7 @@ pub fn run(report: &dyn Fn(Stage)) -> Result<Outcome, Failure> {
             dir.display()
         )));
     }
-    let result = install(&rel.tag, &zip, &exe, &work, report);
+    let result = install(&rel.tag, &pkg, &exe, &work, report);
     // 임시 폴더는 우리가 만든 파일만 지운다 (install이 지움). 비었으면 폴더도 지운다.
     let _ = std::fs::remove_dir(&work);
     match result {
@@ -225,20 +247,27 @@ pub fn run(report: &dyn Fn(Stage)) -> Result<Outcome, Failure> {
     }
 }
 
-fn install(tag: &str, zip: &ZipAsset, exe: &Path, work: &Path, report: &dyn Fn(Stage)) -> Result<PathBuf, String> {
-    let zip_path = work.join(&zip.name);
-    let new_exe = work.join("gemma-search.new.exe");
+fn install(tag: &str, pkg: &Package, exe: &Path, work: &Path, report: &dyn Fn(Stage)) -> Result<PathBuf, String> {
+    let pkg_path = work.join(&pkg.name);
+    let new_exe = work.join(if cfg!(windows) { "gemma-search.new.exe" } else { "gemma-search.new" });
     let result = (|| {
-        let want = fetch_sha(&zip.sha_url)?;
-        download(tag, zip, &zip_path, &want, report)?;
+        let want = fetch_sha(&pkg.sha_url)?;
+        download(tag, pkg, &pkg_path, &want, report)?;
         report(Stage::Installing { tag: tag.to_string() });
-        extract_exe(&zip_path, &new_exe)?;
+        extract_exe(&pkg_path, &new_exe)?;
         swap_exe(exe, &new_exe)
     })();
-    let _ = std::fs::remove_file(&zip_path);
-    let _ = std::fs::remove_file(zip_path.with_extension("zip.part"));
+    let _ = std::fs::remove_file(&pkg_path);
+    let _ = std::fs::remove_file(part_path(&pkg_path));
     let _ = std::fs::remove_file(&new_exe);
     result
+}
+
+/// 받는 동안 쓰는 파일: 이름 뒤에 `.part`
+fn part_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_os_string();
+    s.push(".part");
+    PathBuf::from(s)
 }
 
 fn download_agent() -> ureq::Agent {
@@ -267,15 +296,15 @@ fn fetch_sha(url: &str) -> Result<String, String> {
     parse_sha(&text).ok_or_else(|| "체크섬 파일의 형식이 올바르지 않습니다.".to_string())
 }
 
-/// zip을 받아 해시와 크기를 대조한다. 맞지 않으면 받은 파일을 지우고 실패.
-fn download(tag: &str, zip: &ZipAsset, dest: &Path, want_sha: &str, report: &dyn Fn(Stage)) -> Result<(), String> {
-    let part = dest.with_extension("zip.part");
+/// 묶음을 받아 해시와 크기를 대조한다. 맞지 않으면 받은 파일을 지우고 실패.
+fn download(tag: &str, pkg: &Package, dest: &Path, want_sha: &str, report: &dyn Fn(Stage)) -> Result<(), String> {
+    let part = part_path(dest);
     let io = |e: std::io::Error| format!("받은 파일을 쓰지 못했습니다: {e}");
     let mut resp = download_agent()
-        .get(&zip.url)
+        .get(&pkg.url)
         .header("User-Agent", "gemma-desktop-search")
         .call()
-        .map_err(|e| format!("{}을 받지 못했습니다: {e}", zip.name))?;
+        .map_err(|e| format!("{}을 받지 못했습니다: {e}", pkg.name))?;
     let mut out = std::fs::File::create(&part).map_err(io)?;
     let mut hasher = Sha256::new();
     let mut done = 0u64;
@@ -283,7 +312,7 @@ fn download(tag: &str, zip: &ZipAsset, dest: &Path, want_sha: &str, report: &dyn
         report(Stage::Downloading {
             tag: tag.to_string(),
             done,
-            total: zip.size,
+            total: pkg.size,
         })
     };
     progress(0);
@@ -304,7 +333,7 @@ fn download(tag: &str, zip: &ZipAsset, dest: &Path, want_sha: &str, report: &dyn
     out.flush().map_err(io)?;
     drop(out);
     let got = format!("{:x}", hasher.finalize());
-    if got != want_sha || (zip.size > 0 && done != zip.size) {
+    if got != want_sha || (pkg.size > 0 && done != pkg.size) {
         let _ = std::fs::remove_file(&part);
         return Err("받은 파일의 체크섬이 맞지 않습니다. 받은 파일을 지웠습니다.".to_string());
     }
@@ -312,8 +341,59 @@ fn download(tag: &str, zip: &ZipAsset, dest: &Path, want_sha: &str, report: &dyn
     std::fs::rename(&part, dest).map_err(io)
 }
 
-/// zip에서 실행 파일만 꺼낸다 (README·라이선스는 두고)
-fn extract_exe(zip_path: &Path, dest: &Path) -> Result<(), String> {
+/// 묶음에서 실행 파일만 꺼낸다 (README·라이선스는 두고): Windows는 zip, Linux는 tar.gz
+fn extract_exe(pkg_path: &Path, dest: &Path) -> Result<(), String> {
+    if pkg_path.to_string_lossy().ends_with(".tar.gz") {
+        extract_from_tar_gz(pkg_path, dest)
+    } else {
+        extract_from_zip(pkg_path, dest)
+    }
+}
+
+/// tar.gz에서 `gemma-search`를 꺼낸다. Linux 실행 파일(ELF)인지 보고, 이 계정만 쓰고 모두 실행할 수 있는 권한(755)으로 둔다.
+#[cfg(unix)]
+fn extract_from_tar_gz(pkg_path: &Path, dest: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let bad = |e: String| format!("받은 tar.gz를 풀지 못했습니다: {e}");
+    let f = std::io::BufReader::new(std::fs::File::open(pkg_path).map_err(|e| bad(e.to_string()))?);
+    let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(f));
+    for entry in ar.entries().map_err(|e| bad(e.to_string()))? {
+        let mut entry = entry.map_err(|e| bad(e.to_string()))?;
+        let is_ours = entry.header().entry_type().is_file()
+            && entry
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n == EXE_NAME))
+                .unwrap_or(false);
+        if !is_ours {
+            continue;
+        }
+        let mut out = std::fs::File::create(dest).map_err(|e| bad(e.to_string()))?;
+        std::io::copy(&mut entry, &mut out).map_err(|e| bad(e.to_string()))?;
+        out.flush().map_err(|e| bad(e.to_string()))?;
+        drop(out);
+        let mut head = [0u8; 4];
+        let ok = std::fs::File::open(dest)
+            .and_then(|mut f| f.read_exact(&mut head))
+            .is_ok()
+            && &head == b"\x7fELF"
+            && std::fs::metadata(dest).map(|m| m.len() > 1 << 20).unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(dest);
+            return Err("묶음 안의 실행 파일이 올바르지 않습니다.".to_string());
+        }
+        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| bad(e.to_string()))?;
+        return Ok(());
+    }
+    Err(format!("묶음 안에 {EXE_NAME}가 없습니다."))
+}
+
+#[cfg(not(unix))]
+fn extract_from_tar_gz(_pkg_path: &Path, _dest: &Path) -> Result<(), String> {
+    Err("이 OS에서는 tar.gz 묶음을 풀지 않습니다.".to_string())
+}
+
+fn extract_from_zip(zip_path: &Path, dest: &Path) -> Result<(), String> {
     let bad = |e: String| format!("받은 zip을 풀지 못했습니다: {e}");
     let f = std::fs::File::open(zip_path).map_err(|e| bad(e.to_string()))?;
     let mut z = zip::ZipArchive::new(f).map_err(|e| bad(e.to_string()))?;
@@ -344,10 +424,16 @@ fn extract_exe(zip_path: &Path, dest: &Path) -> Result<(), String> {
     Err(format!("zip 안에 {EXE_NAME}가 없습니다."))
 }
 
-/// 지금 exe를 `….old.exe`로 옮기고 새 exe를 그 자리에 둔다. 이전 exe를 옮겨 둔 곳을 돌려준다.
-/// 새 exe를 놓지 못하면 이전 exe를 제자리로 되돌린다.
+/// 지금 실행 파일을 `….old.exe`(Linux는 `….old`)로 옮기고 새 것을 그 자리에 둔다. 이전 것을 옮겨 둔 곳을 돌려준다.
+/// 새 것을 놓지 못하면 이전 것을 제자리로 되돌린다.
 pub fn swap_exe(current: &Path, new: &Path) -> Result<PathBuf, String> {
-    let old = current.with_extension("old.exe");
+    let old = if cfg!(windows) {
+        current.with_extension("old.exe")
+    } else {
+        let mut s = current.as_os_str().to_os_string();
+        s.push(".old");
+        PathBuf::from(s)
+    };
     if old.exists() {
         std::fs::remove_file(&old).map_err(|e| format!("이전 백업({})을 지울 수 없습니다: {e}", old.display()))?;
     }
@@ -416,40 +502,122 @@ pub fn spawn_restart(background: bool) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// 창 없이 업데이트 (`gemma-search.exe --update`): 새 버전이 있으면 받아서 바꾼다.
-pub fn run_cli() -> i32 {
+/// 명령줄 업데이트: `gemma-search update [--check] [--restart] [--unit <이름>]`
+/// (예전 이름 `--update`, `--check-update`도 받는다)
+/// - 새 버전이 있으면 받아서 실행 파일을 바꾼다. 관리자 권한은 쓰지 않는다.
+/// - Linux에서 서비스가 떠 있으면 다시 띄우는 방법을 알려 준다. `--restart`면 systemd 사용자 서비스(`--unit`, 기본
+///   gemma-search)를 다시 띄운다.
+pub fn cli(args: &[String]) -> i32 {
+    if crate::cli::wants_help(args) {
+        println!("{}", crate::service::USAGE);
+        return 0;
+    }
+    let a = match crate::cli::parse_args(args, &["--unit"], &["--check", "--restart"], false) {
+        Ok(a) => a,
+        Err(e) => return crate::cli::usage_error(&e),
+    };
+    let unit = a.value("--unit").unwrap_or("gemma-search").trim().to_string();
     println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
-    // 릴리스에는 Windows판(zip 안의 gemma-search.exe)만 있다. 다른 OS에서 받으면 실행 파일을 Windows판으로 바꿔 버린다.
-    if !cfg!(windows) {
-        eprintln!("자동 업데이트는 Windows판에만 있습니다. 새로 빌드한 실행 파일로 바꾼 뒤 서비스를 다시 띄우세요.");
-        return 1;
+    if a.flag("--check") {
+        return match check() {
+            Ok(Some((tag, page))) => {
+                println!("새 버전 {tag}이 있습니다: {page}");
+                println!("바꾸려면: {} update", me());
+                0
+            }
+            Ok(None) => {
+                println!("최신 버전입니다.");
+                0
+            }
+            Err(e) => {
+                eprintln!("새 버전을 확인하지 못했습니다: {e}");
+                1
+            }
+        };
     }
     let report = |s: Stage| match s {
         Stage::Checking => println!("새 버전 확인 중…"),
         Stage::Downloading { tag, done: 0, total } => {
-            println!("{tag} 받는 중 ({:.1}MB)…", total as f64 / 1048576.0)
+            println!("{tag} 받는 중 ({:.1}MB)…", total as f64 / 1_000_000.0)
         }
         Stage::Installing { tag } => println!("체크섬 확인 완료. {tag} 버전으로 바꾸는 중…"),
         _ => {}
     };
     match run(&report) {
         Ok(Outcome::UpToDate) => {
-            println!("새 버전 없음");
+            println!("최신 버전입니다.");
             0
         }
         Ok(Outcome::Updated { tag, old }) => {
-            println!("{tag} 버전으로 바꿨습니다. 다음에 실행하면 새 버전이 뜹니다.");
-            println!("이전 실행 파일: {}", old.display());
-            0
+            println!("{tag} 버전으로 바꿨습니다. 이전 실행 파일: {}", old.display());
+            if cfg!(windows) {
+                println!("다음에 실행하면 새 버전이 뜹니다.");
+                0
+            } else {
+                after_update(&tag, a.flag("--restart"), &unit)
+            }
         }
         Err(f) => {
-            println!("실패: {}", f.message);
+            eprintln!("실패: {}", f.message);
             if let Some(p) = f.page {
-                println!("직접 받기: {p}");
+                eprintln!("직접 받기: {p}");
             }
             1
         }
     }
+}
+
+/// 안내에 쓸 이 프로그램의 이름: 경로로 실행했으면 그 경로, 아니면 gemma-search
+fn me() -> String {
+    std::env::args()
+        .next()
+        .filter(|a| a.contains('/') || a.contains('\\'))
+        .unwrap_or_else(|| "gemma-search".to_string())
+}
+
+/// systemd 사용자 서비스가 떠 있는지 (`systemctl --user is-active`)
+fn user_unit_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Linux: 바꾼 뒤 서비스가 새 버전으로 돌게 한다 (`restart`면 systemd 사용자 서비스를 다시 띄우고, 아니면 방법을 알려 준다)
+fn after_update(tag: &str, restart: bool, unit: &str) -> i32 {
+    let unit_active = user_unit_active(unit);
+    let data = crate::config::data_dir();
+    let locked = data.is_dir()
+        && crate::config::instance_lock(&data).is_err_and(|e| e.starts_with(crate::config::LOCK_BUSY));
+    if !unit_active && !locked {
+        println!("떠 있는 서비스가 없습니다. 다음에 serve를 띄우면 {tag} 버전이 돕니다.");
+        return 0;
+    }
+    if restart {
+        if !unit_active {
+            eprintln!(
+                "systemd 사용자 서비스 {unit}이(가) 떠 있지 않아 다시 띄우지 못했습니다. 떠 있는 serve를 끄고 다시 실행하세요."
+            );
+            return 1;
+        }
+        let ok = std::process::Command::new("systemctl")
+            .args(["--user", "restart", unit])
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            println!("서비스 {unit}을(를) 다시 띄웠습니다. 이제 {tag} 버전이 돕니다.");
+            return 0;
+        }
+        eprintln!("서비스 {unit}을(를) 다시 띄우지 못했습니다. `systemctl --user status {unit}`으로 확인하세요.");
+        return 1;
+    }
+    println!("서비스가 아직 예전 버전으로 돌고 있습니다. 다시 띄워야 {tag} 버전이 돕니다:");
+    if unit_active {
+        println!("  systemctl --user restart {unit}     (또는 {} update --restart)", me());
+    } else {
+        println!("  떠 있는 serve를 끄고(Ctrl+C) 다시 실행하세요.");
+    }
+    0
 }
 
 #[cfg(test)]
@@ -468,35 +636,50 @@ mod tests {
         assert!(!is_newer("latest"));
     }
 
+    const WIN: Option<&str> = Some("-windows-x64.zip");
+    const LINUX: Option<&str> = Some("-linux-x64.tar.gz");
+
     #[test]
-    fn picks_zip_and_checksum_from_release() {
+    fn picks_this_os_package_and_checksum_from_release() {
         let base = format!("https://github.com/{REPO}/releases/download/v9.9.9");
+        let asset = |name: &str, size: u64| {
+            serde_json::json!({ "name": name, "size": size, "browser_download_url": format!("{base}/{name}") })
+        };
         let v = serde_json::json!({
             "tag_name": "v9.9.9",
             "html_url": format!("https://github.com/{REPO}/releases/tag/v9.9.9"),
             "assets": [
-                { "name": "gemma-desktop-search-v9.9.9-windows-x64.zip.sha256", "size": 110,
-                  "browser_download_url": format!("{base}/gemma-desktop-search-v9.9.9-windows-x64.zip.sha256") },
-                { "name": "gemma-desktop-search-v9.9.9-windows-x64.zip", "size": 14103601,
-                  "browser_download_url": format!("{base}/gemma-desktop-search-v9.9.9-windows-x64.zip") },
+                asset("gemma-desktop-search-v9.9.9-windows-x64.zip.sha256", 110),
+                asset("gemma-desktop-search-v9.9.9-windows-x64.zip", 14103601),
+                asset("gemma-desktop-search-v9.9.9-linux-x64.tar.gz", 6200000),
+                asset("gemma-desktop-search-v9.9.9-linux-x64.tar.gz.sha256", 112),
             ],
         });
-        let r = release_from_json(&v);
+        let r = release_for(&v, WIN);
         assert_eq!(r.tag, "v9.9.9");
-        let zip = r.zip.expect("zip");
+        let zip = r.package.expect("zip");
         assert_eq!(zip.name, "gemma-desktop-search-v9.9.9-windows-x64.zip");
         assert_eq!(zip.size, 14103601);
         assert!(zip.url.ends_with("x64.zip"));
         assert!(zip.sha_url.ends_with("x64.zip.sha256"));
+        let tgz = release_for(&v, LINUX).package.expect("tar.gz");
+        assert_eq!(tgz.name, "gemma-desktop-search-v9.9.9-linux-x64.tar.gz");
+        assert!(tgz.sha_url.ends_with("linux-x64.tar.gz.sha256"));
+        // 이 OS용 묶음이 정해져 있지 않으면 받지 않는다
+        assert_eq!(release_for(&v, None).package, None);
 
         // 체크섬 파일이 없거나, 다른 곳을 가리키는 주소면 자동으로 받지 않는다
         let mut no_sha = v.clone();
         no_sha["assets"].as_array_mut().unwrap().remove(0);
-        assert_eq!(release_from_json(&no_sha).zip, None);
+        assert_eq!(release_for(&no_sha, WIN).package, None);
         let mut elsewhere = v.clone();
-        elsewhere["assets"][1]["browser_download_url"] = "https://example.com/x-windows-x64.zip".into();
-        assert_eq!(release_from_json(&elsewhere).zip, None);
-        assert_eq!(release_from_json(&serde_json::json!({ "tag_name": "v1.0.0" })).zip, None);
+        elsewhere["assets"][2]["browser_download_url"] = "https://example.com/x-linux-x64.tar.gz".into();
+        assert_eq!(release_for(&elsewhere, LINUX).package, None);
+        assert_eq!(release_for(&serde_json::json!({ "tag_name": "v1.0.0" }), WIN).package, None);
+        // Linux 묶음만 있는 릴리스(Actions가 아직 안 붙였거나 반대)
+        let mut only_win = v.clone();
+        only_win["assets"].as_array_mut().unwrap().truncate(2);
+        assert_eq!(release_for(&only_win, LINUX).package, None);
     }
 
     #[test]
@@ -513,15 +696,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gemma-swap-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let current = dir.join("gemma-search.exe");
-        let new = dir.join("gemma-search.new.exe");
+        let current = dir.join(EXE_NAME);
+        let new = dir.join("gemma-search.new");
+        let backup = dir.join(if cfg!(windows) { "gemma-search.old.exe" } else { "gemma-search.old" });
         std::fs::write(&current, b"old version").unwrap();
         std::fs::write(&new, b"new version").unwrap();
         // 예전 백업이 남아 있어도 된다
-        std::fs::write(dir.join("gemma-search.old.exe"), b"older").unwrap();
+        std::fs::write(&backup, b"older").unwrap();
 
         let old = swap_exe(&current, &new).unwrap();
-        assert_eq!(old, dir.join("gemma-search.old.exe"));
+        assert_eq!(old, backup);
         assert_eq!(std::fs::read(&current).unwrap(), b"new version");
         assert_eq!(std::fs::read(&old).unwrap(), b"old version");
         assert!(!new.exists());
@@ -529,6 +713,67 @@ mod tests {
         // 새 파일이 없으면 실패하고, 지금 exe는 제자리에 그대로 있다
         assert!(swap_exe(&current, &dir.join("missing.exe")).is_err());
         assert_eq!(std::fs::read(&current).unwrap(), b"new version");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 로컬 HTTP 서버로 Linux 묶음을 내주고 실제로 받아서 바꿔 본다 (받기 → 체크섬 → 풀기 → 바꾸기)
+    #[cfg(unix)]
+    #[test]
+    fn installs_linux_package_end_to_end() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("gemma-update-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        // 가짜 새 실행 파일 (ELF 머리 + 2MB)
+        let mut elf = b"\x7fELF".to_vec();
+        elf.resize(2 << 20, 7);
+        let tgz = {
+            let mut b = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+            for (name, data) in [("README.md", &b"readme"[..]), ("gemma-search", &elf[..])] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(data.len() as u64);
+                h.set_mode(0o4755);
+                b.append_data(&mut h, name, data).unwrap();
+            }
+            b.into_inner().unwrap().finish().unwrap()
+        };
+        let sha = format!("{:x}", Sha256::digest(&tgz));
+        // 요청 n개에 답하는 서버
+        let serve = |files: Vec<(&'static str, Vec<u8>)>, n: usize| {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let port = server.server_addr().to_ip().unwrap().port();
+            std::thread::spawn(move || {
+                for _ in 0..n {
+                    let Ok(req) = server.recv() else { return };
+                    let body = files.iter().find(|(p, _)| *p == req.url()).map(|(_, b)| b.clone()).unwrap_or_default();
+                    let _ = req.respond(tiny_http::Response::from_data(body));
+                }
+            });
+            port
+        };
+        let pkg = |port: u16, size: u64| Package {
+            name: "gemma-desktop-search-v9.9.9-linux-x64.tar.gz".into(),
+            url: format!("http://127.0.0.1:{port}/p.tar.gz"),
+            size,
+            sha_url: format!("http://127.0.0.1:{port}/p.tar.gz.sha256"),
+        };
+        let current = dir.join("gemma-search");
+        std::fs::write(&current, b"old version").unwrap();
+
+        // 체크섬이 맞지 않으면 바꾸지 않는다
+        let port = serve(vec![("/p.tar.gz.sha256", format!("{}  x\n", "0".repeat(64)).into_bytes()), ("/p.tar.gz", tgz.clone())], 2);
+        assert!(install("v9.9.9", &pkg(port, tgz.len() as u64), &current, &dir.join("work"), &|_| {}).is_err());
+        assert_eq!(std::fs::read(&current).unwrap(), b"old version");
+
+        // 맞으면 바꾸고, 이전 것은 .old로 남긴다. 권한은 755 (setuid 등은 버린다)
+        let port = serve(vec![("/p.tar.gz.sha256", format!("{sha}  x\n").into_bytes()), ("/p.tar.gz", tgz.clone())], 2);
+        let old = install("v9.9.9", &pkg(port, tgz.len() as u64), &current, &dir.join("work"), &|_| {}).unwrap();
+        assert_eq!(old, dir.join("gemma-search.old"));
+        assert_eq!(std::fs::read(&current).unwrap(), elf);
+        assert_eq!(std::fs::read(&old).unwrap(), b"old version");
+        assert_eq!(std::fs::metadata(&current).unwrap().permissions().mode() & 0o7777, 0o755);
+        // 임시 파일은 남지 않는다
+        assert_eq!(std::fs::read_dir(dir.join("work")).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

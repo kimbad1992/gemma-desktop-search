@@ -85,7 +85,14 @@ pub const USAGE: &str = "\
   네 명령 모두:
       --url <http://주소:포트>    다른 기기의 서비스에 묻는다 (환경 변수 GEMMA_SEARCH_URL)
       --token <토큰>              접속 토큰 (환경 변수 GEMMA_SEARCH_TOKEN). 주소를 주지 않았거나
-                                  이 기기의 주소면 설정 파일의 토큰을 쓴다";
+                                  이 기기의 주소면 설정 파일의 토큰을 쓴다
+
+업데이트:
+  gemma-search update             새 버전이 있으면 받아서 실행 파일을 바꾼다 (관리자 권한 필요 없음)
+      --check                     확인만 한다
+      --restart                   바꾼 뒤 systemd 사용자 서비스를 다시 띄운다
+      --unit <이름>               다시 띄울 서비스 이름 (기본 gemma-search)
+  서비스는 하루 한 번 새 버전을 확인해 status와 로그에 알려 준다 (설정의 check_updates로 끈다)";
 /// 글 파일을 브라우저로 보낼 때의 최대 크기
 const MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -112,6 +119,8 @@ struct Engine {
     index_runs: AtomicU64,
     /// 요청받은 인덱싱을 시작하지 못한 까닭 (다음 요청이 시작되면 지운다)
     index_error: Mutex<Option<String>>,
+    /// 새 버전: (태그, 릴리스 페이지). 하루 한 번 확인한다 (설정의 check_updates).
+    update_available: Mutex<Option<(String, String)>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -253,6 +262,7 @@ pub fn serve(args: &[String]) -> i32 {
         index_request: Mutex::new(None),
         index_runs: AtomicU64::new(0),
         index_error: Mutex::new(None),
+        update_available: Mutex::new(None),
         stop: stop.clone(),
         cfg,
     });
@@ -294,11 +304,43 @@ pub fn serve(args: &[String]) -> i32 {
         println!("인덱스가 비어 있어 처음 인덱싱을 시작합니다");
         *engine.index_request.lock() = Some(false);
     }
+    if engine.cfg.check_updates {
+        println!("새 버전 확인: 하루 한 번 (알려만 줍니다. 끄려면 설정의 check_updates = false)");
+        spawn_update_check(engine.clone());
+    }
     println!("끝내려면 Ctrl+C");
 
     main_loop(&engine, indexer);
     log("끝냅니다");
     0
+}
+
+/// 새 버전 확인: 켠 지 1분 뒤에 한 번, 그 뒤 하루마다. 알려만 주고 바꾸지는 않는다 (`gemma-search update`가 바꾼다).
+fn spawn_update_check(e: Arc<Engine>) {
+    let _ = std::thread::Builder::new().name("update-check".into()).spawn(move || {
+        let mut wait = Duration::from_secs(60);
+        loop {
+            let t0 = Instant::now();
+            while t0.elapsed() < wait {
+                if e.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            match crate::update::check() {
+                Ok(Some((tag, page))) => {
+                    let mut g = e.update_available.lock();
+                    if g.as_ref().map(|(t, _)| t) != Some(&tag) {
+                        log(format!("새 버전 {tag}이 나왔습니다. `gemma-search update`로 바꿀 수 있습니다 ({page})"));
+                    }
+                    *g = Some((tag, page));
+                }
+                Ok(None) => *e.update_available.lock() = None,
+                Err(err) => log(format!("새 버전을 확인하지 못했습니다 (하루 뒤 다시): {err}")),
+            }
+            wait = Duration::from_secs(24 * 3600);
+        }
+    });
 }
 
 /// 시작할 때 알려 줄 빠진 준비물
@@ -772,6 +814,8 @@ fn status(e: &Engine) -> Value {
     };
     json!({
         "version": env!("CARGO_PKG_VERSION"),
+        // 하루 한 번 확인한 새 버전 (없거나 확인을 껐으면 null)
+        "update": e.update_available.lock().as_ref().map(|(tag, page)| json!({ "tag": tag, "page": page })),
         "problems": problems(&e.cfg),
         "server": {
             "key": match &state {

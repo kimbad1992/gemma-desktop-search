@@ -323,17 +323,19 @@ RTX 4090에서 측정한 처리량은 다음과 같고, 그중 가장 빨랐던 
 
 - Linux x64, glibc 2.34 이상(Ubuntu 22.04 이상 등)에서 돕니다.
 - 관리자 권한(sudo) 없이 한 계정 안에서 설치하고 돌립니다. 프로그램이 시스템 폴더·패키지·그룹을 건드리지 않습니다.
-- 릴리스에는 아직 Linux 실행 파일이 없습니다. [빌드](#빌드)를 보고 직접 빌드하세요.
+- 릴리스를 올리면 GitHub Actions가 Linux판을 빌드해 `gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz`(와 `.sha256`)로 함께 붙입니다. Linux판이 붙지 않은 예전 릴리스는 [빌드](#빌드)를 보고 직접 빌드하세요.
 
 ### 설치와 첫 실행
 
-실행 파일을 계정이 쓸 수 있는 폴더에 두고, 준비물을 받은 뒤 서비스를 띄웁니다.
+[Releases](https://github.com/kimbad1992/gemma-desktop-search/releases)에서 `…-linux-x64.tar.gz`를 받아 계정이 쓸 수 있는 폴더에 풀고, 준비물을 받은 뒤 서비스를 띄웁니다.
 
 ```bash
-mkdir -p ~/gemma-search && cp gemma-search ~/gemma-search/ && cd ~/gemma-search
+mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz -C ~/gemma-search && cd ~/gemma-search
 ./gemma-search download
 ./gemma-search serve --root ~/문서 --root /mnt/nas/사진
 ```
+
+직접 빌드했다면 `target/release/gemma-search`를 `~/gemma-search`에 복사하면 됩니다.
 
 다른 터미널에서 상태를 보고 검색합니다.
 
@@ -366,6 +368,7 @@ mkdir -p ~/gemma-search && cp gemma-search ~/gemma-search/ && cd ~/gemma-search
 | `search <질의…>` | 검색. `--kinds docs,images`(종류), `--path <글자>`(경로에 든 글자, 여러 번 쓰면 모두), `--min <관련도>`, `--limit <개수>`(기본 20, 0이면 모두), `--json` |
 | `index [--rebuild] [--wait]` | 바뀐 파일을 지금 인덱싱. `--rebuild`는 전체 재구축, `--wait`는 끝날 때까지 진행을 보여 줌 |
 | `rescan` | 폴더를 지금 훑어 바뀐 파일을 찾음 (폴더 감시가 켜져 있을 때) |
+| `update [--check] [--restart]` | 새 버전으로 바꾸기 (아래 [업데이트](#업데이트) 참고) |
 
 - 종류는 `docs`(문서 내용), `images`(이미지), `videos`(영상), `audio`(오디오), `names`(파일 이름)입니다. `--kinds 문서,사진`처럼 한글로도 됩니다.
 - 결과는 표준 출력, 진행과 오류는 표준 오류로 나옵니다. 종료 코드는 0 성공, 1 실패, 2 인자가 잘못됨입니다. `index --wait`는 인덱싱이 실패하거나 서버를 켜지 못하면 1로 끝나므로 스크립트에 쓸 수 있습니다.
@@ -417,6 +420,53 @@ journalctl --user -u gemma-search -f
 - `systemctl --user stop gemma-search`은 SIGTERM을 보내므로 llama-server까지 정리됩니다.
 - 사용자 서비스는 그 계정이 로그인해 있는 동안만 돕니다. 로그아웃한 뒤에도 돌게 하려면 `loginctl enable-linger`를 한 번 실행합니다. SSH로 접속한 경우처럼 배포판 설정에 따라 관리자 인증을 물을 수 있습니다.
 
+### 업데이트
+
+```bash
+./gemma-search update --check      # 새 버전이 있는지만
+./gemma-search update              # 받아서 실행 파일을 바꾼다
+./gemma-search update --restart    # 바꾼 뒤 systemd 사용자 서비스(gemma-search)까지 다시 띄운다
+```
+
+- 릴리스의 Linux 묶음과 `.sha256`을 받아 해시를 대조한 뒤 실행 파일만 바꿉니다. 이전 것은 `gemma-search.old`로 남으니, 문제가 생기면 되돌리면 됩니다.
+- 실행 파일이 있는 폴더 안의 일이라 관리자 권한이 필요 없습니다. llama.cpp, 모델, 데이터 폴더는 건드리지 않습니다.
+- 서비스가 떠 있으면 다시 띄워야 새 버전이 돕니다. `--restart`를 주거나 `systemctl --user restart gemma-search`를 실행하세요. 다른 이름으로 등록했다면 `--unit <이름>`을 줍니다.
+- 서비스는 하루 한 번 새 버전을 확인해 `status`와 로그에 알려 줍니다. 알려만 주고 바꾸지는 않습니다. GitHub의 최신 릴리스 정보만 묻고, 파일 정보는 보내지 않습니다. 끄려면 `data/config.toml`에 `check_updates = false`를 적습니다.
+- 릴리스가 올라가고 Linux판이 붙기까지 몇 분 걸립니다. 그 사이에 `update`를 하면 "아직 이 OS용 파일이 없습니다"라고 하고 아무것도 바꾸지 않습니다.
+
+저절로 바꾸고 싶으면 systemd 타이머를 둡니다(예: 매주). sudo 없이 자기 계정에 등록합니다.
+
+`~/.config/systemd/user/gemma-search-update.service`:
+
+```ini
+[Unit]
+Description=Gemma Search 업데이트
+
+[Service]
+Type=oneshot
+ExecStart=%h/gemma-search/gemma-search update --restart
+```
+
+`~/.config/systemd/user/gemma-search-update.timer`:
+
+```ini
+[Unit]
+Description=Gemma Search 업데이트 (매주)
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now gemma-search-update.timer
+systemctl --user list-timers gemma-search-update.timer
+```
+
 ### 그래픽 쓰기 (Vulkan, NVIDIA)
 
 `download`는 다음 기준으로 llama.cpp 판을 고릅니다.
@@ -455,7 +505,6 @@ journalctl --user -u gemma-search -f
 
 ### Linux에서 아직 안 되는 것
 
-- 자동 업데이트(`--update`)는 Windows판에만 있습니다. 새로 빌드한 실행 파일로 바꾼 뒤 서비스를 다시 띄우세요.
 - 창 있는 앱은 Windows판만 있습니다.
 - 경로를 대소문자 구분 없이 비교합니다. 한 폴더에 이름이 대소문자만 다른 파일(`A.txt`, `a.txt`)이 함께 있으면 폴더 감시가 둘을 섞을 수 있습니다.
 - macOS용 llama.cpp 받기는 아직 없습니다.
@@ -485,6 +534,10 @@ cargo test --release
 - Linux: Rust(stable)와 C 컴파일러(gcc). SQLite와 TLS 라이브러리 일부를 C로 컴파일하기 때문입니다.
   - Rust는 [rustup](https://rustup.rs)이 홈 폴더에 설치하므로 sudo가 필요 없습니다. gcc는 Ubuntu라면 `build-essential` 패키지입니다.
   - 실행 파일은 `target/release/gemma-search`입니다. 다른 기기로 옮겨 쓸 때는 그 기기의 glibc가 실행 파일이 요구하는 버전 이상이어야 합니다. Ubuntu 24.04에서 빌드한 것은 glibc 2.34 이상(Ubuntu 22.04 이상)을 요구합니다.
+- 릴리스의 Linux판은 GitHub Actions([`.github/workflows/linux.yml`](.github/workflows/linux.yml))가 만듭니다.
+  - 릴리스를 올리면 Ubuntu 22.04에서 시험하고 빌드해, tar.gz와 `.sha256`을 그 릴리스에 붙입니다. 태그와 `Cargo.toml`의 버전이 다르면 멈춥니다.
+  - Actions 화면에서 직접 실행하면 빌드만 하고 결과를 Artifacts로 남깁니다. 태그를 주면 그 릴리스에 붙입니다.
+  - Windows판은 직접 빌드해 올립니다.
 - 테스트 샘플 만들기: `powershell -ExecutionPolicy Bypass -File testdata\make-testdata.ps1`
 
 ## 참고한 프로젝트

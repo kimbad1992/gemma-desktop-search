@@ -76,16 +76,9 @@ fn command(args: &[String]) -> Option<i32> {
             println!("\n{USAGE}");
             0
         }
-        "--update" => update::run_cli(),
-        "--check-update" => {
-            println!("지금 버전 v{}", env!("CARGO_PKG_VERSION"));
-            match update::check() {
-                Ok(Some((tag, url))) => println!("새 버전 {tag}: {url}"),
-                Ok(None) => println!("새 버전 없음"),
-                Err(e) => println!("확인 실패: {e}"),
-            }
-            0
-        }
+        // 업데이트 (update.rs). 예전 이름 --update, --check-update도 받는다
+        "update" | "--update" => update::cli(rest),
+        "--check-update" => update::cli(&["--check".to_string()]),
         "--sysinfo" => headless::sysinfo(),
         "--index-once" => headless::index_once(),
         "--query-once" => headless::query_once(rest),
@@ -105,8 +98,7 @@ const USAGE: &str = "\
 그 밖의 명령:
   gemma-search --sysinfo          사양 확인과 추천 설정
   gemma-search --index-once       바뀐 파일을 한 번 인덱싱하고 끝낸다
-                                  (서비스가 떠 있을 때는 `gemma-search index`)
-  gemma-search --check-update     새 버전 확인";
+                                  (서비스가 떠 있을 때는 `gemma-search index`)";
 
 /// 창이 있는 앱
 #[cfg(feature = "gui")]
