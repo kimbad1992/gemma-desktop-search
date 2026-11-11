@@ -6,6 +6,7 @@
 use super::compat;
 use super::db::{self, ChunkRecord, Db, FileRecord, FileRow};
 use super::progress::{Progress, RunState};
+use super::queue::{LocalProvider, WorkQueue};
 use crate::config::Config;
 use crate::embed::client::{EmbedClient, EmbedError, EmbedInput, EmbedTarget};
 use crate::embed::prompt;
@@ -221,7 +222,10 @@ enum Done {
 struct WorkerCtx {
     cfg: Config,
     caps: Capabilities,
+    /// 토큰 세기 등 임베딩 말고 서버에 묻는 일에 쓴다. 임베딩은 `queue`로 한다.
     client: EmbedClient,
+    /// 일감 대기열: 임베딩할 입력 묶음을 넣으면 계산 제공자가 처리해 돌려준다
+    queue: Arc<WorkQueue>,
     file_map: Arc<HashMap<String, FileRow>>,
     enabled: [bool; 6],
     full_rebuild: bool,
@@ -335,10 +339,12 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     let was_empty = db.chunk_count()? == 0;
     let reindex_text = db.meta_get("text_index_version").as_deref() != Some(TEXT_INDEX_VERSION) && !was_empty;
 
+    let (queue, work_rx) = WorkQueue::new();
     let ctx = Arc::new(WorkerCtx {
         cfg: p.cfg.clone(),
         caps: p.caps.clone(),
         client,
+        queue: queue.clone(),
         file_map: file_map.clone(),
         enabled,
         full_rebuild: p.full_rebuild,
@@ -376,6 +382,13 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     };
 
     let n_workers = p.cfg.workers.clamp(1, 16);
+    // 계산 제공자: 지금은 설정의 임베딩 대상 하나 (이 기기의 서버 또는 외부 서버).
+    // 일꾼은 결과가 올 때까지 기다리므로, 서버에 동시에 가는 요청은 예전처럼 많아야 일꾼 수다.
+    let provider = {
+        let ctl = ctl.clone();
+        let client = Arc::new(EmbedClient::new(&p.target));
+        LocalProvider::start(queue, work_rx, client, n_workers, Arc::new(move || ctl.checkpoint()))?
+    };
     let mut workers = Vec::new();
     for i in 0..n_workers {
         let rx = job_rx.clone();
@@ -400,6 +413,8 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     for w in workers {
         let _ = w.join();
     }
+    // 일꾼이 모두 끝났으니 대기열을 닫고 계산 제공자를 끝낸다
+    drop(provider);
     let walk = walker.join().map_err(|_| anyhow!("탐색 스레드 오류"))?;
 
     if let Some(msg) = ctx.fatal.lock().take() {
@@ -1315,16 +1330,12 @@ fn embed_pieces(ctx: &WorkerCtx, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>
             .iter_mut()
             .map(|p| std::mem::replace(&mut p.input, EmbedInput::Text(String::new())))
             .collect();
-        let results: Vec<Result<Vec<f32>, EmbedError>> = match ctx.client.embed(&inputs) {
-            Ok(vecs) => vecs.into_iter().map(Ok).collect(),
-            Err(EmbedError::Transport(m)) => {
-                return Err(WorkErr::Fatal(format!("서버 연결이 끊겼습니다: {m}")))
-            }
-            Err(e) if inputs.len() == 1 => vec![Err(e)],
-            Err(_) => inputs
-                .iter()
-                .map(|inp| ctx.client.embed(std::slice::from_ref(inp)).map(|mut v| v.remove(0)))
-                .collect(),
+        // 일감으로 넣고 결과를 기다린다. 묶음이 실패하면 하나씩 다시 해 보는 것은 계산 제공자가 한다 (queue::run_work).
+        let results: Vec<Result<Vec<f32>, EmbedError>> = match ctx.queue.embed(inputs) {
+            Some(Ok(r)) => r,
+            Some(Err(m)) => return Err(WorkErr::Fatal(format!("서버 연결이 끊겼습니다: {m}"))),
+            // 중지로 일감이 버려졌다
+            None => return Err(WorkErr::Stopped),
         };
         for (p, r) in group.into_iter().zip(results) {
             match r {
