@@ -6,7 +6,7 @@
 use super::compat;
 use super::db::{self, ChunkRecord, Db, FileRecord, FileRow};
 use super::progress::{Progress, RunState};
-use super::queue::{LocalProvider, WorkQueue};
+use super::queue::{LocalProvider, WorkQueue, WorkReply};
 use crate::config::Config;
 use crate::embed::client::{EmbedClient, EmbedError, EmbedInput, EmbedTarget};
 use crate::embed::prompt;
@@ -339,7 +339,15 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     let was_empty = db.chunk_count()? == 0;
     let reindex_text = db.meta_get("text_index_version").as_deref() != Some(TEXT_INDEX_VERSION) && !was_empty;
 
-    let (queue, work_rx) = WorkQueue::new();
+    let n_workers = p.cfg.workers.clamp(1, 16);
+    // 계산 제공자가 서버에 동시에 보내는 수: 서버의 슬롯 수. 모르면 설정의 parallel.
+    let slots = match client.props() {
+        Ok(props) if props.slots > 0 => props.slots as usize,
+        _ => p.cfg.parallel as usize,
+    }
+    .clamp(1, 32);
+    // 대기열 칸: 슬롯의 두 배 (서버가 쉬지 않을 만큼만 쌓고, 긴 영상이 일감을 한꺼번에 밀어 넣지 못하게)
+    let (queue, work_rx) = WorkQueue::new(slots * 2);
     let ctx = Arc::new(WorkerCtx {
         cfg: p.cfg.clone(),
         caps: p.caps.clone(),
@@ -381,44 +389,67 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         })?
     };
 
-    let n_workers = p.cfg.workers.clamp(1, 16);
-    // 계산 제공자: 지금은 설정의 임베딩 대상 하나 (이 기기의 서버 또는 외부 서버).
-    // 일꾼은 결과가 올 때까지 기다리므로, 서버에 동시에 가는 요청은 예전처럼 많아야 일꾼 수다.
+    // 계산 제공자: 지금은 설정의 임베딩 대상 하나 (이 기기의 서버 또는 외부 서버). 슬롯 수만큼 동시에 보낸다.
     let provider = {
         let ctl = ctl.clone();
         let client = Arc::new(EmbedClient::new(&p.target));
-        LocalProvider::start(queue, work_rx, client, n_workers, Arc::new(move || ctl.checkpoint()))?
+        LocalProvider::start(queue, work_rx, client, slots, Arc::new(move || ctl.checkpoint()))?
     };
+    // 일꾼은 파일을 추출해 일감을 넣고, 결과를 기다리지 않은 채 그 파일을 결과 모으기 쪽으로 넘긴다.
+    // 넘기는 칸을 일꾼 수로 묶어, 메모리에 올라와 있는 파일 수에 한도를 둔다.
+    let (pend_tx, pend_rx) = bounded::<PendingFile>(n_workers);
     let mut workers = Vec::new();
     for i in 0..n_workers {
-        let rx = job_rx.clone();
-        let tx = res_tx.clone();
-        let ctx = ctx.clone();
+        let (rx, tx, ptx, ctx) = (job_rx.clone(), res_tx.clone(), pend_tx.clone(), ctx.clone());
         workers.push(
             std::thread::Builder::new()
                 .name(format!("index-worker-{i}"))
-                .spawn(move || worker(rx, tx, ctx))?,
+                .spawn(move || worker(rx, tx, ptx, ctx))?,
         );
     }
+    // 결과 모으기: 넘겨받은 파일의 일감 결과를 기다려 기록을 만든다 (파일마다 기다리므로 일꾼 수만큼)
+    let mut collectors = Vec::new();
+    for i in 0..n_workers {
+        let (rx, tx, ctx) = (pend_rx.clone(), res_tx.clone(), ctx.clone());
+        collectors.push(
+            std::thread::Builder::new()
+                .name(format!("index-collect-{i}"))
+                .spawn(move || collect(rx, tx, ctx))?,
+        );
+    }
+    // 여기서 쥐고 있던 끝을 놓아야, 일꾼·결과 모으기가 끝날 때 채널이 닫힌다
     drop(res_tx);
     drop(job_rx);
+    drop(pend_tx);
+    drop(pend_rx);
 
-    // 기록 루프: 모든 워커가 끝나면 채널이 닫힌다
+    // 기록 루프: 일꾼과 결과 모으기가 모두 끝나면 채널이 닫힌다
     for done in res_rx.iter() {
         match done {
             Done::File(rec) => write_record(&mut db, &p.store, prog, rec),
             Done::Moved { id, path, kind, name } => write_move(&mut db, &p.store, prog, id, path, kind, &name),
         }
     }
+    // 끝내는 순서: 일꾼 → 결과 모으기 → 계산 제공자 (결과 모으기는 계산 제공자의 결과를 기다린다)
     for w in workers {
         let _ = w.join();
     }
-    // 일꾼이 모두 끝났으니 대기열을 닫고 계산 제공자를 끝낸다
+    for c in collectors {
+        let _ = c.join();
+    }
     drop(provider);
     let walk = walker.join().map_err(|_| anyhow!("탐색 스레드 오류"))?;
 
     if let Some(msg) = ctx.fatal.lock().take() {
-        if let Some(list) = ctx.crash_inflight.lock().take() {
+        // 충돌 의심 파일: 연결이 끊긴 순간 서버에서 처리 중이던 일감의 파일들 +
+        // 추출하다(토큰 세기 등) 서버에 묻는 중 끊긴 일꾼이 처리 중이던 파일들
+        let mut list = ctx.queue.take_crash().unwrap_or_default();
+        if let Some(l) = ctx.crash_inflight.lock().take() {
+            list.extend(l);
+        }
+        list.sort();
+        list.dedup();
+        if !list.is_empty() {
             let _ = db.add_crash_suspects(&list);
         }
         bail!("{msg}");
@@ -820,7 +851,15 @@ enum WorkErr {
     Stopped,
 }
 
-fn worker(rx: Receiver<FileJob>, tx: Sender<Done>, ctx: Arc<WorkerCtx>) {
+/// 일꾼이 한 파일을 처리한 결과
+enum Step {
+    /// 다 끝나 바로 기록할 것 (옮긴 파일)
+    Done(Done),
+    /// 임베딩을 맡겨 두었다: 결과 모으기 쪽이 마저 끝낸다
+    Pending(PendingFile),
+}
+
+fn worker(rx: Receiver<FileJob>, tx: Sender<Done>, pending: Sender<PendingFile>, ctx: Arc<WorkerCtx>) {
     while let Ok(job) = rx.recv() {
         if !ctx.ctl.checkpoint() {
             break;
@@ -857,20 +896,26 @@ fn worker(rx: Receiver<FileJob>, tx: Sender<Done>, ctx: Arc<WorkerCtx>) {
         }
         ctx.prog.lock().current = job.path.clone();
         ctx.inflight.lock().insert(job.path.clone());
-        // 옮기거나 이름만 바꾼 파일은 내용을 다시 읽지 않는다 (다시 처리해야 하는 종류는 새로 처리)
+        // 옮기거나 이름만 바꾼 파일은 내용을 다시 읽지 않는다 (다시 처리해야 하는 종류는 새로 처리).
+        // 옮긴 파일은 이름 벡터 하나라 결과를 기다려 바로 끝낸다. 그 밖의 파일은 일감을 넣고 넘긴다.
         let result = match &job.moved_from {
-            Some((id, _)) if !ctx.full_rebuild && !force => process_move(&ctx, &job, *id),
-            _ => process_file(&ctx, &job).map(Done::File),
+            Some((id, _)) if !ctx.full_rebuild && !force => process_move(&ctx, &job, *id).map(Step::Done),
+            _ => prepare_file(&ctx, &job).map(Step::Pending),
         };
         if let Err(WorkErr::Fatal(_)) = &result {
-            // 서버가 죽은 시점에 처리 중이던 파일들을 의심 파일로 남긴다 (자기 자신 포함)
+            // 추출하다 서버에 묻는 중(토큰 세기 등) 끊겼다: 이때 처리 중이던 파일들도 의심 파일로 남긴다 (자기 자신 포함)
             let snapshot: Vec<String> = ctx.inflight.lock().iter().cloned().collect();
             ctx.crash_inflight.lock().get_or_insert(snapshot);
         }
         ctx.inflight.lock().remove(&job.path);
         match result {
-            Ok(rec) => {
+            Ok(Step::Done(rec)) => {
                 if tx.send(rec).is_err() {
+                    break;
+                }
+            }
+            Ok(Step::Pending(p)) => {
+                if pending.send(p).is_err() {
                     break;
                 }
             }
@@ -933,7 +978,7 @@ fn name_piece(path: &str) -> Piece {
 
 /// 옮기거나 이름을 바꾼 파일: 이름 벡터만 새로 만든다 (내용 벡터는 그대로 쓴다)
 fn process_move(ctx: &WorkerCtx, job: &FileJob, id: i64) -> Result<Done, WorkErr> {
-    let (mut chunks, _failures) = embed_pieces(ctx, vec![name_piece(&job.path)])?;
+    let (mut chunks, _failures) = embed_pieces(ctx, &job.path, vec![name_piece(&job.path)])?;
     match chunks.pop() {
         Some(name) => Ok(Done::Moved {
             id,
@@ -946,7 +991,59 @@ fn process_move(ctx: &WorkerCtx, job: &FileJob, id: i64) -> Result<Done, WorkErr
     }
 }
 
+/// 임베딩을 맡겨 두고 결과를 기다리는 파일 (일꾼 → 결과 모으기)
+struct PendingFile {
+    path: String,
+    size: i64,
+    mtime: i64,
+    kind: Kind,
+    status: i64,
+    error: Option<String>,
+    /// 이름 조각을 뺀 내용 조각 수
+    content_pieces: usize,
+    groups: Vec<PendingGroup>,
+}
+
+/// 일감 하나로 맡긴 조각들과, 그 결과가 올 곳
+struct PendingGroup {
+    pieces: Vec<PieceMeta>,
+    reply: Receiver<WorkReply>,
+}
+
+/// 벡터를 받으면 기록에 쓰는 조각 정보 (입력은 일감으로 넘어갔다)
+struct PieceMeta {
+    modality: Modality,
+    locator: i64,
+    snippet: String,
+    thumb: Option<Vec<u8>>,
+    text: Option<String>,
+}
+
+/// 파일 하나를 끝까지 처리한다 (결과를 기다린다). 옮긴 파일의 이름 벡터를 만들지 못했을 때만 쓴다.
 fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
+    finish_file(ctx, prepare_file(ctx, job)?)
+}
+
+/// 결과 모으기 스레드: 넘겨받은 파일의 결과를 기다려 기록을 만든다.
+/// 중지·연결 끊김이어도 남은 파일을 계속 꺼내 비운다 (일꾼이 넘기다 막히지 않게).
+fn collect(rx: Receiver<PendingFile>, tx: Sender<Done>, ctx: Arc<WorkerCtx>) {
+    for p in rx.iter() {
+        match finish_file(&ctx, p) {
+            Ok(rec) => {
+                let _ = tx.send(Done::File(rec));
+            }
+            // 이 파일은 기록하지 않는다 (다음 실행에서 다시 처리)
+            Err(WorkErr::Stopped) => {}
+            Err(WorkErr::Fatal(msg)) => {
+                ctx.fatal.lock().get_or_insert(msg);
+                ctx.ctl.set(STOP);
+            }
+        }
+    }
+}
+
+/// 파일을 읽고 잘라 임베딩할 조각을 만들고, 일감으로 넣는다 (결과는 기다리지 않는다)
+fn prepare_file(ctx: &WorkerCtx, job: &FileJob) -> Result<PendingFile, WorkErr> {
     let path = Path::new(&job.path);
     let file_name = path
         .file_name()
@@ -991,7 +1088,32 @@ fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
     }
 
     let content_pieces = pieces.len() - 1;
-    let (chunks, failures) = embed_pieces(ctx, pieces)?;
+    let groups = submit_pieces(ctx, &job.path, pieces)?;
+    Ok(PendingFile {
+        path: job.path.clone(),
+        size: job.size,
+        mtime: job.mtime,
+        kind: job.kind,
+        status,
+        error,
+        content_pieces,
+        groups,
+    })
+}
+
+/// 맡긴 일감의 결과를 모아 파일 기록을 만든다. 일부 조각이 실패했을 때의 상태 규칙은 예전과 같다.
+fn finish_file(ctx: &WorkerCtx, p: PendingFile) -> Result<FileRecord, WorkErr> {
+    let PendingFile {
+        path,
+        size,
+        mtime,
+        kind,
+        mut status,
+        mut error,
+        content_pieces,
+        groups,
+    } = p;
+    let (chunks, failures) = gather(groups)?;
     let content_ok = chunks.iter().filter(|c| c.modality != Modality::Name).count();
     if !failures.is_empty() {
         if content_pieces > 0 && content_ok == 0 || chunks.is_empty() {
@@ -999,20 +1121,18 @@ fn process_file(ctx: &WorkerCtx, job: &FileJob) -> Result<FileRecord, WorkErr> {
             error = Some(failures[0].clone());
         } else if status == db::ST_OK {
             let msg = format!("일부 구간 실패 {}개: {}", failures.len(), failures[0]);
-            ctx.prog.lock().add_warning(&job.path, msg.clone());
+            ctx.prog.lock().add_warning(&path, msg.clone());
             error = Some(msg);
         }
     }
     if status == db::ST_ERROR {
-        ctx.prog
-            .lock()
-            .add_error(&job.path, error.clone().unwrap_or_default());
+        ctx.prog.lock().add_error(&path, error.clone().unwrap_or_default());
     }
     Ok(FileRecord {
-        path: job.path.clone(),
-        size: job.size,
-        mtime: job.mtime,
-        kind: job.kind,
+        path,
+        size,
+        mtime,
+        kind,
         status,
         error,
         chunks,
@@ -1301,10 +1421,16 @@ pub(crate) fn text_chunks(
     Ok(out)
 }
 
-/// 같은 종류끼리 묶어 배치 임베딩. 배치가 실패하면 하나씩 다시 시도.
-fn embed_pieces(ctx: &WorkerCtx, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>, Vec<String>), WorkErr> {
-    let mut out = Vec::with_capacity(pieces.len());
-    let mut fails = Vec::new();
+/// 같은 종류끼리 묶어 배치 임베딩하고 결과를 기다린다 (옮긴 파일의 이름 벡터처럼 바로 끝내야 할 때)
+fn embed_pieces(ctx: &WorkerCtx, tag: &str, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>, Vec<String>), WorkErr> {
+    gather(submit_pieces(ctx, tag, pieces)?)
+}
+
+/// 같은 종류끼리 묶어 일감으로 넣는다 (묶음 규칙: 글 16, 그림 4(배치 가능할 때), 영상·소리 1).
+/// 결과는 기다리지 않는다. 묶음이 실패하면 하나씩 다시 해 보는 것은 계산 제공자가 한다 (queue::run_work).
+/// `tag`는 이 일감이 어느 파일의 것인지 (서버가 죽었을 때 의심 파일로 남긴다).
+fn submit_pieces(ctx: &WorkerCtx, tag: &str, pieces: Vec<Piece>) -> Result<Vec<PendingGroup>, WorkErr> {
+    let mut groups = Vec::new();
     let class = |p: &Piece| match p.input {
         EmbedInput::Text(_) => 0u8,
         EmbedInput::Image(_) => 1,
@@ -1326,18 +1452,37 @@ fn embed_pieces(ctx: &WorkerCtx, pieces: Vec<Piece>) -> Result<(Vec<ChunkRecord>
         if !ctx.ctl.checkpoint() {
             return Err(WorkErr::Stopped);
         }
-        let inputs: Vec<EmbedInput> = group
-            .iter_mut()
-            .map(|p| std::mem::replace(&mut p.input, EmbedInput::Text(String::new())))
-            .collect();
-        // 일감으로 넣고 결과를 기다린다. 묶음이 실패하면 하나씩 다시 해 보는 것은 계산 제공자가 한다 (queue::run_work).
-        let results: Vec<Result<Vec<f32>, EmbedError>> = match ctx.queue.embed(inputs) {
-            Some(Ok(r)) => r,
-            Some(Err(m)) => return Err(WorkErr::Fatal(format!("서버 연결이 끊겼습니다: {m}"))),
-            // 중지로 일감이 버려졌다
-            None => return Err(WorkErr::Stopped),
+        let mut inputs = Vec::with_capacity(group.len());
+        let mut metas = Vec::with_capacity(group.len());
+        for p in group {
+            inputs.push(p.input);
+            metas.push(PieceMeta {
+                modality: p.modality,
+                locator: p.locator,
+                snippet: p.snippet,
+                thumb: p.thumb,
+                text: p.text,
+            });
+        }
+        // 대기열이 닫혔다 = 중지
+        let reply = ctx.queue.submit(tag, inputs).ok_or(WorkErr::Stopped)?;
+        groups.push(PendingGroup { pieces: metas, reply });
+    }
+    Ok(groups)
+}
+
+/// 맡긴 일감들의 결과를 차례로 받아 조각 기록과 실패 까닭을 모은다.
+/// 결과 없이 채널이 닫히면 중지(일감이 버려졌다), 연결이 끊겼으면 인덱싱 전체를 멈춘다.
+fn gather(groups: Vec<PendingGroup>) -> Result<(Vec<ChunkRecord>, Vec<String>), WorkErr> {
+    let mut out = Vec::new();
+    let mut fails = Vec::new();
+    for g in groups {
+        let results: Vec<Result<Vec<f32>, EmbedError>> = match g.reply.recv() {
+            Ok(Ok(r)) => r,
+            Ok(Err(m)) => return Err(WorkErr::Fatal(format!("서버 연결이 끊겼습니다: {m}"))),
+            Err(_) => return Err(WorkErr::Stopped),
         };
-        for (p, r) in group.into_iter().zip(results) {
+        for (p, r) in g.pieces.into_iter().zip(results) {
             match r {
                 Ok(vec) => out.push(ChunkRecord {
                     modality: p.modality,
