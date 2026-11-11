@@ -6,7 +6,7 @@
 pub mod job;
 
 use crate::config::Config;
-use crate::embed::client::EmbedClient;
+use crate::embed::client::{EmbedClient, EmbedError, EmbedTarget};
 use crate::embed::selftest::{self, Capabilities};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
@@ -64,7 +64,12 @@ pub struct Shared {
     pub pid: Option<u32>,
     pub started_at: Option<Instant>,
     pub ready_at: Option<Instant>,
+    /// 앱이 켠 서버의 포트 (외부 서버면 0)
     pub port: u16,
+    /// 임베딩을 맡기는 곳: 앱이 켠 서버면 이 기기의 포트, 외부 서버면 그 주소
+    pub target: EmbedTarget,
+    /// 외부 서버의 llama.cpp 빌드와 모델 (인덱스에 기록하는 서버 서명)
+    external_sig: String,
     pub command_line: String,
     pub selftest: SelfTest,
     /// start/stop 할 때마다 증가 — 이전 감시 스레드가 스스로 종료하도록
@@ -90,6 +95,8 @@ impl Default for ServerManager {
                 started_at: None,
                 ready_at: None,
                 port: 0,
+                target: EmbedTarget::local(0),
+                external_sig: String::new(),
                 command_line: String::new(),
                 selftest: SelfTest::NotRun,
                 generation: 0,
@@ -211,6 +218,40 @@ impl ServerManager {
         self.shared.lock().port
     }
 
+    /// 임베딩 요청을 보낼 곳
+    pub fn target(&self) -> EmbedTarget {
+        self.shared.lock().target.clone()
+    }
+
+    /// 화면에 보여 줄 서버 위치: "포트 8090" 또는 "외부 서버 http://…"
+    pub fn place(&self) -> String {
+        let s = self.shared.lock();
+        if s.state == ServerState::External {
+            format!("외부 서버 {}", s.target)
+        } else {
+            format!("포트 {}", s.port)
+        }
+    }
+
+    /// 인덱스에 기록할 llama.cpp 서명. 외부 서버면 그 서버가 알려 준 빌드와 모델, 아니면 이 기기의 실행 파일.
+    pub fn signature(&self, cfg: &Config) -> String {
+        let s = self.shared.lock();
+        if s.state == ServerState::External {
+            s.external_sig.clone()
+        } else {
+            cfg.server_signature()
+        }
+    }
+
+    /// 쓸 수 있게 한다: 설정에 외부 서버(`embed_server`)가 있으면 그 서버에 연결하고, 없으면 이 기기에서 켠다.
+    pub fn bring_up(&self, cfg: &Config) -> Result<()> {
+        match cfg.external_server() {
+            Some(Ok(target)) => self.connect_external(target, cfg),
+            Some(Err(e)) => bail!("설정의 외부 서버 주소(embed_server)가 올바르지 않습니다: {e}"),
+            None => self.start(cfg),
+        }
+    }
+
     pub fn log(&self, line: impl Into<String>) {
         push_log(&self.logs, &self.log_file, line.into());
     }
@@ -245,7 +286,7 @@ impl ServerManager {
         // 경우가 있다 → 다른 서버가 응답 중인 게 아니면 빈 포트를 골라 쓴다.
         let mut cfg = cfg.clone();
         if std::net::TcpListener::bind(("127.0.0.1", cfg.port)).is_err() {
-            if EmbedClient::new(cfg.port).health().is_ok() {
+            if EmbedClient::new(&EmbedTarget::local(cfg.port)).health().is_ok() {
                 bail!(
                     "포트 {}에서 이미 다른 서버가 응답 중입니다. '외부 서버 연결'을 쓰거나 포트를 바꾸세요.",
                     cfg.port
@@ -324,6 +365,7 @@ impl ServerManager {
             s.started_at = Some(Instant::now());
             s.ready_at = None;
             s.port = cfg.port;
+            s.target = EmbedTarget::local(cfg.port);
             s.command_line = command_line;
             s.selftest = SelfTest::NotRun;
             s.has_mmproj = cfg.has_mmproj();
@@ -336,17 +378,45 @@ impl ServerManager {
         Ok(())
     }
 
-    /// 이미 떠 있는 서버(같은 포트)에 연결해서 사용
-    pub fn connect_external(&self, cfg: &Config) -> Result<()> {
+    /// 이미 떠 있는 서버(이 기기의 다른 포트나 다른 기기)에 연결해서 사용.
+    /// `cfg`는 이 기기가 그 서버에 보낼 입력 크기(컨텍스트·슬롯 설정)를 서버와 견주는 데 쓴다.
+    pub fn connect_external(&self, target: EmbedTarget, cfg: &Config) -> Result<()> {
         if self.state().is_running() {
             bail!("앱이 띄운 서버가 실행 중입니다");
         }
-        let client = EmbedClient::new(cfg.port);
+        let client = EmbedClient::new(&target);
         match client.health() {
             Ok(200) => {}
-            Ok(code) => bail!("포트 {}의 서버가 아직 준비되지 않았습니다 (HTTP {code})", cfg.port),
-            Err(e) => bail!("포트 {}에 연결할 수 없습니다: {e}", cfg.port),
+            Ok(code) => bail!("{}의 서버가 아직 준비되지 않았습니다 (HTTP {code})", target.base),
+            Err(e) => bail!("{}에 연결할 수 없습니다: {e}", target.base),
         }
+        // /health는 접속 키 없이도 답하므로, 키가 맞는지와 빌드·모델은 /props로 확인한다
+        let sig = match client.props() {
+            Ok(p) => {
+                // 이 기기 설정으로 자른 입력(글 조각·영상 구간)이 그 서버의 슬롯에 들어가야 한다
+                let want = cfg.max_input_tokens() as u32;
+                self.log(format!("[앱] 외부 서버: 슬롯 {}개 · 슬롯마다 컨텍스트 {}", p.slots, p.slot_ctx));
+                if p.slot_ctx > 0 && p.slot_ctx < want {
+                    self.log(format!(
+                        "[앱] 경고: 외부 서버의 슬롯 컨텍스트({})가 이 기기 설정의 입력 크기({want})보다 작습니다. \
+                         긴 입력이 거절될 수 있으니 그 서버를 같은 -c·-np로 띄우세요",
+                        p.slot_ctx
+                    ));
+                }
+                format!(
+                    "external:{}|{}",
+                    if p.build.is_empty() { "?" } else { &p.build },
+                    if p.model.is_empty() { "?" } else { &p.model }
+                )
+            }
+            Err(EmbedError::Server(m)) if m.contains("HTTP 401") => {
+                bail!("{}의 서버가 접속 키를 받지 않습니다. 설정의 embed_server_key를 확인하세요", target.base)
+            }
+            Err(e) => {
+                self.log(format!("[앱] 외부 서버의 빌드를 알 수 없습니다 ({e})"));
+                "external:?".to_string()
+            }
+        };
         let gen = {
             let mut s = self.shared.lock();
             s.generation += 1;
@@ -354,13 +424,15 @@ impl ServerManager {
             s.pid = None;
             s.started_at = Some(Instant::now());
             s.ready_at = Some(Instant::now());
-            s.port = cfg.port;
-            s.command_line = format!("(외부 서버) http://127.0.0.1:{}", cfg.port);
+            s.port = 0;
+            s.command_line = format!("(외부 서버) {target}");
+            s.external_sig = sig.clone();
+            s.target = target;
             s.selftest = SelfTest::NotRun;
             s.has_mmproj = true; // 외부 서버는 mmproj 여부를 알 수 없으니 진단으로 판별
             s.generation
         };
-        self.log(format!("[앱] 외부 서버에 연결: 포트 {}", cfg.port));
+        self.log(format!("[앱] 외부 서버에 연결: {} · {sig}", self.target()));
         self.spawn_selftest();
         let me = self.clone();
         std::thread::spawn(move || me.monitor_external(gen));
@@ -399,14 +471,14 @@ impl ServerManager {
     }
 
     fn spawn_selftest(&self) {
-        let (port, has_mmproj) = {
+        let (target, has_mmproj) = {
             let mut s = self.shared.lock();
             s.selftest = SelfTest::Running;
-            (s.port, s.has_mmproj)
+            (s.target.clone(), s.has_mmproj)
         };
         let me = self.clone();
         std::thread::spawn(move || {
-            let client = EmbedClient::new(port);
+            let client = EmbedClient::new(&target);
             let caps = selftest::run(&client, has_mmproj);
             me.log(format!(
                 "[앱] 자가진단 ({}ms): 텍스트 {:?} / 이미지 {:?} / 오디오 {:?}",
@@ -420,8 +492,7 @@ impl ServerManager {
     }
 
     fn monitor(&self, gen: u64) {
-        let port = self.port();
-        let client = EmbedClient::new(port);
+        let client = EmbedClient::new(&self.target());
         loop {
             if self.shared.lock().generation != gen {
                 return;
@@ -485,7 +556,7 @@ impl ServerManager {
     }
 
     fn monitor_external(&self, gen: u64) {
-        let client = EmbedClient::new(self.port());
+        let client = EmbedClient::new(&self.target());
         let mut failures = 0;
         loop {
             std::thread::sleep(Duration::from_secs(2));

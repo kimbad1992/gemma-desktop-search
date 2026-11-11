@@ -2,7 +2,7 @@
 
 use super::keyword::{self, KeywordResult};
 use super::store::{Boost, Filter, Hit, Section, VectorStore, KEYWORD_SHOW};
-use crate::embed::client::{EmbedClient, EmbedInput};
+use crate::embed::client::{EmbedClient, EmbedInput, EmbedTarget};
 use crate::embed::prompt;
 use crate::extract::{Kind, Modality};
 use crate::index::db::Db;
@@ -63,7 +63,7 @@ impl Outcome {
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
-    port: u16,
+    target: &EmbedTarget,
     store: &RwLock<VectorStore>,
     db: &Mutex<Db>,
     q: QueryKind,
@@ -82,7 +82,7 @@ pub fn run(
         kind_hints: Vec::new(),
         expr: None,
     };
-    let client = EmbedClient::new(port);
+    let client = EmbedClient::new(target);
     let (label, input, text) = match &q {
         QueryKind::Text(s) => (format!("“{}”", s.trim()), EmbedInput::Text(prompt::query(s)), Some(s.clone())),
         QueryKind::Image(p) => {

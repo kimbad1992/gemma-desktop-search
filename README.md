@@ -294,7 +294,7 @@ gemma-search.exe --tab index|server|settings|search
 gemma-search.exe --headless-test <폴더> [질의...]   # GUI 없이 전체 흐름 점검 (개발용, 임시 DB 사용)
 gemma-search.exe --bench <텍스트파일>              # 실행 중인 서버의 임베딩 처리량 측정
 gemma-search.exe --index-once                      # 창 없이 변경분 인덱싱 한 번 (서버 시작·중지 포함, 앱이 같은 데이터 폴더로 떠 있으면 하지 않음)
-gemma-search.exe --compat <포트>                   # 인덱스 표본을 그 포트의 서버로 다시 임베딩해 벡터 비교
+gemma-search.exe --compat <포트나 주소>            # 인덱스 표본을 그 서버로 다시 임베딩해 벡터 비교
 gemma-search.exe --sysinfo                         # 사양 확인과 추천 설정 (마법사와 같은 내용)
 gemma-search.exe --check-update                    # 새 버전이 있는지 확인만
 gemma-search.exe --update                          # 새 버전이 있으면 받아서 실행 파일을 바꿈 (창 없이)
@@ -351,7 +351,7 @@ mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz
   - 받은 위치는 설정에 적어 두므로 `serve`가 바로 찾습니다.
   - 옵션: `--list`(고를 수 있는 판과 이 기기의 추천), `--llama cpu|vulkan|cuda13|cuda12`(직접 고르기), `--only model|llama`, `--dir <폴더>`(받을 곳), `-y`(묻지 않기)
 - **`serve`**: 서비스를 띄웁니다.
-  - 옵션으로 준 값(`--root`, `--bind`, `--token`, `--llama`, `--model`, `--mmproj`)은 설정(`data/config.toml`)에 저장됩니다. 다음부터는 `./gemma-search serve`만 쓰면 됩니다.
+  - 옵션으로 준 값(`--root`, `--bind`, `--token`, `--llama`, `--model`, `--mmproj`, `--embed-server`, `--embed-key`)은 설정(`data/config.toml`)에 저장됩니다. 다음부터는 `./gemma-search serve`만 쓰면 됩니다.
   - 인덱스가 비어 있으면 바로 처음 인덱싱을 시작합니다. 폴더 감시는 기본으로 켜져 있습니다(`--no-watch`로 끔).
   - llama-server는 검색·인덱싱할 때 켜고, 10분 동안 쓰지 않으면 끕니다.
   - Ctrl+C나 SIGTERM으로 끝내면 llama-server도 함께 끝납니다. 서비스가 비정상 종료돼도 llama-server는 남지 않습니다.
@@ -502,6 +502,32 @@ systemctl --user list-timers gemma-search-update.timer
 - 처음 인덱싱이 가장 오래 걸리고, 그 뒤로는 바뀐 파일만 처리합니다. 위 Vulkan판 속도로 한글 문서 1만 개(파일당 2,000자)면 처음 인덱싱에 2시간쯤 걸리는 규모입니다.
 - Vulkan판은 맨 처음 켤 때 그래픽 드라이버가 셰이더를 준비하느라 10초쯤 더 걸리고, 그다음부터는 2초 안팎입니다.
 - 참고로 RTX 4090(CUDA)에서는 기본 설정으로 초당 약 91벡터를 처리했습니다([명령줄 옵션](#명령줄-옵션)의 표, 측정한 내용은 다름).
+
+### 다른 PC의 그래픽 쓰기 (외부 llama-server)
+
+파일이 있는 서버는 그대로 두고, 임베딩만 그래픽이 좋은 다른 PC의 llama-server에 맡길 수 있습니다. 서버는 파일을 읽고 잘라서 보내고, 결과 벡터를 자기 인덱스에 저장합니다.
+
+1. 그래픽이 좋은 PC에서 llama-server를 띄웁니다. 그 PC에 설치한 Gemma Search의 `llama.cpp`와 `models` 폴더를 쓰면 됩니다. 접속 키는 아무 긴 글자로 정합니다.
+   ```bash
+   llama-server -m embeddinggemma-2-Q8_0.gguf --mmproj mmproj-embeddinggemma-2-Q8_0.gguf \
+     --embeddings --pooling mean -c 65536 -np 8 -b 8192 -ub 8192 -ngl 99 -fa off \
+     --video-fps 1 --video-ffmpeg-dir <ffmpeg가 있는 폴더> \
+     --host 127.0.0.1 --port 8090 --no-webui --api-key <접속 키>
+   ```
+2. 그 PC에서 서버로 SSH 역방향 터널을 엽니다. 그 PC는 나가는 접속만 하므로 포트를 열지 않아도 됩니다.
+   ```bash
+   ssh -N -R 18080:127.0.0.1:8090 <서버>
+   ```
+3. 서버에서 그 주소를 씁니다. 되돌리려면 `--embed-server local`을 줍니다.
+   ```bash
+   ./gemma-search serve --embed-server http://127.0.0.1:18080 --embed-key <접속 키>
+   ```
+
+- 그 서버는 같은 모델 파일과 llama.cpp 빌드로 띄워야 합니다. 인덱스에는 그 서버가 알려 준 빌드와 모델을 적어 두고, 이 기기 서버와 오갈 때 바뀌면 기존 항목 몇 개를 다시 임베딩해 벡터가 같은지 확인합니다. 다르면 재구축하라고 알려 줍니다.
+- `-c`와 `-np`도 이 기기 설정과 같게 띄웁니다. 슬롯 하나의 컨텍스트가 이 기기 설정보다 작으면 긴 입력이 거절될 수 있어 로그에 경고합니다.
+- 파일 내용(글 조각, 줄인 그림, 영상·소리 구간)이 그 PC로 갑니다. 주소가 `http://`이면 암호화되지 않으므로 SSH 터널이나 Tailscale 같은 VPN 안으로 지나가게 하세요.
+- `--index-once`와 창 있는 앱도 설정의 `embed_server`·`embed_server_key`를 따릅니다. 서버를 켜는 대신 그 서버에 연결합니다. 창 있는 앱의 설정 화면에는 아직 이 항목이 없어 `data\config.toml`에 적습니다.
+- 지금은 한 서버에 모두 맡깁니다. 그 서버가 꺼지면 다시 닿을 때까지 검색과 인덱싱이 기다리고, 이 기기의 그래픽으로 넘어가지 않습니다.
 
 ### Linux에서 아직 안 되는 것
 

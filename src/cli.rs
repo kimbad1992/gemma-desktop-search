@@ -469,14 +469,17 @@ fn status_text(base: &str, v: &Value) -> String {
         line(format!("새 버전: {tag}이 나왔습니다. `gemma-search update`로 바꿉니다 (서비스가 돌고 있는 기기에서)"));
     }
     let sv = &v["server"];
+    let external = sv["external"].as_str();
     line(format!(
-        "검색 서버: {}",
-        match sv["key"].as_str() {
-            Some("ready") => "준비됨".to_string(),
-            Some("stopped") => "꺼짐 (검색하거나 인덱싱할 때 켭니다)".to_string(),
-            Some("failed") => format!("오류: {}", sv["error"].as_str().unwrap_or("")),
+        "검색 서버: {}{}",
+        match (sv["key"].as_str(), external) {
+            (Some("ready"), _) => "준비됨".to_string(),
+            (Some("stopped"), None) => "꺼짐 (검색하거나 인덱싱할 때 켭니다)".to_string(),
+            (Some("stopped"), Some(_)) => "연결 안 됨 (검색하거나 인덱싱할 때 연결합니다)".to_string(),
+            (Some("failed"), _) => format!("오류: {}", sv["error"].as_str().unwrap_or("")),
             _ => format!("{}…", sv["state"].as_str().unwrap_or("?")),
-        }
+        },
+        external.map(|t| format!(" · 외부 서버 {t}")).unwrap_or_default()
     ));
     if sv["ready"] != true {
         if let Some(why) = sv["start_error"]["message"].as_str() {

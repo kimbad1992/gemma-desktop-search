@@ -1,5 +1,6 @@
 //! 앱 설정 (data\config.toml)
 
+use crate::embed::target::EmbedTarget;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,11 @@ pub struct Config {
     /// CUDA DLL 등이 llama 폴더에 없을 때 PATH 앞에 붙일 폴더
     pub extra_dll_dir: String,
     pub port: u16,
+    /// 다른 곳에서 떠 있는 llama-server를 쓴다 (예: `http://127.0.0.1:18080`, `192.168.0.10:8090`).
+    /// 비워 두면 이 기기에서 llama-server를 켠다. 같은 모델 파일과 llama.cpp 빌드로 띄운 서버여야 한다.
+    pub embed_server: String,
+    /// 그 서버를 `--api-key`로 켰을 때의 키
+    pub embed_server_key: String,
     pub n_gpu_layers: i32,
     pub ctx_size: u32,
     pub parallel: u32,
@@ -122,6 +128,8 @@ impl Default for Config {
             ]),
             extra_dll_dir: String::new(),
             port: 8090,
+            embed_server: String::new(),
+            embed_server_key: String::new(),
             n_gpu_layers: 99,
             // RTX 4090 실측: np 4/ub 2048 ≈ 56 벡터/초, np 8/ub 8192 ≈ 91 벡터/초, np 16 ≈ 73 (GPU 포화)
             // 슬롯당 8192(모델 최대 컨텍스트)가 되도록 65536 — 영상 30초 구간(약 2,600토큰)이 들어가야 함
@@ -295,6 +303,17 @@ impl Config {
 
     pub fn has_mmproj(&self) -> bool {
         !self.mmproj_path.trim().is_empty()
+    }
+
+    /// 다른 곳의 llama-server를 쓰도록 정했으면 그 대상 (`embed_server`). 주소가 틀렸으면 그 까닭.
+    pub fn external_server(&self) -> Option<Result<EmbedTarget, String>> {
+        let addr = self.embed_server.trim();
+        (!addr.is_empty()).then(|| EmbedTarget::parse(addr, &self.embed_server_key))
+    }
+
+    /// '외부 서버 연결'이 붙을 곳: 정해 둔 외부 서버, 없으면 이 기기의 설정 포트
+    pub fn connect_target(&self) -> Result<EmbedTarget, String> {
+        self.external_server().unwrap_or_else(|| Ok(EmbedTarget::local(self.port)))
     }
 
     /// llama.cpp 빌드 서명 (실행 파일 이름:크기). 바뀌면 벡터가 그대로인지 호환성 검사.

@@ -7,7 +7,7 @@ use super::compat;
 use super::db::{self, ChunkRecord, Db, FileRecord, FileRow};
 use super::progress::{Progress, RunState};
 use crate::config::Config;
-use crate::embed::client::{EmbedClient, EmbedError, EmbedInput};
+use crate::embed::client::{EmbedClient, EmbedError, EmbedInput, EmbedTarget};
 use crate::embed::prompt;
 use crate::embed::selftest::Capabilities;
 use crate::extract::{self, media, Kind, Modality};
@@ -68,7 +68,10 @@ impl Control {
 pub struct IndexParams {
     pub cfg: Config,
     pub caps: Capabilities,
-    pub port: u16,
+    /// 임베딩을 맡길 곳
+    pub target: EmbedTarget,
+    /// 인덱스에 기록할 llama.cpp 서명 (`ServerManager::signature`). 바뀌면 벡터가 그대로인지 확인한다.
+    pub server_sig: String,
     pub db_path: PathBuf,
     pub data_dir: PathBuf,
     pub store: Arc<RwLock<VectorStore>>,
@@ -252,7 +255,7 @@ const TEXT_INDEX_VERSION: &str = "2";
 fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -> Result<Outcome> {
     let mut db = Db::open(&p.db_path)?;
     let sig = p.cfg.model_signature();
-    let server_sig = p.cfg.server_signature();
+    let server_sig = p.server_sig.clone();
     if p.full_rebuild {
         db.clear_all()?;
         p.store.write().clear();
@@ -267,7 +270,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         if (model_changed || server_changed) && db.chunk_count()? > 0 {
             let what = if model_changed { "모델 파일" } else { "llama.cpp 빌드" };
             prog.lock().current = format!("{what}이 바뀌어 기존 인덱스와 벡터가 같은지 확인하는 중…");
-            let report = compat::check(&db, &p.cfg, &EmbedClient::new(p.port), compat::Budget::quick())?;
+            let report = compat::check(&db, &p.cfg, &EmbedClient::new(&p.target), compat::Budget::quick())?;
             if !report.compatible() {
                 bail!(
                     "{what}이 바뀌어 벡터가 기존 인덱스와 다릅니다 ({}). '전체 재구축'을 실행하세요.",
@@ -299,7 +302,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     enabled[Kind::Audio.idx()] = p.cfg.index_audio && p.caps.audio.usable() && media_ok;
 
     // 서버가 영상 입력을 받는지 2초짜리 시험 영상으로 한 번 확인
-    let client = EmbedClient::new(p.port);
+    let client = EmbedClient::new(&p.target);
     let video_native = if enabled[Kind::Video.idx()] {
         match media::test_clip(ffmpeg.as_deref().unwrap()) {
             Ok(clip) => match client.embed(&[EmbedInput::Video(clip)]) {

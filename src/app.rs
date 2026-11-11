@@ -732,6 +732,20 @@ impl GemmaApp {
 
     // ── 서버 ──
     pub fn start_server(&mut self) {
+        // 설정에 외부 서버(embed_server)가 있으면 켜지 않고 그 서버에 연결한다
+        if self.cfg.external_server().is_some() {
+            match self.server.bring_up(&self.cfg) {
+                Ok(()) => {
+                    self.server_cfg_at_start = None;
+                    self.notify("외부 서버에 연결했습니다", false);
+                }
+                Err(e) => {
+                    self.server.log(format!("[앱] 외부 서버 연결 실패: {e}"));
+                    self.notify(format!("외부 서버 연결 실패: {e}"), true);
+                }
+            }
+            return;
+        }
         match self.server.start(&self.cfg) {
             Ok(()) => {
                 let actual = self.server.port();
@@ -1502,7 +1516,8 @@ impl GemmaApp {
         let params = IndexParams {
             cfg: self.cfg.clone(),
             caps,
-            port: self.server.port(),
+            target: self.server.target(),
+            server_sig: self.server.signature(&self.cfg),
             db_path: self.db_path.clone(),
             data_dir: self.data_dir.clone(),
             store: self.store.clone(),
@@ -1672,14 +1687,14 @@ impl GemmaApp {
         };
         self.last_query = Some(q.clone());
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let port = self.server.port();
+        let target = self.server.target();
         let store = self.store.clone();
         let db = self.db.clone();
         let top_k = self.cfg.top_k.max(1);
         let ff = self.cfg.ffmpeg();
         let min_score = self.cfg.min_relevance;
         std::thread::spawn(move || {
-            let o = query::run(port, &store, &db, q, filter, top_k, min_score, ff);
+            let o = query::run(&target, &store, &db, q, filter, top_k, min_score, ff);
             let _ = tx.send(o);
         });
         self.search_rx = Some(rx);
@@ -2112,8 +2127,8 @@ impl GemmaApp {
                 .interact(egui::Sense::click());
             let hover = if ss.is_ready() {
                 format!(
-                    "포트 {} · 벡터 {}개\n누르면 서버 화면을 엽니다",
-                    self.server.port(),
+                    "{} · 벡터 {}개\n누르면 서버 화면을 엽니다",
+                    self.server.place(),
                     fmt_num(chunks as u64)
                 )
             } else {

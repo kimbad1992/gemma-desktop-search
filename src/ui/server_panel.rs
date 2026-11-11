@@ -102,8 +102,12 @@ impl GemmaApp {
                         if widgets::icon_button(ui, Btn::Primary, widgets::Icon::Play, "서버 시작").clicked() {
                             act = Act::Start;
                         }
+                        let hint = match self.cfg.external_server() {
+                            Some(Ok(t)) => format!("설정한 외부 서버({})에 연결합니다", t.base),
+                            _ => "이미 같은 포트에서 실행 중인 llama-server를 그대로 사용합니다".to_string(),
+                        };
                         if widgets::button(ui, Btn::Ghost, "외부 서버 연결")
-                            .on_hover_text("이미 같은 포트에서 실행 중인 llama-server를 그대로 사용합니다")
+                            .on_hover_text(hint)
                             .clicked()
                         {
                             act = Act::Connect;
@@ -112,7 +116,15 @@ impl GemmaApp {
                 });
             });
             widgets::help(ui, "AI 모델을 돌리는 llama.cpp 서버입니다. 검색·인덱싱할 때 자동으로 켜집니다.");
-            let mut line = format!("http://127.0.0.1:{}", if port != 0 { port } else { self.cfg.port });
+            // 연결된 곳. 꺼져 있으면 켜거나 연결할 곳
+            let mut line = if external || port != 0 {
+                self.server.target().base
+            } else {
+                match self.cfg.connect_target() {
+                    Ok(t) => t.base,
+                    Err(_) => format!("http://127.0.0.1:{}", self.cfg.port),
+                }
+            };
             if let (Some(t), true) = (started, running) {
                 line += &format!(" · 가동 {}", fmt_dur(t.elapsed()));
             }
@@ -135,7 +147,12 @@ impl GemmaApp {
                 self.stop_server();
                 self.start_server_manual();
             }
-            Act::Connect => match self.server.connect_external(&self.cfg) {
+            Act::Connect => match self
+                .cfg
+                .connect_target()
+                .map_err(anyhow::Error::msg)
+                .and_then(|t| self.server.connect_external(t, &self.cfg))
+            {
                 Ok(()) => self.notify("외부 서버에 연결했습니다", false),
                 Err(e) => self.notify(e.to_string(), true),
             },

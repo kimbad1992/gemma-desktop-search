@@ -16,6 +16,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// 시험 명령의 서버 인자: 이 기기의 포트(`8090`)나 주소(`http://host:8090`)
+fn target_arg(arg: Option<&String>) -> Option<crate::embed::client::EmbedTarget> {
+    let arg = arg?;
+    match crate::embed::client::EmbedTarget::parse(arg, "") {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("{e}");
+            None
+        }
+    }
+}
+
 /// 서버 안정성 시험: 폴더를 임시 DB에 반복 재구축하면서 서버가 죽는지 본다.
 ///   gemma-search.exe --stress <폴더> <초>
 pub fn stress(args: &[String]) -> i32 {
@@ -63,7 +75,8 @@ pub fn stress(args: &[String]) -> i32 {
             .start(IndexParams {
                 cfg: cfg.clone(),
                 caps: caps.clone(),
-                port: cfg.port,
+                target: server.target(),
+                server_sig: server.signature(&cfg),
                 db_path: data_dir.join("index.db"),
                 data_dir: data_dir.clone(),
                 store: store.clone(),
@@ -131,15 +144,14 @@ pub fn index_once() -> i32 {
             return 1;
         }
     };
-    let mut cfg = Config::load(&data_dir);
+    let cfg = Config::load(&data_dir);
     println!("데이터 폴더: {}", data_dir.display());
     let server = ServerManager::default();
-    if let Err(e) = server.start(&cfg) {
+    if let Err(e) = server.bring_up(&cfg) {
         println!("서버 시작 실패: {e}");
         return 1;
     }
-    cfg.port = server.port();
-    println!("서버 포트: {}", cfg.port);
+    println!("임베딩 서버: {}", server.place());
     let t0 = Instant::now();
     let caps = loop {
         if let Some(c) = server.capabilities() {
@@ -157,7 +169,8 @@ pub fn index_once() -> i32 {
     if let Err(e) = indexer.start(IndexParams {
         cfg: cfg.clone(),
         caps,
-        port: cfg.port,
+        target: server.target(),
+        server_sig: server.signature(&cfg),
         db_path: data_dir.join("index.db"),
         data_dir: data_dir.clone(),
         store,
@@ -215,13 +228,13 @@ pub fn query_once(args: &[String]) -> i32 {
         return 2;
     };
     let data_dir = crate::config::data_dir();
-    let mut cfg = Config::load(&data_dir);
+    let cfg = Config::load(&data_dir);
     let server = ServerManager::default();
-    if let Err(e) = server.start(&cfg) {
+    if let Err(e) = server.bring_up(&cfg) {
         println!("서버 시작 실패: {e}");
         return 1;
     }
-    cfg.port = server.port();
+    let target = server.target();
     let t0 = Instant::now();
     while server.capabilities().is_none() {
         if t0.elapsed() > Duration::from_secs(180) {
@@ -237,14 +250,14 @@ pub fn query_once(args: &[String]) -> i32 {
     let store = Arc::new(RwLock::new(st));
     for q in &args[1..] {
         // 종류별 평균 점수 (모든 벡터 기준)
-        if let Ok(mut v) = crate::embed::client::EmbedClient::new(cfg.port)
+        if let Ok(mut v) = crate::embed::client::EmbedClient::new(&target)
             .embed(&[crate::embed::client::EmbedInput::Text(crate::embed::prompt::query(q))])
         {
             let means = store.read().modality_means(&v.remove(0));
             let s: Vec<String> = means.iter().map(|(m, mean, n)| format!("{m:?} {mean:.3}({n})")).collect();
             println!("  평균: {}", s.join(" · "));
         }
-        let o = query::run(cfg.port, &store, &db, QueryKind::Text(q.clone()), Filter::default(), cfg.top_k, min, cfg.ffmpeg());
+        let o = query::run(&target, &store, &db, QueryKind::Text(q.clone()), Filter::default(), cfg.top_k, min, cfg.ffmpeg());
         let mut line = format!("{q:<22} ({:.0}ms) |", o.elapsed.as_secs_f32() * 1000.0);
         for (sec, hits) in &o.sections {
             let shown = hits.iter().filter(|h| h.visible(min)).count();
@@ -300,12 +313,8 @@ pub fn sysinfo() -> i32 {
 ///   gemma-search.exe --bench-compare <포트A> <포트B> <폴더>
 pub fn bench_compare(args: &[String]) -> i32 {
     use crate::embed::client::{EmbedClient, EmbedInput};
-    let (Some(pa), Some(pb), Some(dir)) = (
-        args.first().and_then(|s| s.parse::<u16>().ok()),
-        args.get(1).and_then(|s| s.parse::<u16>().ok()),
-        args.get(2),
-    ) else {
-        eprintln!("사용법: --bench-compare <포트A> <포트B> <폴더>");
+    let (Some(pa), Some(pb), Some(dir)) = (target_arg(args.first()), target_arg(args.get(1)), args.get(2)) else {
+        eprintln!("사용법: --bench-compare <포트나 주소 A> <포트나 주소 B> <폴더>");
         return 2;
     };
     let cfg = Config::load(&crate::config::data_dir());
@@ -339,8 +348,8 @@ pub fn bench_compare(args: &[String]) -> i32 {
         .map(|c| EmbedInput::Text(crate::embed::prompt::document("bench", &c)))
         .collect();
     println!("입력: 텍스트 {}개, 이미지 {}개, 영상 30초 구간 {}개", texts.len(), images.len(), videos.len());
-    for (label, port) in [("A", pa), ("B", pb)] {
-        let c = EmbedClient::new(port);
+    for (label, target) in [("A", pa), ("B", pb)] {
+        let c = EmbedClient::new(&target);
         // 한 번 데워 둔다
         let _ = c.embed(&texts[..1.min(texts.len())]);
         let t = Instant::now();
@@ -360,7 +369,7 @@ pub fn bench_compare(args: &[String]) -> i32 {
         let tv = t.elapsed();
         let per = |d: Duration, n: usize| d.as_secs_f64() * 1000.0 / n.max(1) as f64;
         println!(
-            "{label} (포트 {port}): 텍스트 {:.1}ms/개 · 이미지 {:.1}ms/장 · 영상 구간 {:.0}ms/개",
+            "{label} ({target}): 텍스트 {:.1}ms/개 · 이미지 {:.1}ms/장 · 영상 구간 {:.0}ms/개",
             per(tt, texts.len()),
             per(ti, images.len()),
             per(tv, videos.len())
@@ -374,8 +383,8 @@ pub fn bench_compare(args: &[String]) -> i32 {
 pub fn compat(args: &[String]) -> i32 {
     use crate::embed::client::EmbedClient;
     use crate::index::compat::{check, Budget};
-    let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
-        eprintln!("사용법: --compat <포트> [이름 텍스트 이미지 영상 오디오]");
+    let Some(target) = target_arg(args.first()) else {
+        eprintln!("사용법: --compat <포트나 주소> [이름 텍스트 이미지 영상 오디오]");
         return 2;
     };
     let n = |i: usize, d: usize| args.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
@@ -396,7 +405,7 @@ pub fn compat(args: &[String]) -> i32 {
             return 1;
         }
     };
-    match check(&db, &cfg, &EmbedClient::new(port), budget) {
+    match check(&db, &cfg, &EmbedClient::new(&target), budget) {
         Ok(r) => {
             for s in &r.stats {
                 println!(
@@ -419,11 +428,8 @@ pub fn compat(args: &[String]) -> i32 {
 pub fn compare_queries(args: &[String]) -> i32 {
     use crate::embed::client::{EmbedClient, EmbedInput};
     use crate::search::store::Section;
-    let (Some(pa), Some(pb)) = (
-        args.first().and_then(|s| s.parse::<u16>().ok()),
-        args.get(1).and_then(|s| s.parse::<u16>().ok()),
-    ) else {
-        eprintln!("사용법: --compare-queries <포트A> <포트B> <질의>...");
+    let (Some(pa), Some(pb)) = (target_arg(args.first()), target_arg(args.get(1))) else {
+        eprintln!("사용법: --compare-queries <포트나 주소 A> <포트나 주소 B> <질의>...");
         return 2;
     };
     let dir = crate::config::data_dir();
@@ -432,7 +438,7 @@ pub fn compare_queries(args: &[String]) -> i32 {
     let mut store = VectorStore::new(cfg.search_dim);
     store.fill_from_db(&db).expect("벡터 적재");
     println!("벡터 {}개 적재", store.live_chunks());
-    let (ca, cb) = (EmbedClient::new(pa), EmbedClient::new(pb));
+    let (ca, cb) = (EmbedClient::new(&pa), EmbedClient::new(&pb));
     let k = 10;
     let mut totals = [(0usize, 0usize); 5];
     let mut top1_same = [(0usize, 0usize); 5];
@@ -474,9 +480,9 @@ pub fn compare_queries(args: &[String]) -> i32 {
 
 /// 이미 떠 있는 서버(설정 포트)에 대해 클라이언트 왕복 시간 측정
 pub fn bench(file: &str) -> i32 {
-    use crate::embed::client::{EmbedClient, EmbedInput};
+    use crate::embed::client::{EmbedClient, EmbedInput, EmbedTarget};
     let cfg = Config::load(&crate::config::data_dir());
-    let client = EmbedClient::new(cfg.port);
+    let client = EmbedClient::new(&cfg.connect_target().unwrap_or_else(|_| EmbedTarget::local(cfg.port)));
     let text = std::fs::read_to_string(file).unwrap_or_default();
     let chunks: Vec<String> = crate::extract::text::chunk_text(&text, 1000, 150, 16)
         .into_iter()
@@ -571,7 +577,8 @@ pub fn run(args: &[String]) -> i32 {
     let params = |full: bool| IndexParams {
         cfg: cfg.clone(),
         caps: caps.clone(),
-        port: cfg.port,
+        target: server.target(),
+        server_sig: server.signature(&cfg),
         db_path: db_path.clone(),
         data_dir: data_dir.clone(),
         store: store.clone(),
@@ -696,7 +703,7 @@ pub fn run(args: &[String]) -> i32 {
         qs.push(QueryKind::Image(PathBuf::from(img.path())));
     }
     for q in qs {
-        let o = query::run(cfg.port, &store, &db, q, Filter::default(), 3, 0.0, cfg.ffmpeg());
+        let o = query::run(&server.target(), &store, &db, q, Filter::default(), 3, 0.0, cfg.ffmpeg());
         println!("\n질의 {} ({:.0}ms)", o.label, o.elapsed.as_secs_f32() * 1000.0);
         if let Some(e) = &o.error {
             println!("  오류: {e}");

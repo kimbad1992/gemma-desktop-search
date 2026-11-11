@@ -6,6 +6,7 @@
 //! - 오디오: `"input": [{"content":[{"type":"input_audio","input_audio":{"data":"<b64 wav>","format":"wav"}}]}]`
 //! 응답은 `data[i].index`로 순서를 맞춘다.
 
+pub use super::target::EmbedTarget;
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -101,15 +102,48 @@ struct TokResponse {
     tokens: Vec<Value>,
 }
 
+#[derive(Deserialize)]
+struct PropsResponse {
+    #[serde(default)]
+    build_info: String,
+    #[serde(default)]
+    model_path: String,
+    #[serde(default)]
+    total_slots: u32,
+    #[serde(default)]
+    default_generation_settings: Option<SlotSettings>,
+}
+
+#[derive(Deserialize)]
+struct SlotSettings {
+    #[serde(default)]
+    n_ctx: u32,
+}
+
+/// `GET /props`에서 쓰는 것
+#[derive(Debug, Clone, Default)]
+pub struct ServerProps {
+    /// llama.cpp 빌드 (예: b12201-a2b301831)
+    pub build: String,
+    /// 불러온 모델 파일 이름 (소문자)
+    pub model: String,
+    /// 슬롯 수 (-np)
+    pub slots: u32,
+    /// 슬롯 하나의 컨텍스트 (-c를 슬롯 수로 나눈 값)
+    pub slot_ctx: u32,
+}
+
 #[derive(Clone)]
 pub struct EmbedClient {
     agent: ureq::Agent,
     quick: ureq::Agent,
     base: String,
+    /// "Bearer <키>" (llama-server를 --api-key로 켠 경우)
+    auth: Option<String>,
 }
 
 impl EmbedClient {
-    pub fn new(port: u16) -> Self {
+    pub fn new(target: &EmbedTarget) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(300)))
             .http_status_as_error(false)
@@ -123,14 +157,55 @@ impl EmbedClient {
         Self {
             agent,
             quick,
-            base: format!("http://127.0.0.1:{port}"),
+            base: target.base.clone(),
+            auth: target.key.as_ref().map(|k| format!("Bearer {k}")),
+        }
+    }
+
+    fn get(&self, agent: &ureq::Agent, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+        let r = agent.get(&format!("{}{path}", self.base));
+        match &self.auth {
+            Some(a) => r.header("Authorization", a),
+            None => r,
+        }
+    }
+
+    fn post(&self, path: &str) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+        let r = self.agent.post(&format!("{}{path}", self.base));
+        match &self.auth {
+            Some(a) => r.header("Authorization", a),
+            None => r,
         }
     }
 
     /// GET /health 상태 코드 (200 준비, 503 로딩)
     pub fn health(&self) -> Result<u16, EmbedError> {
-        let resp = self.quick.get(&format!("{}/health", self.base)).call()?;
+        let resp = self.get(&self.quick, "/health").call()?;
         Ok(resp.status().as_u16())
+    }
+
+    /// GET /props: 빌드, 모델, 슬롯. 다른 곳의 서버를 쓸 때 인덱스에 기록할 서명과 입력 크기 확인에 쓴다.
+    /// 접속 키가 틀렸으면 401이 온다.
+    pub fn props(&self) -> Result<ServerProps, EmbedError> {
+        let mut resp = self.get(&self.quick, "/props").call()?;
+        let status = resp.status().as_u16();
+        if status != 200 {
+            let text = resp.body_mut().read_to_string().unwrap_or_default();
+            return Err(EmbedError::Server(format!("props HTTP {status}: {}", error_message(&text))));
+        }
+        let p: PropsResponse = resp.body_mut().read_json().map_err(|e| EmbedError::Invalid(e.to_string()))?;
+        let model = p
+            .model_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        Ok(ServerProps {
+            build: p.build_info,
+            model,
+            slots: p.total_slots,
+            slot_ctx: p.default_generation_settings.map(|s| s.n_ctx).unwrap_or(0),
+        })
     }
 
     /// 여러 입력을 한 요청으로 임베딩. 결과는 L2 정규화된 벡터, 입력 순서대로.
@@ -142,10 +217,7 @@ impl EmbedClient {
             "input": inputs.iter().map(EmbedInput::to_json).collect::<Vec<_>>(),
             "encoding_format": "float",
         });
-        let mut resp = self
-            .agent
-            .post(&format!("{}/v1/embeddings", self.base))
-            .send_json(&body)?;
+        let mut resp = self.post("/v1/embeddings").send_json(&body)?;
         let status = resp.status().as_u16();
         if status != 200 {
             let text = resp.body_mut().read_to_string().unwrap_or_default();
@@ -197,8 +269,7 @@ impl EmbedClient {
     /// POST /tokenize 로 토큰 수 확인
     pub fn count_tokens(&self, text: &str) -> Result<usize, EmbedError> {
         let mut resp = self
-            .agent
-            .post(&format!("{}/tokenize", self.base))
+            .post("/tokenize")
             .send_json(&json!({ "content": text, "add_special": true }))?;
         let status = resp.status().as_u16();
         if status != 200 {

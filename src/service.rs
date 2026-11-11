@@ -4,9 +4,11 @@
 //!
 //!   gemma-search serve [--bind 127.0.0.1:8787] [--token <토큰>] [--no-watch]
 //!                      [--root <폴더>]… [--llama <경로>] [--model <gguf>] [--mmproj <gguf>]
+//!                      [--embed-server <주소> [--embed-key <키>]]
 //!
 //! - 설정과 인덱스는 창이 있는 앱과 같은 데이터 폴더(`config.toml`, `index.db`)를 쓴다.
 //! - llama-server는 필요할 때(검색, 인덱싱) 켜고 한동안 쓰지 않으면 끈다 (설정의 `idle_stop_minutes`).
+//!   `--embed-server`로 다른 곳에서 떠 있는 llama-server를 정하면 켜지 않고 그 서버에 연결해서 쓴다.
 //! - 기본은 이 기기에서만 접속할 수 있다(127.0.0.1). 다른 PC에서 접속하게 하려면 `--bind 0.0.0.0:8787`로 열고,
 //!   그때는 토큰이 있어야 한다: 검색 결과로 파일 내용까지 내려받을 수 있기 때문이다.
 //! - 서버를 켜고 끄는 일과 인덱싱 시작은 메인 루프 한 스레드에서만 한다 (Linux에서 자식 프로세스는 자기를 만든
@@ -64,6 +66,10 @@ pub const USAGE: &str = "\
                                   (그때는 접속 토큰이 생기고, 페이지를 처음 열 때 묻는다)
       --token <토큰>              접속 토큰을 직접 정한다
       --no-watch                  폴더를 감시하지 않는다 (검색만)
+      --embed-server <주소>       이 기기에서 llama-server를 켜지 않고, 이미 떠 있는 서버에 임베딩을 맡긴다
+                                  (예: SSH 터널로 이은 다른 PC의 서버 http://127.0.0.1:18080).
+                                  같은 모델 파일과 llama.cpp 빌드로 띄운 서버여야 한다. 되돌리려면 local
+      --embed-key <키>            그 서버를 --api-key로 켰을 때의 키
 
   serve에 준 값은 설정 파일(data/config.toml)에 저장되므로 다음부터는 `gemma-search serve`만 쓰면 됩니다.
   데이터 폴더는 실행 파일 옆의 data 폴더이고, 환경 변수 GEMMA_SEARCH_DATA로 바꿀 수 있습니다.
@@ -183,6 +189,23 @@ pub fn serve(args: &[String]) -> i32 {
         cfg.service_token = t;
         changed = true;
     }
+    if let Some(s) = value("--embed-server") {
+        let s = s.trim();
+        if s.is_empty() || s.eq_ignore_ascii_case("local") {
+            cfg.embed_server.clear();
+            cfg.embed_server_key.clear();
+        } else if let Err(e) = crate::embed::target::EmbedTarget::parse(s, "") {
+            eprintln!("--embed-server: {e}");
+            return 2;
+        } else {
+            cfg.embed_server = s.to_string();
+        }
+        changed = true;
+    }
+    if let Some(k) = value("--embed-key") {
+        cfg.embed_server_key = k;
+        changed = true;
+    }
     let bind = if cfg.service_bind.trim().is_empty() {
         DEFAULT_BIND.to_string()
     } else {
@@ -203,6 +226,13 @@ pub fn serve(args: &[String]) -> i32 {
 
     println!("Gemma Search v{} 서비스", env!("CARGO_PKG_VERSION"));
     println!("데이터 폴더: {}", data_dir.display());
+    if let Some(Ok(t)) = cfg.external_server() {
+        println!("임베딩: 외부 llama-server {t} (이 기기에서는 llama-server를 켜지 않습니다)");
+        if !t.is_loopback() && t.base.starts_with("http://") {
+            // 파일 내용(글·그림·영상)이 그대로 오가므로, 집 밖에서는 터널이나 VPN 안으로 지나가게 한다
+            println!("  이 주소는 암호화되지 않은 http입니다. 같은 집 LAN이 아니면 SSH 터널이나 Tailscale로 이어 쓰세요.");
+        }
+    }
     for problem in problems(&cfg) {
         println!("⚠ {problem}");
     }
@@ -346,7 +376,12 @@ fn spawn_update_check(e: Arc<Engine>) {
 /// 시작할 때 알려 줄 빠진 준비물
 fn problems(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
-    if crate::server::resolve_binary(&cfg.llama_path).is_err() {
+    let external = cfg.external_server();
+    if let Some(Err(e)) = &external {
+        out.push(format!("외부 서버 주소(embed_server)가 올바르지 않습니다: {e}. --embed-server로 고치거나 local로 되돌리세요."));
+    }
+    // 외부 서버를 쓰면 이 기기의 llama.cpp는 필요 없다 (모델 파일은 인덱스에 남길 서명에 쓰므로 그대로 확인한다)
+    if external.is_none() && crate::server::resolve_binary(&cfg.llama_path).is_err() {
         out.push(format!(
             "llama.cpp를 찾을 수 없습니다 ({}). `gemma-search download`로 받거나 --llama <폴더>로 지정하세요.",
             cfg.llama_path
@@ -413,8 +448,12 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
         let state = e.server.state();
         if state != last_server {
             match &state {
-                ServerState::Ready => {
-                    log(format!("llama-server 준비됨 (포트 {})", e.server.port()));
+                ServerState::Ready | ServerState::External => {
+                    if state == ServerState::External {
+                        log(format!("외부 llama-server에 연결됨: {}", e.server.target()));
+                    } else {
+                        log(format!("llama-server 준비됨 (포트 {})", e.server.port()));
+                    }
                     // 켜졌으니 예전 실패는 잊는다 (status와 index --wait가 이것으로 "켜지 못하는 중"을 판단한다)
                     *e.start_error.lock() = None;
                 }
@@ -477,11 +516,16 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
             if last_start.is_none_or(|t| t.elapsed() > wait) {
                 last_start = Some(Instant::now());
                 retry = (retry * 2).min(RETRY_MAX);
-                log("llama-server를 켭니다");
-                match e.server.start(&e.cfg) {
-                    Ok(()) => our_server = true,
+                let external = e.cfg.external_server().is_some();
+                log(if external { "외부 llama-server에 연결합니다" } else { "llama-server를 켭니다" });
+                match e.server.bring_up(&e.cfg) {
+                    // 외부 서버는 우리가 켠 것이 아니므로 쓰지 않을 때 끄지 않는다
+                    Ok(()) => our_server = !external,
                     Err(err) => {
-                        log(format!("llama-server를 켜지 못했습니다: {err}"));
+                        log(format!(
+                            "{}: {err}",
+                            if external { "외부 llama-server에 연결하지 못했습니다" } else { "llama-server를 켜지 못했습니다" }
+                        ));
                         *e.start_error.lock() = Some((Instant::now(), err.to_string()));
                     }
                 }
@@ -498,11 +542,10 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
                     None => None,
                 };
                 if let Some((only, full_rebuild)) = job {
-                    let mut cfg = e.cfg.clone();
-                    cfg.port = e.server.port();
                     let started = indexer.start(IndexParams {
-                        port: cfg.port,
-                        cfg,
+                        cfg: e.cfg.clone(),
+                        target: e.server.target(),
+                        server_sig: e.server.signature(&e.cfg),
                         caps,
                         db_path: e.db_path.clone(),
                         data_dir: e.data_dir.clone(),
@@ -827,6 +870,8 @@ fn status(e: &Engine) -> Value {
             "state": state.label(),
             "ready": state.is_ready(),
             "error": match &state { ServerState::Failed(m) => Some(m.clone()), _ => None },
+            // 다른 곳의 llama-server를 쓰면 그 주소 (이 기기에서 켜면 null)
+            "external": e.cfg.external_server().and_then(|t| t.ok()).map(|t| t.to_string()),
             // 서버를 마지막으로 켜지 못한 까닭 (경로가 틀려 아예 띄우지 못하면 상태는 "중지됨"으로 남는다)
             "start_error": e.start_error.lock().as_ref().map(|(at, why)| json!({
                 "message": why,
@@ -892,7 +937,7 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
         folders: None,
     };
     let o = query::run(
-        e.server.port(),
+        &e.server.target(),
         &e.store,
         &e.db,
         QueryKind::Text(q.clone()),
