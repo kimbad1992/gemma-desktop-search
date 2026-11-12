@@ -14,6 +14,7 @@ mod embed;
 mod extract;
 mod headless;
 mod index;
+mod lend;
 #[cfg(feature = "gui")]
 mod open;
 mod paths;
@@ -70,6 +71,12 @@ fn command(args: &[String]) -> Option<i32> {
         "status" => cli::status(rest),
         "index" => cli::index(rest),
         "rescan" => cli::rescan(rest),
+        // 계산 빌려주기: 다른 기기의 서비스가 인덱싱할 때 이 기기로 임베딩을 나눠 맡는다 (lend.rs).
+        // 창 있는 빌드에서는 콘솔이 없으므로 앱(트레이)에서 빌려주고 진행을 오버레이에 보인다 (ui/lend.rs).
+        // `--console`을 주면 창 있는 빌드에서도 콘솔 방식으로 돈다 (출력을 파일로 받을 때)
+        #[cfg(feature = "gui")]
+        "lend" if !rest.iter().any(|a| a == "--console") => return gui_lend(rest),
+        "lend" => lend::lend(rest),
         "help" | "--help" | "-h" => {
             println!("Gemma Search v{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE);
             #[cfg(not(feature = "gui"))]
@@ -100,6 +107,37 @@ const USAGE: &str = "\
   gemma-search --index-once       바뀐 파일을 한 번 인덱싱하고 끝낸다
                                   (서비스가 떠 있을 때는 `gemma-search index`)";
 
+/// 창 있는 빌드의 `lend`: 주소·토큰을 설정에 저장하고 앱을 빌려주기로 시작한다 (None이면 이어서 앱을 띄운다).
+/// 앱이 이미 떠 있으면 그 앱에 알린다 (`shell::already_running`).
+#[cfg(feature = "gui")]
+fn gui_lend(args: &[String]) -> Option<i32> {
+    let data_dir = config::data_dir();
+    let mut cfg = config::Config::load(&data_dir);
+    if let Some((base, token, _name)) = lend::params_from_args(args, &cfg) {
+        cfg.lend_server = base;
+        if let Some(t) = token {
+            cfg.lend_token = t;
+        }
+        if let Err(e) = cfg.save(&data_dir) {
+            rfd::MessageDialog::new()
+                .set_title("Gemma Search")
+                .set_description(format!("설정을 저장하지 못했습니다: {e}"))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+            return Some(1);
+        }
+    } else if cfg.lend_server.trim().is_empty() {
+        rfd::MessageDialog::new()
+            .set_title("Gemma Search")
+            .set_description(format!("소유 기기 서비스의 주소가 필요합니다.\n\n{}", lend::USAGE))
+            .set_level(rfd::MessageLevel::Warning)
+            .show();
+        return Some(2);
+    }
+    app::LEND_ON_START.store(true, std::sync::atomic::Ordering::SeqCst);
+    None
+}
+
 /// 창이 있는 앱
 #[cfg(feature = "gui")]
 fn gui(args: &[String]) -> eframe::Result {
@@ -107,7 +145,8 @@ fn gui(args: &[String]) -> eframe::Result {
     // 화면 확인용 --shot <png>: 창을 화면에 띄우지 않고 그려서 PNG로 저장하고 끝낸다 (app::Shot)
     let shot = args.iter().any(|a| a == "--shot");
     // 이미 실행 중이면 그 창을 띄우고 끝낸다 (로그인 시 자동 실행 + 직접 실행이 겹쳐도 하나만)
-    if !shot && shell::already_running(&config::data_dir()) {
+    let lend_on_start = app::LEND_ON_START.load(std::sync::atomic::Ordering::SeqCst);
+    if !shot && shell::already_running(&config::data_dir(), lend_on_start) {
         return Ok(());
     }
     // 서비스(gemma-search serve)가 이 데이터 폴더를 쓰는 중이면 띄우지 않는다: 인덱스를 둘이 함께 고치면 안 된다

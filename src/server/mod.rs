@@ -6,7 +6,7 @@
 pub mod job;
 
 use crate::config::Config;
-use crate::embed::client::{EmbedClient, EmbedError, EmbedTarget};
+use crate::embed::client::{EmbedClient, EmbedError, EmbedTarget, ServerProps};
 use crate::embed::selftest::{self, Capabilities};
 use anyhow::{bail, Context, Result};
 use parking_lot::Mutex;
@@ -68,8 +68,8 @@ pub struct Shared {
     pub port: u16,
     /// 임베딩을 맡기는 곳: 앱이 켠 서버면 이 기기의 포트, 외부 서버면 그 주소
     pub target: EmbedTarget,
-    /// 외부 서버의 llama.cpp 빌드와 모델 (인덱스에 기록하는 서버 서명)
-    external_sig: String,
+    /// 서버가 `/props`로 알려 준 빌드·모델·슬롯 (준비된 뒤 읽는다). 인덱스에 기록하는 서버 서명의 바탕.
+    props: Option<ServerProps>,
     pub command_line: String,
     pub selftest: SelfTest,
     /// start/stop 할 때마다 증가 — 이전 감시 스레드가 스스로 종료하도록
@@ -96,7 +96,7 @@ impl Default for ServerManager {
                 ready_at: None,
                 port: 0,
                 target: EmbedTarget::local(0),
-                external_sig: String::new(),
+                props: None,
                 command_line: String::new(),
                 selftest: SelfTest::NotRun,
                 generation: 0,
@@ -233,14 +233,22 @@ impl ServerManager {
         }
     }
 
-    /// 인덱스에 기록할 llama.cpp 서명. 외부 서버면 그 서버가 알려 준 빌드와 모델, 아니면 이 기기의 실행 파일.
+    /// 인덱스에 기록할 llama.cpp 서명: 서버가 알려 준 빌드와 모델 (`ServerProps::signature`).
+    /// 이 기기 서버든 외부 서버든 같은 모양이라, 둘을 오가거나 빌려주는 기기와 섞어도 서명이 같다.
+    /// `/props`를 읽지 못한 예전 빌드의 서버면 이 기기 실행 파일의 크기로 대신한다.
     pub fn signature(&self, cfg: &Config) -> String {
         let s = self.shared.lock();
-        if s.state == ServerState::External {
-            s.external_sig.clone()
-        } else {
-            cfg.server_signature()
+        match &s.props {
+            Some(p) if !p.build.is_empty() => p.signature(),
+            Some(p) if s.state == ServerState::External => p.signature(),
+            None if s.state == ServerState::External => "llama:?|?".to_string(),
+            _ => cfg.server_signature(),
         }
+    }
+
+    /// 서버가 알려 준 빌드·모델·슬롯 (준비되기 전이나 알 수 없으면 None)
+    pub fn props(&self) -> Option<ServerProps> {
+        self.shared.lock().props.clone()
     }
 
     /// 쓸 수 있게 한다: 설정에 외부 서버(`embed_server`)가 있으면 그 서버에 연결하고, 없으면 이 기기에서 켠다.
@@ -366,6 +374,7 @@ impl ServerManager {
             s.ready_at = None;
             s.port = cfg.port;
             s.target = EmbedTarget::local(cfg.port);
+            s.props = None;
             s.command_line = command_line;
             s.selftest = SelfTest::NotRun;
             s.has_mmproj = cfg.has_mmproj();
@@ -391,7 +400,7 @@ impl ServerManager {
             Err(e) => bail!("{}에 연결할 수 없습니다: {e}", target.base),
         }
         // /health는 접속 키 없이도 답하므로, 키가 맞는지와 빌드·모델은 /props로 확인한다
-        let sig = match client.props() {
+        let props = match client.props() {
             Ok(p) => {
                 // 이 기기 설정으로 자른 입력(글 조각·영상 구간)이 그 서버의 슬롯에 들어가야 한다
                 let want = cfg.max_input_tokens() as u32;
@@ -403,20 +412,17 @@ impl ServerManager {
                         p.slot_ctx
                     ));
                 }
-                format!(
-                    "external:{}|{}",
-                    if p.build.is_empty() { "?" } else { &p.build },
-                    if p.model.is_empty() { "?" } else { &p.model }
-                )
+                Some(p)
             }
             Err(EmbedError::Server(m)) if m.contains("HTTP 401") => {
                 bail!("{}의 서버가 접속 키를 받지 않습니다. 설정의 embed_server_key를 확인하세요", target.base)
             }
             Err(e) => {
                 self.log(format!("[앱] 외부 서버의 빌드를 알 수 없습니다 ({e})"));
-                "external:?".to_string()
+                None
             }
         };
+        let sig = props.as_ref().map(ServerProps::signature).unwrap_or_else(|| "llama:?|?".to_string());
         let gen = {
             let mut s = self.shared.lock();
             s.generation += 1;
@@ -426,7 +432,7 @@ impl ServerManager {
             s.ready_at = Some(Instant::now());
             s.port = 0;
             s.command_line = format!("(외부 서버) {target}");
-            s.external_sig = sig.clone();
+            s.props = props;
             s.target = target;
             s.selftest = SelfTest::NotRun;
             s.has_mmproj = true; // 외부 서버는 mmproj 여부를 알 수 없으니 진단으로 판별
@@ -479,6 +485,14 @@ impl ServerManager {
         let me = self.clone();
         std::thread::spawn(move || {
             let client = EmbedClient::new(&target);
+            // 빌드·모델·슬롯: 자가진단보다 먼저 읽어 둔다 (인덱싱은 자가진단이 끝난 뒤에 시작하므로 그때는 서명이 있다)
+            match client.props() {
+                Ok(p) => {
+                    me.log(format!("[앱] 서버: {} · 슬롯 {}개 × 컨텍스트 {}", p.signature(), p.slots, p.slot_ctx));
+                    me.shared.lock().props = Some(p);
+                }
+                Err(e) => me.log(format!("[앱] 서버의 빌드를 읽지 못했습니다 (/props): {e}")),
+            }
             let caps = selftest::run(&client, has_mmproj);
             me.log(format!(
                 "[앱] 자가진단 ({}ms): 텍스트 {:?} / 이미지 {:?} / 오디오 {:?}",

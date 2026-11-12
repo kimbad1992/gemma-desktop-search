@@ -109,6 +109,10 @@ pub struct Config {
     pub service_bind: String,
     /// 서비스판의 접속 토큰. 다른 기기에서 접속하게 열면 있어야 하고, 비어 있으면 그때 만든다.
     pub service_token: String,
+    /// 계산 빌려주기(창 있는 앱): 일감을 가져올 소유 기기 서비스의 주소 (예: `http://192.168.0.100:8787`)
+    pub lend_server: String,
+    /// 그 서비스의 접속 토큰 (그 기기 설정의 service_token)
+    pub lend_token: String,
 }
 
 impl Default for Config {
@@ -211,6 +215,8 @@ impl Default for Config {
             watch_rescan_hours: 6,
             service_bind: "127.0.0.1:8787".into(),
             service_token: String::new(),
+            lend_server: String::new(),
+            lend_token: String::new(),
         }
     }
 }

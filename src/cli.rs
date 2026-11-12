@@ -155,12 +155,12 @@ struct Client {
     agent: ureq::Agent,
 }
 
-fn env(name: &str) -> Option<String> {
+pub(crate) fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// "주소:포트", "http://주소:포트/" → "http://주소:포트"
-fn base_url(given: &str) -> String {
+pub(crate) fn base_url(given: &str) -> String {
     let g = given.trim().trim_end_matches('/');
     if g.contains("://") {
         g.to_string()
@@ -170,13 +170,13 @@ fn base_url(given: &str) -> String {
 }
 
 /// 주소가 이 기기를 가리키는지 ("http://127.0.0.1:8787", "localhost:8787" 등)
-fn is_local(base: &str) -> bool {
+pub(crate) fn is_local(base: &str) -> bool {
     let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
     bind_is_loopback(rest.split('/').next().unwrap_or(rest))
 }
 
 /// 보낼 토큰: --token, 환경 변수, 그다음 설정 파일의 토큰. 설정 파일의 것은 이 기기의 서비스에 물을 때만 쓴다.
-fn pick_token(flag: Option<&str>, env: Option<&str>, saved: &str, local: bool) -> Option<String> {
+pub(crate) fn pick_token(flag: Option<&str>, env: Option<&str>, saved: &str, local: bool) -> Option<String> {
     flag.or(env)
         .map(str::trim)
         .filter(|t| !t.is_empty())
@@ -245,6 +245,45 @@ impl Client {
         }
         Ok(v)
     }
+}
+
+/// 계산 빌려주기: 처리 몫과 빌려주는 기기 (빌려주는 기기를 쓴 적이 없으면 아무것도 없다)
+fn lend_lines(l: &Value) -> Vec<String> {
+    let lenders = l["lenders"].as_array().cloned().unwrap_or_default();
+    let share = l["share"].as_array().cloned().unwrap_or_default();
+    if lenders.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if !share.is_empty() {
+        let parts: Vec<String> = share
+            .iter()
+            .map(|s| format!("{} {}%", s["name"].as_str().unwrap_or("?"), s["percent"].as_f64().unwrap_or(0.0)))
+            .collect();
+        out.push(format!(
+            "계산{}: {}",
+            if l["active"] == true { "" } else { " (마지막 인덱싱)" },
+            parts.join(" · ")
+        ));
+    }
+    for d in &lenders {
+        let ago = d["last_seen_secs"].as_u64().unwrap_or(0);
+        let mut s = format!(
+            "  빌려주는 기기 {}: 일감 {}개 · 입력 {}개 · {}",
+            d["name"].as_str().unwrap_or("?"),
+            num(&d["jobs"]),
+            num(&d["inputs"]),
+            if ago < 60 { "연결됨".to_string() } else { format!("{} 전에 마지막으로 연결", human_secs(ago)) }
+        );
+        if d["failures"].as_u64().unwrap_or(0) > 0 {
+            s += &format!(" · 다시 맡긴 일감 {}개", num(&d["failures"]));
+        }
+        if let Some(why) = d["rejected"].as_str() {
+            s += &format!("\n    맡길 수 없음: {why}");
+        }
+        out.push(s);
+    }
+    out
 }
 
 fn print_json(v: &Value) {
@@ -492,6 +531,9 @@ fn status_text(base: &str, v: &Value) -> String {
     line(format!("인덱싱: {}", indexing_line(ix)));
     if let Some(err) = ix["start_error"].as_str() {
         line(format!("  마지막 요청을 시작하지 못했습니다: {err}"));
+    }
+    for l in lend_lines(&v["lend"]) {
+        line(l);
     }
     let w = &v["watch"];
     if w["enabled"] == true {

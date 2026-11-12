@@ -169,9 +169,12 @@ pub(crate) fn waker(ctx: &egui::Context) -> crate::util::Waker {
     Arc::new(move || ctx.request_repaint())
 }
 
-/// 창 없이 시작하는지: 트레이로 시작(`--background`)하거나 화면 확인용(`--shot`)
+/// `gemma-search.exe lend …`로 실행됨: 트레이로 시작해 바로 계산 빌려주기를 한다 (main.rs의 gui_lend)
+pub static LEND_ON_START: AtomicBool = AtomicBool::new(false);
+
+/// 창 없이 시작하는지: 트레이로 시작(`--background`), 화면 확인용(`--shot`), 계산 빌려주기(`lend`)
 fn starts_hidden() -> bool {
-    std::env::args().any(|a| a == "--background" || a == "--shot")
+    std::env::args().any(|a| a == "--background" || a == "--shot") || LEND_ON_START.load(Ordering::SeqCst)
 }
 
 /// 검색 폴더 목록의 한 줄 (지금 대상 폴더 + 예전에 인덱싱한 폴더)
@@ -295,7 +298,7 @@ pub struct GemmaApp {
     /// 검색·인덱싱 때문에 앱이 켠 서버 (유휴 시 자동 종료 대상)
     server_on_demand: bool,
     /// 마지막 검색·인덱싱 시각
-    last_activity: Instant,
+    pub(crate) last_activity: Instant,
     /// 새 버전 (태그, 릴리스 주소)
     pub update_available: Option<(String, String)>,
     /// 준비물 받기 진행 상태
@@ -323,6 +326,12 @@ pub struct GemmaApp {
     pub overlay_rx: Receiver<crate::ui::overlay::OverlayAction>,
     /// 전체 화면 상태 확인 결과 (확인 시각, 바쁨)
     pub overlay_busy_cache: Mutex<(Option<Instant>, bool)>,
+    /// 계산 빌려주기 (ui/lend.rs): 돌고 있는 세션 / 실패로 끝난 마지막 세션의 상태(닫기 전까지) /
+    /// 세션이 서버를 켜 달라고 함 / 이번 세션 동안 오버레이 숨김
+    pub lend: Option<crate::lend::LendSession>,
+    pub lend_last: Option<Arc<Mutex<crate::lend::LendStatus>>>,
+    pub lend_want_server: Arc<AtomicBool>,
+    pub lend_overlay_dismissed: bool,
     /// 첫 실행 마법사
     pub setup_open: bool,
     pub setup: crate::ui::setup::SetupState,
@@ -457,6 +466,10 @@ impl GemmaApp {
             overlay_tx,
             overlay_rx,
             overlay_busy_cache: Mutex::new((None, false)),
+            lend: None,
+            lend_last: None,
+            lend_want_server: Arc::new(AtomicBool::new(false)),
+            lend_overlay_dismissed: false,
             new_root: String::new(),
             notice: None,
             confirm_rebuild: false,
@@ -560,6 +573,16 @@ impl GemmaApp {
         };
         app.auto_index = flag("--index") || app.cfg.index_on_start;
         app.auto_query = value("--query");
+        // gemma-search.exe lend …: 설정에 저장된 주소로 바로 빌려주기
+        if LEND_ON_START.load(Ordering::SeqCst) {
+            if let Err(e) = app.start_lending(&cc.egui_ctx) {
+                app.notify(e, true);
+            }
+        }
+        // 화면 확인용: 빌려주는 중인 것처럼 (오버레이·설정 화면)
+        if flag("--lend-demo") {
+            app.lend_last = Some(Arc::new(Mutex::new(crate::ui::lend::demo_status())));
+        }
         if app.cfg.auto_start_server || flag("--start-server") {
             app.start_server_manual();
         } else if app.auto_index || app.auto_query.is_some() {
@@ -949,7 +972,7 @@ impl GemmaApp {
         }
     }
 
-    fn show_window(&mut self, ctx: &egui::Context) {
+    pub(crate) fn show_window(&mut self, ctx: &egui::Context) {
         // 빠른 검색창 모양인 채로 숨겨 둔 창이면, 보이기 전에 큰 창 모양으로 되돌린다
         let mut maximize = false;
         if self.quick.is_none() {
@@ -1113,6 +1136,9 @@ impl GemmaApp {
                         self.start_server_manual();
                     }
                 }
+                ShellEvent::ToggleLend => self.toggle_lending(ctx),
+                ShellEvent::StartLend => self.start_lending_from_command(ctx),
+                ShellEvent::ShowLendOverlay => self.lend_overlay_dismissed = false,
                 ShellEvent::Quit => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1239,7 +1265,9 @@ impl GemmaApp {
 
     /// 트레이 아이콘·툴팁·메뉴 상태
     fn update_tray(&mut self) {
-        let Some(shell) = &self.shell else { return };
+        if self.shell.is_none() {
+            return;
+        }
         let (state, frac, scanning, discovered) = {
             let p = self.indexer.progress.lock();
             (p.state, p.fraction(), p.scanning, p.discovered)
@@ -1258,17 +1286,23 @@ impl GemmaApp {
                 format!("Gemma Search · 인덱싱 {:.0}%", frac.unwrap_or(0.0) * 100.0),
             ),
             RunState::Paused => (TrayIcon::Paused, Some(true), "Gemma Search · 인덱싱 일시정지".to_string()),
-            _ => (
-                TrayIcon::Idle,
-                None,
-                format!(
-                    "Gemma Search · 파일 {}개 · 서버 {}",
-                    fmt_num(files as u64),
-                    if server.is_ready() { "준비됨" } else if server.is_running() { "시작 중" } else { "꺼짐" }
+            _ => match self.lend_tray_tip() {
+                // 빌려주는 중이면 그것을 알린다
+                Some(tip) => (TrayIcon::Busy, None, tip),
+                None => (
+                    TrayIcon::Idle,
+                    None,
+                    format!(
+                        "Gemma Search · 파일 {}개 · 서버 {}",
+                        fmt_num(files as u64),
+                        if server.is_ready() { "준비됨" } else if server.is_running() { "시작 중" } else { "꺼짐" }
+                    ),
                 ),
-            ),
+            },
         };
-        shell.update(tip, icon, indexing, server.is_running());
+        let lending = self.lend.as_ref().map(|s| s.is_paused());
+        let Some(shell) = &self.shell else { return };
+        shell.update(tip, icon, indexing, server.is_running(), lending, self.lend_overlay_dismissed);
     }
 
     /// 앱이 켠 서버를 오래 쓰지 않으면 끈다 (VRAM 반환)
@@ -1523,6 +1557,7 @@ impl GemmaApp {
             store: self.store.clone(),
             full_rebuild,
             only,
+            lend: None,
         };
         self.indexer.start(params).map_err(|e| format!("인덱싱 시작 실패: {e}"))
     }
@@ -1849,6 +1884,7 @@ impl GemmaApp {
 
         // 트레이·단축키, 기다리던 검색, 유휴 서버, 빠른 검색창
         self.handle_shell(ctx);
+        self.lend_logic();
         self.run_pending_search();
         self.idle_stop();
         self.update_tray();
@@ -2461,7 +2497,10 @@ impl eframe::App for GemmaApp {
         use crate::ui::theme;
         let p = theme::palette(ui.visuals());
         if self.shot.as_ref().is_some_and(|s| s.overlay) {
-            crate::ui::overlay::overlay_ui(ui, &self.indexer.progress, &self.overlay_tx);
+            // 화면 확인용: --lend-demo면 빌려주기 칸, --shot-indexing이면 인덱싱 칸도
+            let lend = self.lend_status_arc();
+            let progress = (self.indexer.is_active() || lend.is_none()).then(|| self.indexer.progress.clone());
+            crate::ui::overlay::overlay_ui(ui, progress.as_ref(), lend.as_ref(), &self.overlay_tx);
             return;
         }
         self.sync_titlebar(ui.visuals().dark_mode);

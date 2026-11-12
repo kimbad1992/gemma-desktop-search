@@ -18,6 +18,7 @@ use crate::config::Config;
 use crate::extract::{Kind, Modality};
 use crate::index::db::Db;
 use crate::index::indexer::{IndexParams, Indexer};
+use crate::index::lend::{JobResult, LendHub, LenderInfo};
 use crate::index::progress::{Progress, RunState};
 use crate::search::keyword;
 use crate::search::query::{self, HitView, QueryKind};
@@ -39,8 +40,9 @@ const PAGE: &str = include_str!("../assets/web/index.html");
 pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8787";
 /// 검색이 서버가 준비되기를 기다리는 최대 시간
 pub(crate) const SERVER_WAIT: Duration = Duration::from_secs(120);
-/// 요청을 받는 스레드 수. 영상을 보내는 동안에는 그 스레드가 묶이므로 넉넉히 둔다.
-const HTTP_WORKERS: usize = 8;
+/// 요청을 받는 스레드 수. 영상을 보내는 동안과, 빌려주는 기기가 일감을 기다리는 동안(`/api/lend/claim`)에는
+/// 그 스레드가 묶이므로 넉넉히 둔다.
+const HTTP_WORKERS: usize = 16;
 /// 서버를 켜지 못했을 때 다시 해 보는 간격: 실패할수록 늘린다. 검색이 기다리는 중이면 짧게.
 const RETRY_MIN: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(600);
@@ -93,6 +95,15 @@ pub const USAGE: &str = "\
       --token <토큰>              접속 토큰 (환경 변수 GEMMA_SEARCH_TOKEN). 주소를 주지 않았거나
                                   이 기기의 주소면 설정 파일의 토큰을 쓴다
 
+계산 빌려주기:
+  gemma-search lend --server <http://주소:포트>
+                                  다른 기기의 서비스가 인덱싱할 때 이 기기의 그래픽으로 임베딩을 나눠 맡는다.
+                                  이 기기는 나가는 접속만 한다(포트를 열지 않는다). Ctrl+C로 끝낸다
+      --token <토큰>              그 서비스의 접속 토큰 (환경 변수 GEMMA_SEARCH_TOKEN)
+      --name <이름>               그 서비스의 status에 보일 이 기기의 이름 (기본: 컴퓨터 이름)
+  서비스 쪽은 빌려주는 기기가 닿을 수 있게 열어 둔다(--bind 0.0.0.0:8787과 토큰, 또는 SSH 터널).
+  같은 llama.cpp 빌드와 모델 파일로 띄운 서버끼리만 일감을 주고받는다.
+
 업데이트:
   gemma-search update             새 버전이 있으면 받아서 실행 파일을 바꾼다 (관리자 권한 필요 없음)
       --check                     확인만 한다
@@ -127,6 +138,8 @@ struct Engine {
     index_error: Mutex<Option<String>>,
     /// 새 버전: (태그, 릴리스 페이지). 하루 한 번 확인한다 (설정의 check_updates).
     update_available: Mutex<Option<(String, String)>>,
+    /// 계산 빌려주기: 인덱싱하는 동안 빌려주는 기기에 일감을 맡긴다 (`/api/lend/*`)
+    lend: Arc<LendHub>,
     stop: Arc<AtomicBool>,
 }
 
@@ -293,6 +306,7 @@ pub fn serve(args: &[String]) -> i32 {
         index_runs: AtomicU64::new(0),
         index_error: Mutex::new(None),
         update_available: Mutex::new(None),
+        lend: Arc::new(LendHub::default()),
         stop: stop.clone(),
         cfg,
     });
@@ -552,6 +566,7 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
                         store: e.store.clone(),
                         full_rebuild,
                         only: only.clone(),
+                        lend: Some(e.lend.clone()),
                     });
                     let requested = only.is_none();
                     {
@@ -779,6 +794,8 @@ fn handle(e: &Engine, req: Request) {
             }
             respond_json(req, 200, json!({ "ok": e.watcher.is_some() }));
         }
+        Method::Post if path == "/api/lend/claim" => lend_claim(e, req),
+        Method::Post if path == "/api/lend/result" => lend_result(e, req),
         Method::Get if path.starts_with("/api/thumb/") => match id_after("/api/thumb/") {
             Some(id) => serve_thumb(e, req, id),
             None => respond_error(req, 404, "없는 주소입니다"),
@@ -789,6 +806,89 @@ fn handle(e: &Engine, req: Request) {
         },
         _ => respond_error(req, 404, "없는 주소입니다"),
     }
+}
+
+// ── 계산 빌려주기 (빌려주는 기기가 부른다) ──
+
+/// 요청 본문을 읽는다 (`limit` 바이트까지)
+fn read_body(req: &mut Request, limit: usize) -> Result<String, String> {
+    if req.body_length().is_some_and(|n| n > limit) {
+        return Err("요청이 너무 큽니다".to_string());
+    }
+    let mut s = String::new();
+    req.as_reader()
+        .take(limit as u64 + 1)
+        .read_to_string(&mut s)
+        .map_err(|e| format!("요청을 읽지 못했습니다: {e}"))?;
+    if s.len() > limit {
+        return Err("요청이 너무 큽니다".to_string());
+    }
+    Ok(s)
+}
+
+/// 일감을 달라는 요청: `{"lender": {...}, "want": 8, "wait_ms": 15000}` →
+/// `{"jobs": [...], "pending": n, "state": "indexing"}`. 맡길 수 없는 기기면 409와 까닭.
+fn lend_claim(e: &Engine, mut req: Request) {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        lender: LenderInfo,
+        #[serde(default)]
+        want: usize,
+        #[serde(default)]
+        wait_ms: u64,
+    }
+    let body = match read_body(&mut req, 64 * 1024) {
+        Ok(b) => b,
+        Err(m) => return respond_error(req, 400, &m),
+    };
+    let b: Body = match serde_json::from_str(&body) {
+        Ok(b) => b,
+        Err(err) => return respond_error(req, 400, &format!("요청을 읽지 못했습니다: {err}")),
+    };
+    let r = e.lend.claim(&b.lender, b.want.min(64), Duration::from_millis(b.wait_ms));
+    if let Some(why) = r.rejected {
+        return respond_error(req, 409, &why);
+    }
+    if !r.jobs.is_empty() {
+        *e.activity.lock() = Instant::now();
+    }
+    respond_json(req, 200, json!({ "jobs": r.jobs, "pending": r.pending, "state": r.state }))
+}
+
+/// 결과: `{"lender": "<이름표>", "id": n, "results": [{"v": [...]}, {"e": "..."}]}`,
+/// 처리하지 못했으면 `{"lender", "id", "error": "..."}` (다시 맡긴다) → `{"accepted": bool}`
+fn lend_result(e: &Engine, mut req: Request) {
+    #[derive(serde::Deserialize)]
+    struct Body {
+        lender: String,
+        id: u64,
+        #[serde(default)]
+        results: Option<Vec<JobResult>>,
+        #[serde(default)]
+        error: Option<String>,
+        /// 시작하지 않은 일감을 돌려줌 (일시정지 등): 실패로 세지 않는다
+        #[serde(default)]
+        give_back: bool,
+    }
+    let body = match read_body(&mut req, 64 * 1024 * 1024) {
+        Ok(b) => b,
+        Err(m) => return respond_error(req, 400, &m),
+    };
+    let b: Body = match serde_json::from_str(&body) {
+        Ok(b) => b,
+        Err(err) => return respond_error(req, 400, &format!("결과를 읽지 못했습니다: {err}")),
+    };
+    if b.give_back {
+        let accepted = e.lend.give_back(&b.lender, b.id);
+        return respond_json(req, 200, json!({ "accepted": accepted }));
+    }
+    let outcome = match (b.results, b.error) {
+        (_, Some(err)) => Err(err),
+        (Some(r), None) => Ok(r),
+        (None, None) => Err("결과가 비었습니다".to_string()),
+    };
+    let accepted = e.lend.result(&b.lender, b.id, outcome);
+    respond_json(req, 200, json!({ "accepted": accepted }))
 }
 
 fn section_key(s: Section) -> &'static str {
@@ -902,6 +1002,8 @@ fn status(e: &Engine) -> Value {
         "watch": watch,
         "roots": e.cfg.roots,
         "min_relevance": rounded(e.cfg.min_relevance, 1),
+        // 계산 빌려주기: 처리 몫(이 기기·빌려주는 기기), 빌려주는 기기들
+        "lend": e.lend.status(),
     })
 }
 

@@ -25,7 +25,8 @@ pub enum EmbedInput {
 }
 
 impl EmbedInput {
-    fn to_json(&self) -> Value {
+    /// llama-server `/v1/embeddings`의 `input` 항목 하나 (빌려주는 기기에 일감을 보낼 때도 이 모양 그대로 보낸다)
+    pub fn to_json(&self) -> Value {
         let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
         match self {
             EmbedInput::Text(s) => Value::String(s.clone()),
@@ -133,6 +134,15 @@ pub struct ServerProps {
     pub slot_ctx: u32,
 }
 
+impl ServerProps {
+    /// 인덱스에 남기는 서버 서명: llama.cpp 빌드와 모델 파일. 같은 빌드면 CUDA·Vulkan처럼 백엔드가 달라도 같다.
+    /// 이 기기 서버, 외부 서버, 빌려주는 기기가 모두 이 모양을 쓰므로 서로 섞어 계산할 수 있다.
+    pub fn signature(&self) -> String {
+        let or_q = |s: &str| if s.is_empty() { "?".to_string() } else { s.to_string() };
+        format!("llama:{}|{}", or_q(&self.build), or_q(&self.model))
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbedClient {
     agent: ureq::Agent,
@@ -210,11 +220,18 @@ impl EmbedClient {
 
     /// 여러 입력을 한 요청으로 임베딩. 결과는 L2 정규화된 벡터, 입력 순서대로.
     pub fn embed(&self, inputs: &[EmbedInput]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let values: Vec<Value> = inputs.iter().map(EmbedInput::to_json).collect();
+        self.embed_values(&values)
+    }
+
+    /// `embed`와 같고, 입력을 이미 llama-server 모양(`EmbedInput::to_json`)으로 받는다.
+    /// 빌려주는 기기는 소유 기기가 보낸 이 모양을 그대로 자기 서버에 넘긴다.
+    pub fn embed_values(&self, inputs: &[Value]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
         let body = json!({
-            "input": inputs.iter().map(EmbedInput::to_json).collect::<Vec<_>>(),
+            "input": inputs,
             "encoding_format": "float",
         });
         let mut resp = self.post("/v1/embeddings").send_json(&body)?;

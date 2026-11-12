@@ -5,6 +5,7 @@
 
 use super::compat;
 use super::db::{self, ChunkRecord, Db, FileRecord, FileRow};
+use super::lend::{Gate, LendHub, Needs, RunSpec};
 use super::progress::{Progress, RunState};
 use super::queue::{LocalProvider, WorkQueue, WorkReply};
 use crate::config::Config;
@@ -51,6 +52,14 @@ impl Control {
     fn stopped(&self) -> bool {
         self.flag.load(Ordering::SeqCst) == STOP
     }
+    /// 기다리지 않고 지금 상태만 (빌려주는 기기에 일감을 맡길지 정할 때)
+    fn gate(&self) -> Gate {
+        match self.flag.load(Ordering::SeqCst) {
+            RUN => Gate::Go,
+            STOP => Gate::Stop,
+            _ => Gate::Pause,
+        }
+    }
     /// 일시정지 중이면 대기. 중지 요청이면 false.
     fn checkpoint(&self) -> bool {
         loop {
@@ -80,6 +89,8 @@ pub struct IndexParams {
     /// 바뀐 경로만 처리한다 (폴더 감시). 파일이면 그 파일, 폴더면 그 아래 전체, 없는 경로면 지워진 것으로 본다.
     /// None이면 대상 폴더 전체를 훑는다.
     pub only: Option<Vec<String>>,
+    /// 빌려주는 기기(`gemma-search lend`)에도 일감을 맡긴다 (서비스판). None이면 이 기기만 계산한다.
+    pub lend: Option<Arc<LendHub>>,
 }
 
 pub struct Indexer {
@@ -389,12 +400,33 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
         })?
     };
 
-    // 계산 제공자: 지금은 설정의 임베딩 대상 하나 (이 기기의 서버 또는 외부 서버). 슬롯 수만큼 동시에 보낸다.
+    // 빌려주는 기기도 같은 대기열에서 가져간다 (이 기기의 계산 제공자에 넘기기 전에 받는 쪽을 복사해 둔다)
+    let lend_rx = work_rx.clone();
+    // 계산 제공자: 설정의 임베딩 대상 (이 기기의 서버 또는 외부 서버). 슬롯 수만큼 동시에 보낸다.
     let provider = {
         let ctl = ctl.clone();
         let client = Arc::new(EmbedClient::new(&p.target));
         LocalProvider::start(queue, work_rx, client, slots, Arc::new(move || ctl.checkpoint()))?
     };
+    // 빌려주는 기기(④ lend): 서비스의 허브에 이 실행을 붙인다. 버리면(끝나면) 떨어진다.
+    let lend_attached = p.lend.as_ref().map(|hub| {
+        let ctl = ctl.clone();
+        let video = enabled[Kind::Video.idx()];
+        hub.attach(RunSpec {
+            queue: ctx.queue.clone(),
+            rx: lend_rx,
+            signature: server_sig.clone(),
+            max_input: ctx.max_tokens as u32,
+            needs: Needs {
+                // 영상을 프레임 그림으로 대신 처리하면 그림이 필요하다
+                image: enabled[Kind::Image.idx()] || (video && !video_native),
+                // 영상의 소리 트랙도 소리 인덱싱이 켜져 있을 때만 넣는다
+                audio: enabled[Kind::Audio.idx()],
+                video: video && video_native,
+            },
+            gate: Arc::new(move || ctl.gate()),
+        })
+    });
     // 일꾼은 파일을 추출해 일감을 넣고, 결과를 기다리지 않은 채 그 파일을 결과 모으기 쪽으로 넘긴다.
     // 넘기는 칸을 일꾼 수로 묶어, 메모리에 올라와 있는 파일 수에 한도를 둔다.
     let (pend_tx, pend_rx) = bounded::<PendingFile>(n_workers);
@@ -437,6 +469,7 @@ fn run_inner(p: &IndexParams, prog: &Arc<Mutex<Progress>>, ctl: &Arc<Control>) -
     for c in collectors {
         let _ = c.join();
     }
+    drop(lend_attached);
     drop(provider);
     let walk = walker.join().map_err(|_| anyhow!("탐색 스레드 오류"))?;
 

@@ -27,12 +27,16 @@ const WM_REFRESH: u32 = WM_APP + 2;
 /// 두 번째로 실행된 인스턴스가 보내는 "창을 보여줘"
 const WM_ACTIVATE_APP: u32 = WM_APP + 3;
 const WM_BALLOON: u32 = WM_APP + 4;
+/// 두 번째로 실행된 `gemma-search.exe lend …`가 보내는 "빌려주기를 시작해"
+const WM_LEND_START: u32 = WM_APP + 5;
 
 const ID_QUICK: usize = 100;
 const ID_OPEN: usize = 101;
 const ID_INDEX: usize = 102;
 const ID_SERVER: usize = 103;
 const ID_QUIT: usize = 104;
+const ID_LEND: usize = 105;
+const ID_LEND_SHOW: usize = 106;
 
 const HOTKEY_ID: i32 = 1;
 /// 실패한 등록(트레이 아이콘·단축키)을 다시 시도하는 타이머
@@ -51,6 +55,12 @@ pub enum ShellEvent {
     Open,
     ToggleIndex,
     ToggleServer,
+    /// 트레이 메뉴의 "계산 빌려주기"
+    ToggleLend,
+    /// 두 번째로 실행된 `lend` 명령: 설정에 저장된 주소로 빌려주기를 시작한다
+    StartLend,
+    /// 트레이 메뉴의 "빌려주기 상태 창 보이기" (오버레이를 숨겼을 때)
+    ShowLendOverlay,
     Quit,
     /// 트레이 아이콘·단축키 등록 상태가 바뀜 (`Shell::status`로 읽는다)
     Status,
@@ -128,6 +138,10 @@ pub struct TrayState {
     pub indexing: Option<bool>,
     pub server_running: bool,
     pub hotkey: bool,
+    /// None = 빌려주지 않음, Some(false) = 빌려주는 중, Some(true) = 일시정지
+    pub lending: Option<bool>,
+    /// 빌려주는 중인데 오른쪽 아래 상태 창을 숨겼다 (다시 보이기 메뉴를 둔다)
+    pub lend_hidden: bool,
 }
 
 struct Shared {
@@ -259,6 +273,10 @@ unsafe fn show_menu(hwnd: HWND) {
         },
     );
     item(ID_SERVER, if st.server_running { "서버 중지" } else { "서버 시작" });
+    item(ID_LEND, if st.lending.is_some() { "계산 빌려주기 끝내기" } else { "계산 빌려주기 시작" });
+    if st.lending.is_some() && st.lend_hidden {
+        item(ID_LEND_SHOW, "빌려주기 상태 창 보이기");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
     item(ID_QUIT, "종료");
     let mut pt = POINT { x: 0, y: 0 };
@@ -284,6 +302,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             ID_OPEN => send(ShellEvent::Open),
             ID_INDEX => send(ShellEvent::ToggleIndex),
             ID_SERVER => send(ShellEvent::ToggleServer),
+            ID_LEND => send(ShellEvent::ToggleLend),
+            ID_LEND_SHOW => send(ShellEvent::ShowLendOverlay),
             ID_QUIT => send(ShellEvent::Quit),
             _ => {}
         },
@@ -302,6 +322,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
         }
         WM_ACTIVATE_APP => send(ShellEvent::Open),
+        WM_LEND_START => send(ShellEvent::StartLend),
         WM_BALLOON => {
             if let Some(sh) = SHARED.get() {
                 let (title, text) = sh.balloon.lock().clone();
@@ -446,7 +467,15 @@ impl Shell {
     }
 
     /// 앱 상태를 트레이에 반영 (바뀌었을 때만 아이콘·툴팁 갱신)
-    pub fn update(&self, tip: String, icon: TrayIcon, indexing: Option<bool>, server_running: bool) {
+    pub fn update(
+        &self,
+        tip: String,
+        icon: TrayIcon,
+        indexing: Option<bool>,
+        server_running: bool,
+        lending: Option<bool>,
+        lend_hidden: bool,
+    ) {
         let changed = {
             let mut st = self.state.lock();
             let visual = st.tip != tip || st.icon != icon;
@@ -454,6 +483,8 @@ impl Shell {
             st.icon = icon;
             st.indexing = indexing;
             st.server_running = server_running;
+            st.lending = lending;
+            st.lend_hidden = lend_hidden;
             visual
         };
         if changed {
@@ -484,7 +515,8 @@ impl Drop for Shell {
 
 /// 같은 데이터 폴더로 이미 실행 중인 인스턴스가 있으면 그 창을 띄우라고 알리고 true.
 /// 없으면 이 인스턴스가 주인이 된다 (뮤텍스는 프로세스가 끝날 때까지 유지).
-pub fn already_running(data_dir: &std::path::Path) -> bool {
+/// 같은 데이터 폴더로 이미 떠 있으면 그 앱에 알리고 true. `lend`면 "빌려주기를 시작해", 아니면 "창을 보여줘".
+pub fn already_running(data_dir: &std::path::Path, lend: bool) -> bool {
     use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
     use windows_sys::Win32::System::Threading::CreateMutexW;
     // 경로를 이름에 쓸 수 있게 단순 해시
@@ -498,7 +530,7 @@ pub fn already_running(data_dir: &std::path::Path) -> bool {
         if !m.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
             let hwnd = FindWindowW(wide(CLASS).as_ptr(), std::ptr::null());
             if !hwnd.is_null() {
-                PostMessageW(hwnd, WM_ACTIVATE_APP, 0, 0);
+                PostMessageW(hwnd, if lend { WM_LEND_START } else { WM_ACTIVATE_APP }, 0, 0);
             }
             return true;
         }

@@ -19,6 +19,7 @@ impl GemmaApp {
         self.advanced_tools(ui);
         self.advanced_index(ui);
         self.advanced_search(ui);
+        self.advanced_lend(ui);
         ui.add_space(space::M);
         widgets::caption(ui, &format!("데이터 폴더: {}", self.data_dir.display()));
     }

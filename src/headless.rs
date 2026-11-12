@@ -82,6 +82,7 @@ pub fn stress(args: &[String]) -> i32 {
                 store: store.clone(),
                 full_rebuild: true,
                 only: None,
+                lend: None,
             })
             .unwrap();
         while indexer.is_active() {
@@ -176,6 +177,7 @@ pub fn index_once() -> i32 {
         store,
         full_rebuild: false,
         only: None,
+        lend: None,
     }) {
         // 검색할 폴더가 없는 경우 등
         println!("인덱싱을 시작하지 못했습니다: {e}");
@@ -584,6 +586,7 @@ pub fn run(args: &[String]) -> i32 {
         store: store.clone(),
         full_rebuild: full,
         only: None,
+        lend: None,
     };
 
     // 1회차: 일시정지/재개 확인 포함

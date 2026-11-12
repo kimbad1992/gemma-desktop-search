@@ -3,9 +3,14 @@
 //! 인덱싱 일꾼은 파일을 읽고 잘라 임베딩할 입력을 만든 뒤, 그 묶음(일감)을 대기열에 넣는다.
 //! 계산 제공자가 대기열에서 일감을 가져가 임베딩하고 결과를 돌려준다.
 //!
-//! - 계산 제공자는 지금 하나다: 설정의 임베딩 대상(이 기기의 llama-server 또는 `--embed-server`).
-//!   서버의 슬롯 수만큼 스레드를 띄워 동시에 가져간다. 다른 기기가 일감을 가져가는 일(④ `lend`)과
-//!   마감·다시 맡기기는 이 위에 더한다.
+//! - 이 기기의 계산 제공자(`LocalProvider`): 설정의 임베딩 대상(이 기기의 llama-server 또는 `--embed-server`).
+//!   서버의 슬롯 수만큼 스레드를 띄워 동시에 가져간다.
+//! - 빌려주는 기기(④ `lend`)는 서비스를 거쳐 같은 대기열에서 가져간다(`lend.rs`의 `LendHub`). 그 기기가 실패하거나
+//!   마감을 넘긴 일감은 `requeue`로 다시 넣고, 다시 맡길 일감은 새 일감보다 먼저 꺼낸다(`next`).
+//! - 빌려주는 기기가 붙어 있으면 이 기기의 계산 제공자는 비켜 준다: 기다리는 일감이 빌려주는 기기들의 슬롯 수만큼
+//!   쌓였을 때만 가져간다(`remote_slots`). 느린 이 기기 그래픽이 일감을 붙잡으면, 결과 모으기가 그 결과를 기다리느라
+//!   빠른 기기까지 일감을 못 받는다(실측: 홈서버 내장 그래픽 + 4090에서 이 기기도 똑같이 가져가면 301초).
+//!   빌려주는 기기가 느려 일감이 쌓이면 이 기기도 거든다.
 //! - 일꾼은 일감을 넣고(`submit`) 결과를 기다리지 않은 채 다음 파일로 넘어간다(B단계). 결과는 인덱서의
 //!   결과 모으기 스레드가 받는다. 묶음을 만드는 규칙(파일마다, 같은 종류끼리)은 예전 그대로다.
 //! - 대기열의 칸 수에 한도가 있다. 긴 영상 하나가 일감 수백 개를 한꺼번에 밀어 넣어 메모리가 불어나지 않게,
@@ -20,12 +25,16 @@
 //!   결과 채널이 닫혀 "중지"로 끝난다.
 
 use crate::embed::client::{EmbedClient, EmbedError, EmbedInput};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Select, Sender};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+/// 처리 몫을 셀 때 이 기기의 계산 제공자 이름
+pub const LOCAL: &str = "이 기기";
 
 /// 입력마다의 결과. 묶음 전체가 연결 끊김으로 실패하면 `Err(까닭)`.
 pub type WorkReply = Result<Vec<Result<Vec<f32>, EmbedError>>, String>;
@@ -37,6 +46,8 @@ pub struct Work {
     tag: String,
     pub inputs: Vec<EmbedInput>,
     reply: Sender<WorkReply>,
+    /// 빌려준 기기에서 실패했거나 마감을 넘긴 횟수
+    remote_failures: u8,
 }
 
 impl Work {
@@ -44,6 +55,27 @@ impl Work {
     pub fn finish(self, reply: WorkReply) {
         let _ = self.reply.send(reply);
     }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn remote_failures(&self) -> u8 {
+        self.remote_failures
+    }
+
+    pub fn count_remote_failure(&mut self) {
+        self.remote_failures = self.remote_failures.saturating_add(1);
+    }
+}
+
+/// `WorkQueue::next`의 결과
+pub enum Next {
+    Work(Work),
+    /// 기다리는 동안 일감이 없었다
+    Empty,
+    /// 대기열이 닫혔고 남은 일감도 없다
+    Closed,
 }
 
 /// 일감 대기열. 일꾼들이 나눠 쓴다.
@@ -54,17 +86,29 @@ pub struct WorkQueue {
     executing: Mutex<HashMap<u64, String>>,
     /// 처음 연결이 끊긴 순간 처리 중이던 파일들
     crash: Mutex<Option<Vec<String>>>,
+    /// 다시 맡길 일감 (빌려준 기기가 실패했거나 마감을 넘김). 새 일감보다 먼저 꺼낸다.
+    retry_tx: Sender<Work>,
+    retry_rx: Receiver<Work>,
+    /// 제공자별로 처리한 입력 수 (이 기기, 빌려준 기기 이름)
+    share: Mutex<Vec<(String, u64)>>,
+    /// 지금 붙어 있는 빌려주는 기기들의 슬롯 합 (`LendHub`가 정한다). 0이 아니면 이 기기는 비켜 준다.
+    remote_slots: std::sync::atomic::AtomicUsize,
 }
 
 impl WorkQueue {
     /// 대기열(칸 `capacity`개)과, 계산 제공자가 일감을 가져갈 쪽
     pub fn new(capacity: usize) -> (Arc<Self>, Receiver<Work>) {
         let (tx, rx) = bounded(capacity.max(1));
+        let (retry_tx, retry_rx) = unbounded();
         let queue = Self {
             tx: Mutex::new(Some(tx)),
             next_id: AtomicU64::new(0),
             executing: Mutex::new(HashMap::new()),
             crash: Mutex::new(None),
+            retry_tx,
+            retry_rx,
+            share: Mutex::new(Vec::new()),
+            remote_slots: std::sync::atomic::AtomicUsize::new(0),
         };
         (Arc::new(queue), rx)
     }
@@ -81,6 +125,7 @@ impl WorkQueue {
             tag: tag.to_string(),
             inputs,
             reply,
+            remote_failures: 0,
         })
         .ok()?;
         Some(result)
@@ -100,6 +145,76 @@ impl WorkQueue {
     /// 처음 연결이 끊긴 순간 서버에서 처리 중이던 일감의 파일들 (중복 없이)
     pub fn take_crash(&self) -> Option<Vec<String>> {
         self.crash.lock().take()
+    }
+
+    /// 다시 맡긴다: 다음에 꺼내는 쪽(이 기기든 빌려주는 기기든)이 새 일감보다 먼저 가져간다
+    pub fn requeue(&self, work: Work) {
+        let _ = self.retry_tx.send(work);
+    }
+
+    /// 다음 일감. 다시 맡길 일감이 먼저다. `wait`가 None이면 올 때까지 기다리고, 시간이 정해져 있으면 그동안
+    /// 없을 때 `Empty`. 새 일감 쪽이 닫혔고(인덱싱이 끝남) 다시 맡길 일감도 없으면 `Closed`.
+    pub fn next(&self, rx: &Receiver<Work>, wait: Option<Duration>) -> Next {
+        if let Ok(w) = self.retry_rx.try_recv() {
+            return Next::Work(w);
+        }
+        let mut sel = Select::new();
+        let retry = sel.recv(&self.retry_rx);
+        let fresh = sel.recv(rx);
+        let op = match wait {
+            None => sel.select(),
+            Some(d) => match sel.select_timeout(d) {
+                Ok(op) => op,
+                Err(_) => return Next::Empty,
+            },
+        };
+        if op.index() == retry {
+            return match op.recv(&self.retry_rx) {
+                Ok(w) => Next::Work(w),
+                Err(_) => Next::Empty,
+            };
+        }
+        debug_assert_eq!(op.index(), fresh);
+        match op.recv(rx) {
+            Ok(w) => Next::Work(w),
+            // 새 일감 쪽이 닫혔다: 그사이 다시 맡긴 것이 없으면 끝
+            Err(_) => match self.retry_rx.try_recv() {
+                Ok(w) => Next::Work(w),
+                Err(_) => Next::Closed,
+            },
+        }
+    }
+
+    /// 꺼내 가기를 기다리는 일감 수
+    pub fn pending(&self, rx: &Receiver<Work>) -> usize {
+        rx.len() + self.retry_rx.len()
+    }
+
+    /// 제공자 `who`가 입력 `n`개를 처리했다
+    pub fn record(&self, who: &str, n: usize) {
+        let mut s = self.share.lock();
+        match s.iter_mut().find(|(name, _)| name == who) {
+            Some((_, c)) => *c += n as u64,
+            None => s.push((who.to_string(), n as u64)),
+        }
+    }
+
+    /// 제공자별로 처리한 입력 수
+    pub fn share(&self) -> Vec<(String, u64)> {
+        self.share.lock().clone()
+    }
+
+    /// 붙어 있는 빌려주는 기기들의 슬롯 합을 정한다 (`LendHub`)
+    pub fn set_remote_slots(&self, n: usize) {
+        self.remote_slots.store(n, Ordering::SeqCst);
+    }
+
+    /// 이 기기의 계산 제공자가 지금 비켜 줘야 하는지: 빌려주는 기기가 붙어 있고, 기다리는 일감이 그 기기들이
+    /// 한 번에 가져갈 만큼도 쌓이지 않았다
+    pub fn local_should_yield(&self, rx: &Receiver<Work>) -> bool {
+        let remote = self.remote_slots.load(Ordering::SeqCst);
+        // 닫힌 뒤에는 비켜 주지 않는다: 남은 일감을 비우고 끝나야 한다 (계속 비켜 주면 끝나지 않는다)
+        remote > 0 && self.pending(rx) < remote && self.tx.lock().is_some()
     }
 
     fn begin(&self, work: &Work) {
@@ -164,18 +279,29 @@ impl LocalProvider {
             let (rx, client, go, q) = (rx.clone(), client.clone(), go.clone(), queue.clone());
             let spawned = std::thread::Builder::new()
                 .name(format!("embed-provider-{i}"))
-                .spawn(move || {
-                    for work in rx.iter() {
-                        if !go() {
-                            // 중지: 일감을 버린다 → 기다리던 쪽은 결과 채널이 닫혀 "중지"로 끝난다.
-                            // 버리면서도 계속 꺼내므로 일감을 넣으려고 기다리던 쪽이 막히지 않는다.
-                            continue;
-                        }
-                        q.begin(&work);
-                        let reply = run_work(&client, &work.inputs);
-                        q.end(&work, lost_connection(&reply));
-                        work.finish(reply);
+                .spawn(move || loop {
+                    // 빠른 빌려주는 기기에 양보 (일감이 쌓이면 거든다)
+                    if q.local_should_yield(&rx) {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
                     }
+                    let work = match q.next(&rx, Some(Duration::from_millis(200))) {
+                        Next::Work(w) => w,
+                        Next::Empty => continue,
+                        Next::Closed => break,
+                    };
+                    if !go() {
+                        // 중지: 일감을 버린다 → 기다리던 쪽은 결과 채널이 닫혀 "중지"로 끝난다.
+                        // 버리면서도 계속 꺼내므로 일감을 넣으려고 기다리던 쪽이 막히지 않는다.
+                        continue;
+                    }
+                    q.begin(&work);
+                    let reply = run_work(&client, &work.inputs);
+                    q.end(&work, lost_connection(&reply));
+                    if reply.is_ok() {
+                        q.record(LOCAL, work.inputs.len());
+                    }
+                    work.finish(reply);
                 });
             match spawned {
                 Ok(t) => threads.push(t),
@@ -295,6 +421,42 @@ mod tests {
         }
         q.close();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn local_provider_yields_to_lenders_until_work_piles_up() {
+        // 닿지 않는 주소: 가져가면 연결 끊김으로 실패한다. 가져갔는지만 본다.
+        let (q, rx) = WorkQueue::new(8);
+        let target = crate::embed::client::EmbedTarget::local(1);
+        let client = Arc::new(EmbedClient::new(&target));
+        q.set_remote_slots(3);
+        let p = LocalProvider::start(q.clone(), rx.clone(), client, 2, Arc::new(|| true)).unwrap();
+        let r1 = q.submit("a", vec![EmbedInput::Text("a".into())]).unwrap();
+        let r2 = q.submit("b", vec![EmbedInput::Text("b".into())]).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        // 빌려주는 기기 슬롯(3)보다 적게 쌓였으니 가져가지 않았다
+        assert_eq!(q.pending(&rx), 2);
+        assert!(r1.try_recv().is_err());
+        // 하나 더 쌓이면 거든다
+        let r3 = q.submit("c", vec![EmbedInput::Text("c".into())]).unwrap();
+        assert!(r3.recv_timeout(Duration::from_secs(10)).is_ok() || r1.recv_timeout(Duration::from_secs(10)).is_ok());
+        // 빌려주는 기기가 빠지면 남은 것도 가져간다
+        q.set_remote_slots(0);
+        assert!(r2.recv_timeout(Duration::from_secs(10)).is_ok());
+        drop(p);
+    }
+
+    #[test]
+    fn yielding_provider_still_ends_when_the_queue_closes() {
+        // 빌려주는 기기가 붙은 채로(슬롯 합이 남은 채로) 인덱싱이 끝나도 계산 제공자가 끝나야 한다
+        let (q, rx) = WorkQueue::new(4);
+        let target = crate::embed::client::EmbedTarget::local(1);
+        let client = Arc::new(EmbedClient::new(&target));
+        q.set_remote_slots(8);
+        let p = LocalProvider::start(q.clone(), rx, client, 2, Arc::new(|| true)).unwrap();
+        let t0 = std::time::Instant::now();
+        drop(p);
+        assert!(t0.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
