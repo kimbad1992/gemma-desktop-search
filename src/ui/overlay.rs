@@ -169,10 +169,12 @@ pub(crate) fn overlay_ui(
 ) {
     let ctx = ui.ctx().clone();
     let pal = crate::ui::theme::palette(ui.visuals());
+    // 아크릴 유리: 벽 위에 아크릴 채우기 (창은 불투명하다)
+    crate::ui::glass::paint_wall(ui);
+    ui.painter().rect_filled(ctx.content_rect(), 0.0, pal.g_acrylic);
     // 테두리 없는 작은 창이라, 뒤의 화면과 구별되게 테두리를 두른다
     let frame = egui::Frame::new()
-        .fill(pal.card_fill)
-        .stroke(egui::Stroke::new(1.0, pal.accent.gamma_multiply(0.75)))
+        .stroke(egui::Stroke::new(1.0, crate::ui::theme::alpha(pal.accent, 0.75)))
         .inner_margin(egui::Margin::symmetric(12, 10));
     egui::CentralPanel::default().frame(frame).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 4.0;

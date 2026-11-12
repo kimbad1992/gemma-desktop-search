@@ -131,7 +131,7 @@ impl GemmaApp {
                     Some(t) => {
                         let size = t.size_vec2();
                         let scale = (w / size.x).min(520.0 / size.y).min(2.0);
-                        ui.add(egui::Image::new(&t).fit_to_exact_size(size * scale).corner_radius(10));
+                        ui.add(egui::Image::new(&t).fit_to_exact_size(size * scale).corner_radius(16));
                     }
                     None => {
                         widgets::spinner(ui);

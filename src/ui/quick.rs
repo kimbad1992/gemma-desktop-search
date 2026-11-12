@@ -17,10 +17,12 @@ impl GemmaApp {
     pub fn quick_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let p = crate::ui::theme::palette(ui.visuals());
+        // 아크릴 유리: 벽 위에 아크릴 채우기 (다른 프로그램 위에 뜨는 창)
+        crate::ui::glass::paint_wall(ui);
+        ui.painter().rect_filled(ctx.content_rect(), 0.0, p.g_acrylic);
         // 테두리 없는 창이라, 뒤의 화면과 구별되게 강조색 테두리를 두른다
         let frame = egui::Frame::new()
-            .fill(p.panel)
-            .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.75)))
+            .stroke(egui::Stroke::new(1.0, crate::ui::theme::alpha(p.accent, 0.75)))
             .inner_margin(egui::Margin {
                 left: 14,
                 right: 14,
@@ -155,13 +157,17 @@ impl GemmaApp {
                     .resizable(false)
                     .show_separator_line(false)
                     .exact_size(ui.available_width() * 0.46)
-                    .frame(widgets::card_frame(ui).outer_margin(egui::Margin {
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::same(14)).outer_margin(egui::Margin {
                         left: 10,
                         right: 0,
                         top: 0,
                         bottom: 2,
                     }))
-                    .show(ui, |ui| self.preview_panel(ui, &ctx, hv, outcome.expr.as_deref()));
+                    .show(ui, |ui| {
+                        use crate::ui::glass::{self, Glass};
+                        glass::backdrop(ui, Glass::Content, 20.0, egui::Margin::same(14));
+                        self.preview_panel(ui, &ctx, hv, outcome.expr.as_deref())
+                    });
             }
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (sec, hv) in &shown {

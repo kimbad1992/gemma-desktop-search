@@ -391,7 +391,18 @@ pub struct GemmaApp {
     /// 이번 인덱싱 작업에서 서버 충돌 후 자동 복구한 횟수
     pub recover_attempts: u32,
     pending_recover: Option<Instant>,
+
+    /// 펼침 메뉴 밑의 진짜 흐림 (wgpu로 그릴 때만, `ui::backdrop`)
+    glass_blur: Option<crate::ui::backdrop::Blur>,
 }
+
+/// 왼쪽 메뉴(진한 유리)의 안쪽 여백
+const NAV_PAD: egui::Margin = egui::Margin {
+    left: 10,
+    right: 10,
+    top: 14,
+    bottom: 10,
+};
 
 /// 한 번의 인덱싱 작업에서 서버 자동 재시작 최대 횟수
 pub const MAX_RECOVER_ATTEMPTS: u32 = 5;
@@ -527,6 +538,7 @@ impl GemmaApp {
             auto_query: None,
             recover_attempts: 0,
             pending_recover: None,
+            glass_blur: None,
         };
         app.server
             .set_log_path(&app.data_dir.join("logs").join("llama-server.log"));
@@ -2069,23 +2081,20 @@ impl GemmaApp {
     fn nav_panel(&mut self, ui: &mut egui::Ui, compact: bool) {
         use crate::ui::theme;
         use widgets::Icon;
-        // 본문과의 경계선
-        let edge = ui.max_rect().expand2(egui::vec2(10.0, 14.0));
-        let line = crate::ui::theme::palette(ui.visuals()).card_stroke;
-        ui.painter()
-            .vline(edge.right() - 0.5, edge.y_range(), egui::Stroke::new(1.0, line));
+        // 창에서 떨어져 떠 있는 진한 유리 기둥 (틀의 안쪽 여백까지)
+        crate::ui::glass::backdrop(ui, crate::ui::glass::Glass::Thick, 22.0, NAV_PAD);
 
         ui.spacing_mut().item_spacing.y = 4.0;
         let logo = self.logo(ui.ctx());
         ui.horizontal(|ui| {
-            ui.add_space(6.0);
+            ui.spacing_mut().item_spacing.x = 9.0;
+            ui.add_space(if compact { ((ui.available_width() - 28.0) / 2.0).max(0.0) } else { 6.0 });
             ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::Vec2::splat(28.0)));
             if !compact {
-                ui.add_space(2.0);
                 ui.label(RichText::new("Gemma Search").text_style(theme::ts_item()).strong());
             }
         });
-        ui.add_space(16.0);
+        ui.add_space(14.0);
         // 저장하지 않은 설정이 있으면 설정 메뉴에 점을 붙인다
         let unsaved = self.cfg != self.saved_cfg;
         for (tab, icon, label, mark) in [
@@ -2188,12 +2197,13 @@ impl GemmaApp {
                 .on_hover_text(warnings.join("\n\n"));
             }
             self.nav_update(ui, false);
+            // 메뉴 아래의 상태 카드: 움푹 들어간 홈
             let card = || {
                 egui::Frame::new()
-                    .fill(p.card_fill)
-                    .stroke(egui::Stroke::new(1.0, p.card_stroke))
-                    .corner_radius(10)
-                    .inner_margin(egui::Margin::symmetric(10, 9))
+                    .fill(p.field_fill)
+                    .stroke(egui::Stroke::new(1.0, p.well_stroke))
+                    .corner_radius(15)
+                    .inner_margin(egui::Margin::symmetric(12, 9))
             };
             // 서버 · 파일 수 (아래 줄부터 넣는다)
             let r = card()
@@ -2346,10 +2356,10 @@ impl GemmaApp {
         // 누르는 카드 한 장: 아이콘 + 제목, 그 아래 작은 설명 (아래에서 위로 쌓는 배치라 아래 줄부터 넣는다)
         let card = |ui: &mut egui::Ui, glyph: Icon, title: &str, sub: &str| {
             egui::Frame::new()
-                .fill(p.accent.gamma_multiply(0.14))
-                .stroke(egui::Stroke::new(1.0, p.accent.gamma_multiply(0.5)))
-                .corner_radius(10)
-                .inner_margin(egui::Margin::symmetric(10, 9))
+                .fill(theme::alpha(p.accent, 0.14))
+                .stroke(egui::Stroke::new(1.0, theme::alpha(p.accent, 0.40)))
+                .corner_radius(15)
+                .inner_margin(egui::Margin::symmetric(12, 9))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -2416,9 +2426,11 @@ impl GemmaApp {
             return;
         }
         self.titlebar_dark = Some(dark);
+        // 제목 표시줄은 벽의 바닥색으로 (벽의 위쪽 가운데는 번짐이 닿지 않아 바닥색 그대로다)
         let p = crate::ui::theme::palette_of(dark);
         let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
-        crate::platform::set_titlebar_colors(self.main_hwnd, dark, rgb(p.sidebar), rgb(p.card_stroke));
+        let border = widgets::mix(p.panel, p.text, 0.12);
+        crate::platform::set_titlebar_colors(self.main_hwnd, dark, rgb(p.panel), rgb(border));
     }
 
     /// 알림을 오른쪽 아래 토스트로 보여준다 (오류는 15초, 안내는 6초 또는 닫을 때까지)
@@ -2512,7 +2524,21 @@ impl eframe::App for GemmaApp {
         }
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // 펼침 메뉴의 흐림 엔진은 첫 프레임에 한 번 만든다 (데이터를 옮긴 뒤 여는 경우에도 같은 길)
+        if self.glass_blur.is_none() {
+            self.glass_blur = frame.wgpu_render_state().map(crate::ui::backdrop::Blur::new);
+        }
+        self.draw(ui);
+        // 펼침 메뉴의 흐림은 이번 프레임의 그림이 다 모인 뒤에 (메뉴 밑에 깔릴 층을 다시 그려 흐린다)
+        if let (Some(blur), Some(rs)) = (&mut self.glass_blur, frame.wgpu_render_state()) {
+            blur.run(ui.ctx(), rs);
+        }
+    }
+}
+
+impl GemmaApp {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.index_overlay(&ctx);
         // 숨긴 상태에서 오버레이 때문에 불렸으면 본 창은 그리지 않는다 (화면 확인용 실행은 숨긴 채로 그린다)
@@ -2544,7 +2570,6 @@ impl eframe::App for GemmaApp {
             }
         }
         use crate::ui::theme;
-        let p = theme::palette(ui.visuals());
         if self.shot.as_ref().is_some_and(|s| s.overlay) {
             // 화면 확인용: --lend-demo면 빌려주기 칸, --shot-indexing이면 인덱싱 칸도
             let lend = self.lend_status_arc();
@@ -2553,32 +2578,39 @@ impl eframe::App for GemmaApp {
             return;
         }
         self.sync_titlebar(ui.visuals().dark_mode);
-        // 본문의 바탕과 여백. 아래 여백은 두지 않는다 (스크롤되는 내용이 창 끝까지 이어지게).
-        let body = egui::Frame::new().fill(p.panel).inner_margin(egui::Margin {
-            left: 20,
-            right: 12,
-            top: 16,
-            bottom: 0,
-        });
+        // 벽: 창 전체에 깔리는 색 번짐. 메뉴·카드는 그 위에 떠 있는 유리다.
+        crate::ui::glass::paint_wall(ui);
+        // 본문의 여백. 아래 여백은 두지 않는다 (스크롤되는 내용이 창 끝까지 이어지게).
+        let body = |left: i8| {
+            egui::Frame::NONE.inner_margin(egui::Margin {
+                left,
+                right: theme::EDGE,
+                top: theme::EDGE,
+                bottom: 0,
+            })
+        };
         // 토스트·대화상자는 숨김 상태의 이른 반환 뒤에만 그린다 (숨긴 창에서 즉시형 창을 띄우면 패닉)
         if self.setup_open {
-            egui::CentralPanel::default().frame(body).show(ui, |ui| self.setup_ui(ui));
+            egui::CentralPanel::default().frame(body(20)).show(ui, |ui| self.setup_ui(ui));
             self.data_move_dialog(&ctx);
             self.show_toast(&ctx);
             return;
         }
-        // 창이 좁으면 메뉴를 아이콘만 남긴다
+        // 창이 좁으면 메뉴를 아이콘만 남긴다. 메뉴는 창 가장자리에서 떼어 띄운다.
         let compact = ctx.content_rect().width() < 900.0;
+        let edge = theme::EDGE;
         egui::Panel::left("nav")
-            .exact_size(if compact { theme::NAV_W_COMPACT } else { theme::NAV_W })
+            .exact_size(edge as f32 + if compact { theme::NAV_W_COMPACT } else { theme::NAV_W })
             .resizable(false)
             .show_separator_line(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(p.sidebar)
-                    .inner_margin(egui::Margin::symmetric(10, 14)),
-            )
+            .frame(egui::Frame::NONE.inner_margin(NAV_PAD).outer_margin(egui::Margin {
+                left: edge,
+                right: 0,
+                top: edge,
+                bottom: edge,
+            }))
             .show(ui, |ui| self.nav_panel(ui, compact));
+        let body = body(theme::GAP);
         egui::CentralPanel::default().frame(body).show(ui, |ui| {
             if self.show_gallery {
                 return widgets::gallery(ui);

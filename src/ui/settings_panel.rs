@@ -4,6 +4,7 @@
 //! `settings_advanced.rs`(전문 항목)에 있다. 저장·되돌리기는 두 화면의 설정 전체에 한 번에 적용된다.
 
 use crate::app::{GemmaApp, SettingsView};
+use crate::ui::glass::{self, Glass};
 use crate::ui::theme::{self, space, Tone};
 use crate::ui::widgets::{self, Btn};
 use eframe::egui;
@@ -116,23 +117,30 @@ impl GemmaApp {
     pub fn settings_tab(&mut self, ui: &mut egui::Ui) {
         let dirty = self.cfg != self.saved_cfg;
         let (mut save, mut revert) = (false, false);
-        // 고정 머리: 화면 전환과 저장·되돌리기 (본문과 같은 폭으로 가운데 정렬)
-        ui.add_space(space::XS);
+        // 고정 머리: 화면 전환과 저장·되돌리기를 맑은 유리 막대에 (본문과 같은 폭으로 가운데 정렬)
+        let bar = egui::Margin {
+            left: 20,
+            right: 10,
+            top: 8,
+            bottom: 8,
+        };
         widgets::centered(ui, theme::PAGE_W, |ui| {
-            ui.horizontal(|ui| {
-                widgets::page_title(ui, "설정");
-                ui.add_space(space::M);
-                widgets::segmented(
-                    ui,
-                    &mut self.settings_view,
-                    &[(SettingsView::Basic, "일반"), (SettingsView::Advanced, "고급")],
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    save = widgets::button_enabled(ui, Btn::Primary, dirty, "저장").clicked();
-                    revert = widgets::button_enabled(ui, Btn::Secondary, dirty, "되돌리기").clicked();
-                    if dirty {
-                        widgets::tone_label(ui, Tone::Warn, "저장하지 않은 변경 사항이 있습니다");
-                    }
+            glass::show(ui, Glass::Clear, 26.0, bar, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::page_title(ui, "설정");
+                    ui.add_space(space::M);
+                    widgets::segmented(
+                        ui,
+                        &mut self.settings_view,
+                        &[(SettingsView::Basic, "일반"), (SettingsView::Advanced, "고급")],
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        save = widgets::button_enabled(ui, Btn::Primary, dirty, "저장").clicked();
+                        revert = widgets::button_enabled(ui, Btn::Secondary, dirty, "되돌리기").clicked();
+                        if dirty {
+                            widgets::tone_label(ui, Tone::Warn, "저장하지 않은 변경 사항이 있습니다");
+                        }
+                    });
                 });
             });
         });
@@ -143,7 +151,6 @@ impl GemmaApp {
             self.revert_settings();
         }
         ui.add_space(space::XS);
-        ui.separator();
 
         widgets::page(ui, "settings_page", theme::PAGE_W, |ui| match self.settings_view {
             SettingsView::Basic => self.settings_basic(ui),

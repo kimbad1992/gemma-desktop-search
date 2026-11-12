@@ -156,8 +156,9 @@ impl Launcher {
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let p = theme::palette(ui.visuals());
-        let body = egui::Frame::new().fill(p.panel).inner_margin(egui::Margin {
+        // 벽 위에 바로 (안내 카드는 유리)
+        crate::ui::glass::paint_wall(ui);
+        let body = egui::Frame::NONE.inner_margin(egui::Margin {
             left: 20,
             right: 12,
             top: 16,

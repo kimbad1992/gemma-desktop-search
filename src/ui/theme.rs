@@ -3,8 +3,9 @@
 //! 시스템의 어두운/밝은 테마를 그대로 따른다 (egui가 매 프레임 고른다). 여기서는 두 테마의 스타일을
 //! 각각 손봐 두기만 한다. 화면 코드는 색 상수 대신 `Tone`·`Hue`와 `palette()`를 쓴다.
 //!
-//! 모양의 기준: 푸른 기가 도는 바탕, 앱 아이콘의 남색→청록 그라데이션을 강조색으로(`gradient`),
-//! 둥근 모서리(카드 12, 버튼·입력칸 9), 아이콘은 Lucide 글꼴(`ICONS`).
+//! 모양의 기준(리퀴드 글래스): 앱 아이콘의 남색·청록이 은은하게 번지는 바탕(벽) 위에 유리 패널이 뜬다.
+//! 글을 길게 읽는 곳은 진한 내용 유리, 툴바·탭·메뉴는 맑은 유리(`ui::glass`). 버튼·칩·입력칸은 끝까지
+//! 둥근 알약 모양, 강조색은 남색→청록 그라데이션(`gradient`), 아이콘은 Lucide 글꼴(`ICONS`).
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Shadow, Stroke, TextStyle, Theme, Visuals};
 
@@ -24,9 +25,9 @@ pub mod space {
     pub const XL: f32 = 24.0;
 }
 
-/// 카드 모서리 / 버튼·입력칸 모서리
-pub const RADIUS: u8 = 12;
-pub const RADIUS_SM: u8 = 9;
+/// 카드(내용 유리) 모서리 / egui 기본 부품(입력칸·체크 상자)의 모서리. 우리 버튼·칩은 끝까지 둥글다.
+pub const RADIUS: u8 = 22;
+pub const RADIUS_SM: u8 = 10;
 /// 카드 안쪽 여백
 pub const CARD_PAD: i8 = 16;
 /// 버튼·입력칸 높이
@@ -35,8 +36,11 @@ pub const CONTROL_H: f32 = 32.0;
 pub const PAGE_W: f32 = 920.0;
 pub const DASH_W: f32 = 1100.0;
 /// 왼쪽 메뉴 폭 (넓을 때 / 창이 좁아 아이콘만 보일 때)
-pub const NAV_W: f32 = 184.0;
-pub const NAV_W_COMPACT: f32 = 60.0;
+pub const NAV_W: f32 = 204.0;
+pub const NAV_W_COMPACT: f32 = 64.0;
+/// 떠 있는 패널과 창 가장자리 사이 / 패널 사이
+pub const EDGE: i8 = 12;
+pub const GAP: i8 = 14;
 
 /// 섹션 제목 (16 굵게)
 pub fn ts_section() -> TextStyle {
@@ -63,22 +67,43 @@ pub fn query_font() -> FontId {
     FontId::new(17.0, FontFamily::Proportional)
 }
 
-/// 테마별 색
+/// 테마별 색. 이름이 `g_`로 시작하는 것은 유리 재질(`ui::glass`), 나머지는 글자·부품 색이다.
+/// 반투명 색은 벽이나 유리 위에 겹쳐 칠하는 것을 전제로 한다.
 pub struct Palette {
-    /// 본문 바탕
+    /// 벽의 바닥색 (불투명). 창을 처음 지우는 색, 제목 표시줄 색으로도 쓴다.
     pub panel: Color32,
-    /// 왼쪽 메뉴·미리보기처럼 한 단 가라앉은 바탕
-    pub sidebar: Color32,
-    pub card_fill: Color32,
-    /// 카드·구분선의 옅은 테두리
-    pub card_stroke: Color32,
-    /// 카드 안 줄무늬·옅은 강조
+    /// 벽에 번지는 빛 네 개 (왼쪽 위, 오른쪽 위, 오른쪽 아래, 왼쪽 아래)
+    pub blobs: [Color32; 4],
+    /// 유리 채우기: 맑음(툴바·탭) / 진함(메뉴·미리보기) / 내용(결과 목록·카드) / 아크릴(다른 프로그램 위에 뜨는 창)
+    pub g_clear: Color32,
+    pub g_thick: Color32,
+    pub g_content: Color32,
+    pub g_acrylic: Color32,
+    /// 흐림 없이 칠하는 떠 있는 것(펼침 메뉴·도움말·알림)의 바탕: 뒤의 글자가 비치지 않을 만큼 진하게
+    pub popup_fill: Color32,
+    /// 유리 테두리 1px / 위쪽 안쪽 밝은 선 / 아래쪽 안쪽 옅은 선
+    pub g_stroke: Color32,
+    pub g_hi: Color32,
+    pub g_lo: Color32,
+    /// 가장자리 빛 (왼쪽 위 / 오른쪽 아래)
+    pub g_rim: Color32,
+    pub g_rim2: Color32,
+    /// 위쪽 광택 그라데이션의 시작색
+    pub g_sheen: Color32,
+    /// 유리 그림자 두 겹 (넓고 옅은 것, 좁고 진한 것)
+    pub g_shadow: [Shadow; 2],
+    /// 선택된 탭·메뉴의 물방울 알약
+    pub bead: Color32,
+    pub bead_shadow: Shadow,
+    /// 카드 안 줄무늬 (표의 홀수 줄)
     pub stripe: Color32,
-    /// 움푹 들어간 영역: 로그, 탭 묶음의 바탕
+    /// 움푹 들어간 홈: 로그, 미디어 바탕
     pub inset_fill: Color32,
-    /// 입력칸 바탕
+    /// 입력칸·분할 전환의 홈 / 홈 테두리 / 홈 위쪽 안쪽 그림자
     pub field_fill: Color32,
-    /// 보통 버튼: 바탕 / 올렸을 때 / 눌렀을 때 / 테두리 / 올렸을 때 테두리
+    pub well_stroke: Color32,
+    pub well_in: Color32,
+    /// 보통 버튼·칩: 바탕 / 올렸을 때 / 눌렀을 때 / 테두리 / 올렸을 때 테두리
     pub control_fill: Color32,
     pub control_hover: Color32,
     pub control_active: Color32,
@@ -86,8 +111,10 @@ pub struct Palette {
     pub control_stroke_hover: Color32,
     /// 막대·스위치의 빈 부분
     pub track: Color32,
-    /// 떠 있는 것(메뉴·알림)의 바탕
-    pub popup_fill: Color32,
+    /// 카드 안 구분선
+    pub card_stroke: Color32,
+    /// 글이 놓이는 내용 유리 채우기 (`g_content`와 같다)
+    pub card_fill: Color32,
     pub text: Color32,
     pub text_strong: Color32,
     /// 덜 중요한 글자
@@ -100,7 +127,7 @@ pub struct Palette {
     pub accent_text: Color32,
     /// 강조색 위의 글자
     pub on_accent: Color32,
-    /// 선택된 행의 옅은 강조 배경
+    /// 선택된 줄의 옅은 강조 배경 (반투명)
     pub accent_soft: Color32,
     pub ok: Color32,
     pub warn: Color32,
@@ -110,70 +137,117 @@ pub struct Palette {
     /// 검색어 강조: 배경 / 글자
     pub highlight_bg: Color32,
     pub highlight_fg: Color32,
+    /// 상태 색을 바탕에 섞는 비율 (배지·꼬리표·안내 상자)
+    pub tint: f32,
+}
+
+const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied_const(r, g, b, a)
+}
+
+const fn shadow(y: i8, blur: u8, color: Color32) -> Shadow {
+    Shadow {
+        offset: [0, y],
+        blur,
+        spread: 0,
+        color,
+    }
 }
 
 static DARK: Palette = Palette {
-    panel: Color32::from_rgb(14, 16, 22),
-    sidebar: Color32::from_rgb(10, 12, 17),
-    card_fill: Color32::from_rgb(20, 23, 32),
-    card_stroke: Color32::from_rgb(35, 40, 55),
-    stripe: Color32::from_rgb(25, 29, 40),
-    inset_fill: Color32::from_rgb(9, 10, 15),
-    field_fill: Color32::from_rgb(22, 25, 35),
-    control_fill: Color32::from_rgb(27, 31, 43),
-    control_hover: Color32::from_rgb(35, 40, 56),
-    control_active: Color32::from_rgb(24, 27, 38),
-    control_stroke: Color32::from_rgb(45, 51, 70),
-    control_stroke_hover: Color32::from_rgb(66, 74, 102),
-    track: Color32::from_rgb(40, 45, 62),
-    popup_fill: Color32::from_rgb(25, 29, 41),
-    text: Color32::from_rgb(214, 218, 232),
-    text_strong: Color32::from_rgb(244, 245, 250),
-    muted: Color32::from_rgb(134, 141, 164),
+    panel: Color32::from_rgb(10, 12, 19),
+    blobs: [rgba(98, 114, 255, 107), rgba(25, 194, 181, 66), rgba(214, 92, 150, 51), rgba(124, 92, 255, 71)],
+    g_clear: rgba(40, 45, 68, 107),
+    g_thick: rgba(24, 28, 44, 153),
+    g_content: rgba(15, 18, 28, 194),
+    g_acrylic: rgba(20, 23, 36, 189),
+    popup_fill: rgba(22, 25, 38, 245),
+    g_stroke: rgba(255, 255, 255, 26),
+    g_hi: rgba(255, 255, 255, 51),
+    g_lo: rgba(255, 255, 255, 10),
+    g_rim: rgba(255, 255, 255, 107),
+    g_rim2: rgba(255, 255, 255, 31),
+    g_sheen: rgba(255, 255, 255, 15),
+    g_shadow: [shadow(14, 36, rgba(0, 0, 0, 115)), shadow(1, 2, rgba(0, 0, 0, 102))],
+    bead: rgba(255, 255, 255, 33),
+    bead_shadow: shadow(2, 10, rgba(0, 0, 0, 89)),
+    stripe: rgba(255, 255, 255, 10),
+    inset_fill: rgba(0, 0, 0, 77),
+    field_fill: rgba(0, 0, 0, 61),
+    well_stroke: rgba(255, 255, 255, 15),
+    well_in: rgba(0, 0, 0, 82),
+    control_fill: rgba(255, 255, 255, 18),
+    control_hover: rgba(255, 255, 255, 31),
+    control_active: rgba(255, 255, 255, 10),
+    control_stroke: rgba(255, 255, 255, 26),
+    control_stroke_hover: rgba(255, 255, 255, 56),
+    track: rgba(255, 255, 255, 33),
+    card_stroke: rgba(255, 255, 255, 20),
+    card_fill: rgba(15, 18, 28, 194),
+    text: Color32::from_rgb(221, 225, 239),
+    text_strong: Color32::from_rgb(245, 246, 251),
+    muted: Color32::from_rgb(149, 156, 182),
     accent: Color32::from_rgb(98, 114, 255),
     accent2: Color32::from_rgb(25, 194, 181),
-    accent_text: Color32::from_rgb(150, 163, 255),
+    accent_text: Color32::from_rgb(166, 176, 255),
     on_accent: Color32::WHITE,
-    accent_soft: Color32::from_rgb(28, 33, 60),
-    ok: Color32::from_rgb(72, 214, 146),
-    warn: Color32::from_rgb(244, 176, 72),
-    danger: Color32::from_rgb(255, 120, 112),
+    accent_soft: rgba(98, 114, 255, 46),
+    ok: Color32::from_rgb(82, 217, 155),
+    warn: Color32::from_rgb(244, 177, 76),
+    danger: Color32::from_rgb(255, 127, 119),
     selection_bg: Color32::from_rgb(44, 52, 112),
     selection_fg: Color32::from_rgb(222, 226, 255),
-    highlight_bg: Color32::from_rgb(20, 62, 66),
-    highlight_fg: Color32::from_rgb(134, 236, 226),
+    highlight_bg: Color32::from_rgb(19, 70, 73),
+    highlight_fg: Color32::from_rgb(140, 240, 229),
+    tint: 0.18,
 };
 
 static LIGHT: Palette = Palette {
-    panel: Color32::from_rgb(246, 247, 251),
-    sidebar: Color32::from_rgb(237, 239, 247),
-    card_fill: Color32::WHITE,
-    card_stroke: Color32::from_rgb(224, 228, 239),
-    stripe: Color32::from_rgb(243, 245, 250),
-    inset_fill: Color32::from_rgb(234, 237, 246),
-    field_fill: Color32::WHITE,
-    control_fill: Color32::WHITE,
-    control_hover: Color32::from_rgb(243, 245, 252),
-    control_active: Color32::from_rgb(232, 235, 247),
-    control_stroke: Color32::from_rgb(212, 217, 232),
-    control_stroke_hover: Color32::from_rgb(176, 184, 210),
-    track: Color32::from_rgb(218, 222, 236),
-    popup_fill: Color32::WHITE,
-    text: Color32::from_rgb(40, 44, 60),
-    text_strong: Color32::from_rgb(18, 20, 31),
-    muted: Color32::from_rgb(103, 111, 135),
+    panel: Color32::from_rgb(231, 235, 246),
+    blobs: [rgba(98, 114, 255, 107), rgba(25, 194, 181, 92), rgba(255, 150, 120, 77), rgba(160, 120, 255, 61)],
+    g_clear: rgba(255, 255, 255, 112),
+    g_thick: rgba(255, 255, 255, 153),
+    g_content: rgba(255, 255, 255, 204),
+    g_acrylic: rgba(246, 248, 253, 184),
+    popup_fill: rgba(250, 251, 254, 247),
+    g_stroke: rgba(255, 255, 255, 179),
+    g_hi: rgba(255, 255, 255, 242),
+    g_lo: rgba(255, 255, 255, 77),
+    g_rim: rgba(255, 255, 255, 242),
+    g_rim2: rgba(255, 255, 255, 115),
+    g_sheen: rgba(255, 255, 255, 87),
+    g_shadow: [shadow(12, 32, rgba(38, 48, 110, 33)), shadow(1, 3, rgba(38, 48, 110, 20))],
+    bead: rgba(255, 255, 255, 224),
+    bead_shadow: shadow(2, 8, rgba(38, 48, 110, 33)),
+    stripe: rgba(30, 40, 90, 10),
+    inset_fill: rgba(20, 24, 40, 13),
+    field_fill: rgba(255, 255, 255, 140),
+    well_stroke: rgba(30, 40, 90, 20),
+    well_in: rgba(30, 40, 90, 18),
+    control_fill: rgba(255, 255, 255, 158),
+    control_hover: rgba(255, 255, 255, 214),
+    control_active: rgba(255, 255, 255, 115),
+    control_stroke: rgba(30, 40, 90, 28),
+    control_stroke_hover: rgba(30, 40, 90, 56),
+    track: rgba(30, 40, 90, 31),
+    card_stroke: rgba(30, 40, 90, 23),
+    card_fill: rgba(255, 255, 255, 204),
+    text: Color32::from_rgb(38, 42, 59),
+    text_strong: Color32::from_rgb(16, 19, 31),
+    muted: Color32::from_rgb(88, 96, 120),
     accent: Color32::from_rgb(79, 91, 230),
     accent2: Color32::from_rgb(14, 160, 150),
-    accent_text: Color32::from_rgb(66, 77, 214),
+    accent_text: Color32::from_rgb(59, 70, 207),
     on_accent: Color32::WHITE,
-    accent_soft: Color32::from_rgb(232, 235, 255),
-    ok: Color32::from_rgb(20, 134, 72),
-    warn: Color32::from_rgb(166, 104, 0),
-    danger: Color32::from_rgb(208, 44, 44),
+    accent_soft: rgba(79, 91, 230, 33),
+    ok: Color32::from_rgb(19, 130, 74),
+    warn: Color32::from_rgb(149, 94, 0),
+    danger: Color32::from_rgb(201, 42, 42),
     selection_bg: Color32::from_rgb(218, 223, 255),
     selection_fg: Color32::from_rgb(48, 58, 180),
-    highlight_bg: Color32::from_rgb(204, 242, 237),
-    highlight_fg: Color32::from_rgb(8, 104, 98),
+    highlight_bg: Color32::from_rgb(199, 239, 233),
+    highlight_fg: Color32::from_rgb(6, 92, 86),
+    tint: 0.14,
 };
 
 pub fn palette(v: &Visuals) -> &'static Palette {
@@ -192,6 +266,13 @@ pub fn palette_of(dark: bool) -> &'static Palette {
 pub fn gradient(dark: bool) -> (Color32, Color32) {
     let p = if dark { &DARK } else { &LIGHT };
     (p.accent, p.accent2)
+}
+
+/// 색에 알파를 곱한 반투명 색 (CSS의 `color-mix(in srgb, 색 n%, transparent)`)
+pub fn alpha(c: Color32, a: f32) -> Color32 {
+    let [r, g, b, ca] = c.to_srgba_unmultiplied();
+    let a = (ca as f32 / 255.0 * a).clamp(0.0, 1.0);
+    Color32::from_rgba_unmultiplied(r, g, b, (a * 255.0).round() as u8)
 }
 
 /// 의미가 있는 색: 화면 코드는 초록·빨강 같은 색 이름 대신 이것을 쓴다
@@ -221,11 +302,12 @@ impl Tone {
         }
     }
 
-    /// 옅은 배경 색 (안내 상자, 배지)
+    /// 옅은 배경 색 (안내 상자, 배지, 꼬리표): 글자색을 `tint`만큼
     pub fn bg(self, v: &Visuals) -> Color32 {
+        let p = palette(v);
         match self {
-            Tone::Neutral | Tone::Muted => palette(v).stripe,
-            _ => self.fg(v).gamma_multiply(if v.dark_mode { 0.13 } else { 0.10 }),
+            Tone::Neutral => p.stripe,
+            _ => alpha(self.fg(v), p.tint),
         }
     }
 
@@ -276,17 +358,18 @@ impl Hue {
         Color32::from_rgb(r, g, b)
     }
 
-    /// 옅은 배경 색
+    /// 옅은 배경 색 (반투명)
     pub fn bg(self, v: &Visuals) -> Color32 {
-        self.fg(v).gamma_multiply(if v.dark_mode { 0.16 } else { 0.12 })
+        alpha(self.fg(v), palette(v).tint)
     }
 }
 
 fn apply_palette(v: &mut Visuals, p: &Palette) {
-    let dark = v.dark_mode;
+    // 창을 처음 지우는 색 (그 위에 벽을 칠한다)
     v.panel_fill = p.panel;
+    // 펼침 메뉴·도움말·대화상자: 흐림 없이 칠하므로 진하게
     v.window_fill = p.popup_fill;
-    v.window_stroke = Stroke::new(1.0, p.card_stroke);
+    v.window_stroke = Stroke::new(1.0, p.g_stroke);
     v.faint_bg_color = p.stripe;
     v.extreme_bg_color = p.inset_fill;
     v.text_edit_bg_color = Some(p.field_fill);
@@ -300,18 +383,11 @@ fn apply_palette(v: &mut Visuals, p: &Palette) {
     v.text_cursor.stroke = Stroke::new(2.0, p.accent_text);
     v.slider_trailing_fill = true;
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
-    let shade = |a: f32| Color32::from_black_alpha((a * if dark { 255.0 } else { 90.0 }) as u8);
-    v.window_shadow = Shadow {
-        offset: [0, 14],
-        blur: 36,
-        spread: 0,
-        color: shade(0.5),
-    };
+    v.window_shadow = p.g_shadow[0];
     v.popup_shadow = Shadow {
-        offset: [0, 8],
-        blur: 24,
-        spread: 0,
-        color: shade(0.42),
+        offset: [0, 10],
+        blur: 28,
+        ..p.g_shadow[0]
     };
 
     let w = &mut v.widgets;
@@ -320,7 +396,7 @@ fn apply_palette(v: &mut Visuals, p: &Palette) {
     w.noninteractive.weak_bg_fill = p.card_fill;
     w.noninteractive.bg_stroke = Stroke::new(1.0, p.card_stroke);
     w.noninteractive.fg_stroke = Stroke::new(1.0, p.text);
-    // egui 기본 버튼·체크박스·드롭다운도 우리 보통 버튼과 같은 모양으로
+    // egui 기본 버튼·체크박스·드롭다운도 우리 보통 버튼과 같은 색으로
     w.inactive.bg_fill = p.control_fill;
     w.inactive.weak_bg_fill = p.control_fill;
     w.inactive.bg_stroke = Stroke::new(1.0, p.control_stroke);
@@ -373,8 +449,8 @@ pub fn install(ctx: &egui::Context) {
         for wv in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
             wv.corner_radius = r;
         }
-        s.visuals.window_corner_radius = CornerRadius::same(14);
-        s.visuals.menu_corner_radius = CornerRadius::same(RADIUS);
+        s.visuals.window_corner_radius = CornerRadius::same(20);
+        s.visuals.menu_corner_radius = CornerRadius::same(16);
     });
     ctx.style_mut_of(Theme::Dark, |s| apply_palette(&mut s.visuals, &DARK));
     ctx.style_mut_of(Theme::Light, |s| apply_palette(&mut s.visuals, &LIGHT));

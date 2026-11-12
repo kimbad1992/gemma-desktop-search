@@ -1,4 +1,6 @@
+pub mod backdrop;
 pub mod data_location;
+pub mod glass;
 pub mod index_panel;
 pub mod lend;
 pub mod launch;
