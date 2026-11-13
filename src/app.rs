@@ -394,6 +394,10 @@ pub struct GemmaApp {
 
     /// 펼침 메뉴 밑의 진짜 흐림 (wgpu로 그릴 때만, `ui::backdrop`)
     glass_blur: Option<crate::ui::backdrop::Blur>,
+    /// 첫 프레임에 OS 바탕(Acrylic)을 쓸 수 있는지 확인했는지 (`glass::OS_BACKDROP`)
+    backdrop_checked: bool,
+    /// 빠른 검색창이 지금 OS의 Acrylic을 깔고 있는지 (창 뒤가 흐리게 비친다)
+    pub(crate) quick_acrylic: bool,
 }
 
 /// 왼쪽 메뉴(진한 유리)의 안쪽 여백
@@ -539,6 +543,8 @@ impl GemmaApp {
             recover_attempts: 0,
             pending_recover: None,
             glass_blur: None,
+            backdrop_checked: false,
+            quick_acrylic: false,
         };
         app.server
             .set_log_path(&app.data_dir.join("logs").join("llama-server.log"));
@@ -1045,6 +1051,7 @@ impl GemmaApp {
         if self.quick.is_none() {
             if let Some(q) = self.parked_shape.take() {
                 Self::send_main_shape(ctx, &q);
+                self.end_quick_backdrop(ctx);
                 maximize = q.prev_maximized;
             }
         }
@@ -1119,10 +1126,52 @@ impl GemmaApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(px / npp, py / npp)));
             }
         }
+        self.start_quick_backdrop(ctx);
         self.tab = Tab::Search;
         self.focus_search = true;
         self.select_query = true;
         self.show_window(ctx);
+    }
+
+    /// 빠른 검색창 모양일 때 OS의 Acrylic을 깐다 (Windows 11, 투명 효과가 켜져 있을 때).
+    /// 테두리 없는 창이라 둥근 모서리와 강조색 테두리는 OS가 그린다. 화면 확인용 실행에서는 쓰지 않는다
+    /// (Acrylic은 OS가 화면을 합칠 때 입히므로 찍히지 않는다).
+    fn start_quick_backdrop(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let usable = crate::ui::glass::OS_BACKDROP.load(SeqCst)
+            && self.shot.is_none()
+            && crate::platform::transparency_effects_on();
+        if usable == self.quick_acrylic {
+            return;
+        }
+        if !usable {
+            self.end_quick_backdrop(ctx);
+            return;
+        }
+        let dark = ctx.theme() == egui::Theme::Dark;
+        let p = crate::ui::theme::palette_of(dark);
+        let rgb = |c: egui::Color32| [c.r(), c.g(), c.b()];
+        crate::platform::set_backdrop(self.main_hwnd, true, dark);
+        // 뜰 때 단색이었다가 흐려지지 않게, 빠른 검색창 모양인 동안은 늘 활성으로 그린다
+        crate::platform::keep_backdrop_active(self.main_hwnd, true);
+        crate::platform::set_titlebar_colors(
+            self.main_hwnd,
+            dark,
+            rgb(p.panel),
+            rgb(widgets::mix(p.panel, p.accent, 0.75)),
+        );
+        self.quick_acrylic = true;
+    }
+
+    /// 큰 창 모양으로 돌아갈 때: OS 바탕을 걷고, 제목 표시줄·테두리 색은 다음 프레임에 큰 창 것으로 다시 맞춘다
+    fn end_quick_backdrop(&mut self, ctx: &egui::Context) {
+        if !self.quick_acrylic {
+            return;
+        }
+        crate::platform::set_backdrop(self.main_hwnd, false, ctx.theme() == egui::Theme::Dark);
+        crate::platform::keep_backdrop_active(self.main_hwnd, false);
+        self.quick_acrylic = false;
+        self.titlebar_dark = None;
     }
 
     /// 빠른 검색창을 닫는다. keep_open이면 원래 큰 창으로, 아니면 원래 상태(숨김이었으면 숨김)로.
@@ -1132,6 +1181,7 @@ impl GemmaApp {
         self.quick_close = false;
         if keep_open || q.was_visible {
             Self::send_main_shape(ctx, &q);
+            self.end_quick_backdrop(ctx);
             if q.prev_maximized {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
             }
@@ -2503,6 +2553,16 @@ impl GemmaApp {
 }
 
 impl eframe::App for GemmaApp {
+    /// 창을 지우는 색. OS 바탕(Acrylic)을 쓸 수 있는 투명 창이면 완전히 투명하게 (빠른 검색창에서 창 뒤가 비치게).
+    /// 큰 창은 그 위에 늘 벽을 불투명하게 칠한다. 그 밖에는 eframe 기본값 그대로.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        if crate::ui::glass::OS_BACKDROP.load(Ordering::SeqCst) {
+            [0.0; 4]
+        } else {
+            egui::Color32::from_rgba_unmultiplied(12, 12, 12, 180).to_normalized_gamma_f32()
+        }
+    }
+
     /// 창이 숨겨져 있어도(트레이) 불린다: 이벤트 처리는 전부 여기서.
     /// (eframe은 숨긴 창에서 `ui`를 부르지 않고 `logic`만 부른다)
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -2528,6 +2588,22 @@ impl eframe::App for GemmaApp {
         // 펼침 메뉴의 흐림 엔진은 첫 프레임에 한 번 만든다 (데이터를 옮긴 뒤 여는 경우에도 같은 길)
         if self.glass_blur.is_none() {
             self.glass_blur = frame.wgpu_render_state().map(crate::ui::backdrop::Blur::new);
+        }
+        // OS 바탕: 실제로 DX12로 그릴 때만 투명하게 내보낼 수 있다. 아니면(Vulkan으로 돌아갔으면) 끈다.
+        if !self.backdrop_checked {
+            self.backdrop_checked = true;
+            if crate::ui::glass::OS_BACKDROP.load(Ordering::SeqCst) {
+                let dx12 = frame
+                    .wgpu_render_state()
+                    .is_some_and(|rs| rs.adapter.get_info().backend == eframe::wgpu::Backend::Dx12);
+                if dx12 {
+                    crate::platform::prepare_backdrop_window(self.main_hwnd);
+                } else {
+                    crate::ui::glass::OS_BACKDROP.store(false, Ordering::SeqCst);
+                    let ctx = ui.ctx().clone();
+                    self.end_quick_backdrop(&ctx);
+                }
+            }
         }
         self.draw(ui);
         // 펼침 메뉴의 흐림은 이번 프레임의 그림이 다 모인 뒤에 (메뉴 밑에 깔릴 층을 다시 그려 흐린다)

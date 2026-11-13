@@ -17,18 +17,26 @@ impl GemmaApp {
     pub fn quick_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let p = crate::ui::theme::palette(ui.visuals());
-        // 아크릴 유리: 벽 위에 아크릴 채우기 (다른 프로그램 위에 뜨는 창)
-        crate::ui::glass::paint_wall(ui);
-        ui.painter().rect_filled(ctx.content_rect(), 0.0, p.g_acrylic);
-        // 테두리 없는 창이라, 뒤의 화면과 구별되게 강조색 테두리를 두른다
-        let frame = egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0, crate::ui::theme::alpha(p.accent, 0.75)))
-            .inner_margin(egui::Margin {
-                left: 14,
-                right: 14,
-                top: 12,
-                bottom: 8,
-            });
+        let acrylic = self.quick_acrylic && crate::ui::glass::OS_BACKDROP.load(std::sync::atomic::Ordering::SeqCst);
+        let mut frame = egui::Frame::new();
+        if acrylic {
+            // OS의 Acrylic이 창 뒤를 흐려 비춘다: 그 위에 옅은 색만 (둥근 모서리와 테두리는 OS가 그린다)
+            let [r, g, b, _] = p.g_acrylic.to_srgba_unmultiplied();
+            ui.painter()
+                .rect_filled(ctx.content_rect(), 0.0, egui::Color32::from_rgba_unmultiplied(r, g, b, 110));
+        } else {
+            // 아크릴을 쓸 수 없으면(Windows 10, 투명 효과 꺼짐): 벽 위에 아크릴 색을 칠한 불투명 창
+            crate::ui::glass::paint_wall(ui);
+            ui.painter().rect_filled(ctx.content_rect(), 0.0, p.g_acrylic);
+            // 테두리 없는 창이라, 뒤의 화면과 구별되게 강조색 테두리를 두른다
+            frame = frame.stroke(egui::Stroke::new(1.0, crate::ui::theme::alpha(p.accent, 0.75)));
+        }
+        let frame = frame.inner_margin(egui::Margin {
+            left: 14,
+            right: 14,
+            top: 12,
+            bottom: 8,
+        });
         egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             // ── 입력 ──
             ui.horizontal(|ui| {
@@ -165,7 +173,11 @@ impl GemmaApp {
                     }))
                     .show(ui, |ui| {
                         use crate::ui::glass::{self, Glass};
-                        glass::backdrop(ui, Glass::Content, 20.0, egui::Margin::same(14));
+                        if acrylic {
+                            glass::backdrop_plain(ui, Glass::Content, 20.0, egui::Margin::same(14));
+                        } else {
+                            glass::backdrop(ui, Glass::Content, 20.0, egui::Margin::same(14));
+                        }
                         self.preview_panel(ui, &ctx, hv, outcome.expr.as_deref())
                     });
             }

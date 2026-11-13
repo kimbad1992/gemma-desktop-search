@@ -224,10 +224,23 @@ fn gui(args: &[String], move_job: Option<location::Job>) -> eframe::Result {
     if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")) {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions {
+    // Windows 11 22H2 이상: 빠른 검색창이 다른 프로그램 위에서 창 뒤를 흐려 비추게(Acrylic) 한다.
+    // 투명 창은 DX12의 DirectComposition 출력에서만 되므로 그렇게 그린다. 빠른 검색창은 큰 창의 모양만 바꾼
+    // 같은 창이라 큰 창도 투명 창이지만, 큰 창은 늘 벽을 불투명하게 칠하므로 겉보기는 같다.
+    // 끄려면 환경 변수 GEMMA_OS_BACKDROP=0 (예전처럼 기본 렌더러, 불투명 창).
+    let os_backdrop =
+        platform::os_backdrop_supported() && std::env::var("GEMMA_OS_BACKDROP").map_or(true, |v| v != "0");
+    if os_backdrop {
+        viewport = viewport.with_transparent(true);
+    }
+    let mut options = eframe::NativeOptions {
         viewport,
         ..Default::default()
     };
+    if os_backdrop {
+        options.wgpu_options.wgpu_setup = dx12_setup();
+        ui::glass::OS_BACKDROP.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     // 옮기는 화면을 거치면 잠금을 그 화면이 들고 있다가 옮길 때 놓고, 옮긴 뒤 새 폴더를 잠근다
     let launcher_lock = if first.is_some() { lock.take() } else { None };
     let _lock = lock;
@@ -241,4 +254,30 @@ fn gui(args: &[String], move_job: Option<location::Job>) -> eframe::Result {
             })
         }),
     )
+}
+
+/// DX12(DirectComposition 출력)로 그리는 설정. DX12로 그릴 수 있는 그래픽이 없으면 Vulkan으로 그린다
+/// (그때는 투명하게 내보낼 수 없어 첫 프레임에 OS 바탕을 끈다, `app.rs`). 소프트웨어 렌더러(WARP 등)는 맨 나중에.
+/// 환경 변수 WGPU_BACKEND를 주면 그 백엔드만 쓴다.
+#[cfg(feature = "gui")]
+fn dx12_setup() -> eframe::egui_wgpu::WgpuSetup {
+    use eframe::{egui_wgpu, wgpu};
+    let mut s = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    s.instance_descriptor.backends = wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::VULKAN);
+    s.instance_descriptor.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    s.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+        adapters
+            .iter()
+            .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+            .min_by_key(|a| {
+                let info = a.get_info();
+                let software = info.device_type == wgpu::DeviceType::Cpu;
+                let not_dx12 = info.backend != wgpu::Backend::Dx12;
+                let integrated = info.device_type != wgpu::DeviceType::DiscreteGpu;
+                (software, not_dx12, integrated)
+            })
+            .cloned()
+            .ok_or_else(|| "화면을 그릴 그래픽 장치를 찾지 못했습니다".to_string())
+    }));
+    egui_wgpu::WgpuSetup::CreateNew(s)
 }

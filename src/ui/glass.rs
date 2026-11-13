@@ -13,6 +13,10 @@
 use crate::ui::theme::{palette_of, Palette};
 use eframe::egui::{self, epaint, Color32, Margin, Pos2, Rect, Shape, Vec2};
 
+/// 창을 투명하게 만들어 OS 바탕(Windows 11의 Acrylic)을 쓸 수 있는지. main.rs가 창을 만들 때 정하고,
+/// 첫 프레임에 실제 렌더러가 DX12가 아니면(투명하게 내보낼 수 없으면) 끈다 (`app.rs`).
+pub static OS_BACKDROP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 유리의 종류 (채우기만 다르다)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Glass {
@@ -393,6 +397,14 @@ pub fn paint(ui: &egui::Ui, rect: Rect, radius: f32, kind: Glass) {
 pub fn backdrop(ui: &egui::Ui, kind: Glass, radius: f32, margin: Margin) {
     let rect = ui.max_rect() + margin;
     paint(ui, rect, radius, kind);
+}
+
+/// `backdrop`과 같되 뒤의 흐린 벽을 깔지 않는다. OS가 창 뒤를 흐려 비추는 창(Acrylic) 안에서 쓴다.
+pub fn backdrop_plain(ui: &egui::Ui, kind: Glass, radius: f32, margin: Margin) {
+    let rect = ui.max_rect() + margin;
+    let dark = ui.visuals().dark_mode;
+    let shapes = layers(ui.ctx(), dark, rect, radius, Under::Nothing, kind.fill(palette_of(dark)));
+    ui.painter().add(Shape::Vec(shapes));
 }
 
 /// 내용을 유리 한 장 위에 놓는다 (`egui::Frame::show`처럼). 응답의 `rect`가 유리 자리다.
