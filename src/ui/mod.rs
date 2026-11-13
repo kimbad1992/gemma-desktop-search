@@ -4,6 +4,7 @@ pub mod glass;
 pub mod index_panel;
 pub mod lend;
 pub mod launch;
+pub mod mesh;
 pub mod overlay;
 pub mod preview;
 pub mod probe;

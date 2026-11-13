@@ -60,12 +60,19 @@ pub struct Health {
     pub indexed_files: usize,
     /// ffmpeg와 ffprobe가 모두 있는지
     pub ffmpeg: bool,
+    /// 원격 라이브러리 수 (다른 기기가 인덱싱하고 이 PC는 검색만 하는 폴더)
+    pub remote: usize,
 }
 
 impl Health {
     /// 인덱싱·검색을 시작할 준비물이 다 있는지 (인덱스가 있는지는 따로 본다)
     pub fn ready(&self) -> bool {
         self.engine && self.model && self.folders > 0
+    }
+
+    /// 이 PC의 검색 폴더 없이 원격 라이브러리만 쓴다 (모델·llama.cpp가 없어도 검색된다)
+    pub fn remote_only(&self) -> bool {
+        self.folders == 0 && self.remote > 0
     }
 }
 
@@ -368,6 +375,8 @@ pub struct GemmaApp {
     pub lend_last: Option<Arc<Mutex<crate::lend::LendStatus>>>,
     pub lend_want_server: Arc<AtomicBool>,
     pub lend_overlay_dismissed: bool,
+    /// 원격 라이브러리 (ui/mesh.rs): 메시 기기 상태, 참여·붙이기, 원격 썸네일, 자동 빌려주기
+    pub mesh: crate::ui::mesh::MeshUi,
     /// 첫 실행 마법사
     pub setup_open: bool,
     pub setup: crate::ui::setup::SetupState,
@@ -531,6 +540,7 @@ impl GemmaApp {
             lend: None,
             lend_last: None,
             lend_want_server: Arc::new(AtomicBool::new(false)),
+            mesh: crate::ui::mesh::MeshUi::new(egui_ctx),
             lend_overlay_dismissed: false,
             new_root: String::new(),
             notice: None,
@@ -651,7 +661,10 @@ impl GemmaApp {
         }
         if app.cfg.auto_start_server || flag("--start-server") {
             app.start_server_manual();
-        } else if app.auto_index || app.auto_query.is_some() {
+        } else if app.auto_index
+            || (app.auto_query.is_some() && (app.cfg.remote_libraries.is_empty() || app.local_search_needed()))
+        {
+            // 원격 라이브러리만 검색할 때는 이 기기 서버가 필요 없다
             app.start_server_auto();
         }
         // 첫 실행: 준비물·폴더가 이미 다 있으면(예전 버전에서 쓰던 설정) 마법사 없이 끝난 것으로
@@ -761,7 +774,9 @@ impl GemmaApp {
             return;
         }
         if !self.auto_index && self.auto_query.is_some() && !self.indexer.is_active() {
-            let ready = self.server.state().is_ready()
+            // 이 기기 인덱스 없이 원격 라이브러리만 있으면 이 기기의 서버를 기다리지 않는다
+            let remote_only = !self.cfg.remote_libraries.is_empty() && !self.local_search_needed();
+            let ready = (self.server.state().is_ready() || remote_only)
                 && !self.store_loading.load(Ordering::SeqCst)
                 && self.search_rx.is_none();
             if ready {
@@ -778,6 +793,8 @@ impl GemmaApp {
         let mut s = self.saved_cfg.clone();
         s.min_relevance = self.cfg.min_relevance;
         s.search_excluded_folders = self.cfg.search_excluded_folders.clone();
+        // 검색 화면에서 원격 라이브러리를 켜고 끈 것
+        s.remote_libraries = self.cfg.remote_libraries.clone();
         if s.save(&self.data_dir).is_ok() {
             self.saved_cfg = s;
         }
@@ -785,6 +802,12 @@ impl GemmaApp {
 
     pub fn persist_min_score(&mut self) {
         self.persist_search_prefs();
+    }
+
+    /// 이 기기 인덱스도 검색해야 하는지: 검색 폴더가 있거나, 예전에 인덱싱한 파일이 남아 있으면.
+    /// 검색 폴더 없이 원격 라이브러리만 쓰면 이 기기의 서버(llama-server)를 켜지 않고 원격에만 묻는다.
+    pub fn local_search_needed(&self) -> bool {
+        !self.cfg.roots.is_empty() || self.store.read().file_count() > 0
     }
 
     /// 지금 폴더 선택으로 만든 필터 (전부 선택이면 None)
@@ -936,6 +959,7 @@ impl GemmaApp {
             root_exists,
             indexed_files: self.store.read().file_count(),
             ffmpeg: c.ffmpeg().is_some() && c.ffprobe().is_some(),
+            remote: c.remote_libraries.len(),
         };
         self.health_cache = Some((Instant::now(), h.clone()));
         h
@@ -1812,7 +1836,13 @@ impl GemmaApp {
             }
         }
         self.last_activity = Instant::now();
-        if !self.server.state().is_ready() {
+        // 원격 라이브러리에도 묻는다 (이미지로 찾기는 아직 이 기기 인덱스만). 꺼진 것으로 알려진 기기는 묻지 않는다.
+        let (remote, offline) = match &q {
+            QueryKind::Text(_) => self.remote_queries(),
+            QueryKind::Image(_) => (Vec::new(), Vec::new()),
+        };
+        let local = (remote.is_empty() && offline.is_empty()) || self.local_search_needed();
+        if local && !self.server.state().is_ready() {
             // 서버가 꺼져 있으면 켜고, 준비되면 이 검색을 실행
             let st = self.server.state();
             if st.is_running() {
@@ -1845,8 +1875,36 @@ impl GemmaApp {
         let top_k = self.cfg.top_k.max(1);
         let ff = self.cfg.ffmpeg();
         let min_score = self.cfg.min_relevance;
+        let (sections, path) = (self.filter_sections, self.path_filter.clone());
         std::thread::spawn(move || {
-            let o = query::run(&target, &store, &db, q, filter, top_k, min_score, ff);
+            let t0 = Instant::now();
+            let text = match &q {
+                QueryKind::Text(t) => t.clone(),
+                QueryKind::Image(_) => String::new(),
+            };
+            // 원격 기기마다 동시에 묻고, 그동안 이 기기 인덱스를 찾는다
+            let asks: Vec<_> = remote
+                .into_iter()
+                .map(|r| {
+                    let (text, path) = (text.clone(), path.clone());
+                    std::thread::spawn(move || crate::mesh::client::search(&r, &text, &sections, &path))
+                })
+                .collect();
+            let mut o = if local {
+                query::run(&target, &store, &db, q.clone(), filter, top_k, min_score, ff)
+            } else {
+                Outcome::empty(&q)
+            };
+            for a in asks {
+                if let Ok(a) = a.join() {
+                    let note = query::RemoteNote { name: a.device_name.clone(), error: a.error.clone() };
+                    o.merge_remote(note, a.hits, a.searched);
+                }
+            }
+            for note in offline {
+                o.merge_remote(note, Vec::new(), 0);
+            }
+            o.elapsed = t0.elapsed();
             let _ = tx.send(o);
         });
         self.search_rx = Some(rx);
@@ -1881,6 +1939,11 @@ impl GemmaApp {
     pub fn thumb_texture(&mut self, ctx: &egui::Context, chunk_id: i64) -> Option<egui::TextureHandle> {
         if let Some(t) = self.thumbs.get(&chunk_id) {
             return t.clone();
+        }
+        // 원격 결과(음수 번호): 소유 기기에서 받아 온다 (받으면 thumbs에 들어간다)
+        if chunk_id < 0 {
+            self.request_remote_thumb(ctx, chunk_id);
+            return None;
         }
         let tex = self
             .db
@@ -1937,6 +2000,7 @@ impl GemmaApp {
                     // 예전 검색어로 고른 기록은 버린다 (나중에 같은 검색어를 다시 쳤을 때 엉뚱한 줄을 지키지 않게)
                     self.nav_query = None;
                 }
+                self.mesh_register_outcome(&o);
                 self.outcome = Some(o);
                 self.search_rx = None;
                 self.search_started = None;
@@ -2002,6 +2066,7 @@ impl GemmaApp {
         // 트레이·단축키, 기다리던 검색, 유휴 서버, 빠른 검색창
         self.handle_shell(ctx);
         self.lend_logic();
+        self.mesh_logic(ctx);
         self.run_pending_search();
         self.idle_stop();
         self.update_tray();

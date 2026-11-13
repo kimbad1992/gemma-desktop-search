@@ -8,6 +8,7 @@ use crate::extract::{Kind, Modality};
 use crate::index::db::Db;
 use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// 키워드 가산점 (관련도 단위 = 표준편차). 번호·코드 조회형 질의는 두 배이고 의미는 절반만 (DigUp과 같은 값).
@@ -29,6 +30,29 @@ pub struct HitView {
     /// 질의 단어를 강조 표식(MARK_START/END)으로 감싼 발췌
     pub highlight: Option<String>,
     pub thumb_chunk: Option<i64>,
+    /// 원격 라이브러리에서 온 결과면 그 출처 (이 기기 인덱스의 결과면 None).
+    /// 원격 결과의 `hit.file_id`·`chunk_id`·`thumb_chunk`는 이 기기 번호와 겹치지 않게 만든 음수다.
+    pub remote: Option<Arc<RemoteHit>>,
+}
+
+/// 원격 라이브러리 결과의 출처: 소유 기기와 그 인덱스의 번호
+#[derive(Clone, Debug)]
+pub struct RemoteHit {
+    pub device_id: String,
+    /// 화면에 보일 출처 이름 (소유 기기의 컴퓨터 이름)
+    pub device_name: String,
+    /// 소유 기기의 썸네일 조각 번호
+    pub thumb: Option<i64>,
+    /// 소유 기기 쪽 경로 (`hit.path`는 이 기기에서 여는 경로)
+    pub owner_path: String,
+}
+
+/// 원격 기기 하나의 검색 결과 요약 (요약 줄에 보인다)
+#[derive(Clone, Debug)]
+pub struct RemoteNote {
+    pub name: String,
+    /// 실패 까닭 ("연결 안 됨" 등)
+    pub error: Option<String>,
 }
 
 impl HitView {
@@ -53,11 +77,58 @@ pub struct Outcome {
     pub kind_hints: Vec<Section>,
     /// 미리보기 강조용 키워드 식
     pub expr: Option<String>,
+    /// 함께 물은 원격 기기들 (원격 라이브러리가 없으면 빈 것)
+    pub remote: Vec<RemoteNote>,
 }
 
 impl Outcome {
     pub fn total_files(&self) -> usize {
         self.sections.iter().map(|(_, v)| v.len()).sum()
+    }
+
+    /// 이 기기 인덱스 없이 원격 라이브러리만 검색할 때의 빈 결과
+    pub fn empty(q: &QueryKind) -> Self {
+        Outcome {
+            label: match q {
+                QueryKind::Text(s) => format!("“{}”", s.trim()),
+                QueryKind::Image(p) => format!(
+                    "이미지: {}",
+                    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                ),
+            },
+            sections: Vec::new(),
+            elapsed: Duration::ZERO,
+            searched_chunks: 0,
+            error: None,
+            kind_hints: match q {
+                QueryKind::Text(s) => keyword::kind_hints(s),
+                QueryKind::Image(_) => Vec::new(),
+            },
+            expr: None,
+            remote: Vec::new(),
+        }
+    }
+
+    /// 원격 기기 하나의 결과를 합친다. 관련도는 인덱스마다 "그 검색에서 얼마나 두드러지나"라서 그대로 섞어
+    /// 섹션마다 관련도 순으로 다시 늘어놓는다 (설계 7.5).
+    pub fn merge_remote(&mut self, note: RemoteNote, hits: Vec<(Section, HitView)>, searched: usize) {
+        for (sec, hv) in hits {
+            match self.sections.iter_mut().find(|(s, _)| *s == sec) {
+                Some((_, v)) => v.push(hv),
+                None => self.sections.push((sec, vec![hv])),
+            }
+        }
+        for (_, v) in &mut self.sections {
+            v.sort_by(|a, b| b.hit.score.total_cmp(&a.hit.score));
+        }
+        self.sections.sort_by_key(|(s, _)| *s as usize);
+        self.searched_chunks += searched;
+        self.remote.push(note);
+    }
+
+    /// 원격 결과가 섞여 있는지 (결과마다 출처를 보일지)
+    pub fn has_remote(&self) -> bool {
+        self.sections.iter().any(|(_, v)| v.iter().any(|h| h.remote.is_some()))
     }
 }
 
@@ -81,6 +152,7 @@ pub fn run(
         error: Some(msg),
         kind_hints: Vec::new(),
         expr: None,
+        remote: Vec::new(),
     };
     let client = EmbedClient::new(target);
     let (label, input, text) = match &q {
@@ -164,6 +236,7 @@ pub fn run(
                         highlight,
                         thumb_chunk,
                         hit,
+                        remote: None,
                     }
                 })
                 .collect();
@@ -178,6 +251,7 @@ pub fn run(
         error: None,
         kind_hints: text.as_deref().map(keyword::kind_hints).unwrap_or_default(),
         expr: kw.expr.clone(),
+        remote: Vec::new(),
     }
 }
 

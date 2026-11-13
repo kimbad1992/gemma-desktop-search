@@ -277,9 +277,123 @@ pub fn is_network_path(path: &str) -> bool {
     fs_type_of(path.trim(), &mounts).is_some_and(fs_is_remote)
 }
 
+// ── 메시: SMB 마운트, 주소 ──
+
+/// `/proc/mounts`의 `\040` 같은 8진수 표기를 푼다
+fn unescape_mount(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 3 < b.len() && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c)) {
+            let v = (b[i + 1] - b'0') as u32 * 64 + (b[i + 2] - b'0') as u32 * 8 + (b[i + 3] - b'0') as u32;
+            out.push(v as u8);
+            i += 4;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `/proc/mounts` 내용에서 `path`가 놓인 SMB(cifs) 마운트: (원격 이름 `//서버/공유[/아래]`, 마운트 지점)
+fn smb_mount_in(path: &str, mounts: &str) -> Option<(String, String)> {
+    let mut best: Option<(String, String)> = None;
+    for line in mounts.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(dev), Some(mp), Some(fstype)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if !matches!(fstype, "cifs" | "smb3" | "smbfs") {
+            continue;
+        }
+        let mp = unescape_mount(mp);
+        let inside = path == mp || path.starts_with(&format!("{}/", mp.trim_end_matches('/')));
+        if inside && best.as_ref().is_none_or(|(_, m)| mp.len() > m.len()) {
+            best = Some((unescape_mount(dev), mp));
+        }
+    }
+    best
+}
+
+/// `path`가 놓인 SMB(cifs) 마운트: (원격 이름 `//서버/공유[/아래]`, 마운트 지점). 아니면 None.
+pub fn smb_mount_of(path: &str) -> Option<(String, String)> {
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    smb_mount_in(path.trim(), &mounts)
+}
+
+/// 이 기기 안에서만 쓰는 가상 네트워크 장치인지 (Docker·가상 머신·컨테이너 브리지). 다른 기기는 그 주소로 닿지
+/// 못하므로 알리지 않는다. VPN(tailscale0, wg0, zt…)과 실제 장치는 남긴다.
+fn internal_interface(name: &str) -> bool {
+    const PREFIXES: [&str; 12] =
+        ["docker", "br-", "veth", "virbr", "vnet", "cni", "flannel", "podman", "lxcbr", "lxdbr", "vmnet", "vboxnet"];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// 이 기기의 IP 주소들 (다른 기기가 닿을 수 있는 네트워크 장치: 가상 브리지는 뺀다)
+pub fn local_addresses() -> Vec<std::net::IpAddr> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let mut out = Vec::new();
+    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
+        return out;
+    }
+    let mut cur = ifap;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        let name = if ifa.ifa_name.is_null() {
+            String::new()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned()
+        };
+        if !ifa.ifa_addr.is_null() && !internal_interface(&name) {
+            let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+            if family == libc::AF_INET {
+                let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr))));
+            } else if family == libc::AF_INET6 {
+                let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                out.push(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+            }
+        }
+        cur = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(ifap) };
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_smb_mount_of_a_path() {
+        let mounts = "\
+/dev/sda1 / ext4 rw 0 0
+//leeubuntu/\\352\\263\\265\\354\\234\\240 /mnt/home\\040nas cifs rw 0 0
+//nas/media/photos /mnt/photos smb3 rw 0 0
+server:/export /mnt/nfs nfs4 rw 0 0
+";
+        assert_eq!(
+            smb_mount_in("/mnt/home nas/사진/a.jpg", mounts),
+            Some(("//leeubuntu/공유".to_string(), "/mnt/home nas".to_string()))
+        );
+        assert_eq!(
+            smb_mount_in("/mnt/photos", mounts),
+            Some(("//nas/media/photos".to_string(), "/mnt/photos".to_string()))
+        );
+        assert_eq!(smb_mount_in("/mnt/nfs/x", mounts), None);
+        assert_eq!(smb_mount_in("/home/me", mounts), None);
+        assert!(!local_addresses().is_empty() || std::env::var("CI").is_ok());
+        // Docker·가상 머신 브리지는 알리지 않고, VPN과 실제 장치는 알린다
+        for n in ["docker0", "br-127a87fa168c", "veth1a2b", "virbr0", "vboxnet0"] {
+            assert!(internal_interface(n), "{n}");
+        }
+        for n in ["tailscale0", "lan0", "eth0", "enp3s0", "wlan0", "wg0", "zt5u4y6"] {
+            assert!(!internal_interface(n), "{n}");
+        }
+    }
 
     #[test]
     fn finds_the_mount_a_path_lives_on() {

@@ -93,6 +93,10 @@ impl GemmaApp {
                 hv.hit.cosine
             ));
             widgets::tone_label(ui, Tone::Info, why(hv));
+            if let Some(r) = &hv.remote {
+                widgets::tone_label(ui, Tone::Muted, format!("출처: {} (원격 라이브러리)", r.device_name))
+                    .on_hover_text(format!("그 기기의 경로: {}", r.owner_path));
+            }
         });
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
@@ -142,7 +146,15 @@ impl GemmaApp {
                 }
             }
             // 글: 문서 구간 전체를 검색어 강조로
-            if hv.hit.modality == Modality::Text {
+            if hv.hit.modality == Modality::Text && hv.remote.is_some() {
+                // 원격 결과: 그 기기가 보내 준 찾은 부분만 (구간 전체는 그 기기의 인덱스에 있다)
+                ui.add_space(4.0);
+                match &hv.highlight {
+                    Some(h) => ui.add(egui::Label::new(highlight_job(ui, h, 14.0)).wrap()),
+                    None => ui.add(egui::Label::new(RichText::new(&hv.snippet).size(14.0)).wrap()),
+                };
+                ui.label(RichText::new("(원격 라이브러리의 결과라 찾은 부분만 보입니다. 열면 전체를 봅니다)").small().weak());
+            } else if hv.hit.modality == Modality::Text {
                 let text = {
                     let db = self.db.lock();
                     expr.and_then(|e| db.fts_highlight(hv.hit.chunk_id, e))

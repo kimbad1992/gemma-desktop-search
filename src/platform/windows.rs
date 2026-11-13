@@ -487,9 +487,88 @@ pub fn is_network_path(path: &str) -> bool {
     false
 }
 
+// ── 메시: 네트워크 드라이브, 공유, 주소 ──
+
+/// 네트워크 드라이브 문자에 연결된 원격 이름: `Z` → `\\leeubuntu\공유` (연결하지 않은 문자면 None)
+pub fn mapped_drive_target(letter: char) -> Option<String> {
+    use windows_sys::Win32::NetworkManagement::WNet::WNetGetConnectionW;
+    let local: Vec<u16> = format!("{letter}:").encode_utf16().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let mut len = buf.len() as u32;
+    let r = unsafe { WNetGetConnectionW(local.as_ptr(), buf.as_mut_ptr(), &mut len) };
+    if r != 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n])).filter(|s| !s.is_empty())
+}
+
+/// 이 기기가 공유한 폴더: Windows 공유 이름 → 폴더. 서버 서비스의 공유 목록(레지스트리)을 읽는다
+/// (NetShareGetInfo의 폴더 정보는 관리자 권한이 있어야 하지만 이 목록은 보통 사용자도 읽는다).
+pub fn share_folder(name: &str) -> Option<String> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_MULTI_SZ};
+    let key = wide(std::ffi::OsStr::new(r"SYSTEM\CurrentControlSet\Services\LanmanServer\Shares"));
+    let value = wide(std::ffi::OsStr::new(name));
+    let mut buf = vec![0u16; 8192];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_MULTI_SZ,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr() as *mut _,
+            &mut len,
+        )
+    };
+    if r != ERROR_SUCCESS {
+        return None;
+    }
+    let n = (len as usize / 2).min(buf.len());
+    let entries: Vec<String> = String::from_utf16_lossy(&buf[..n])
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    share_path_of(&entries)
+}
+
+/// 공유 정보 항목들(`Path=C:\…`, `Permissions=0`, …)에서 폴더
+fn share_path_of(entries: &[String]) -> Option<String> {
+    entries.iter().find_map(|e| {
+        let (k, v) = e.split_once('=')?;
+        (k.trim().eq_ignore_ascii_case("path") && !v.trim().is_empty()).then(|| v.trim().to_string())
+    })
+}
+
+/// 이 기기의 IP 주소들: 컴퓨터 이름을 풀어 얻는다 (Windows는 모든 어댑터의 주소를 돌려준다)
+pub fn local_addresses() -> Vec<std::net::IpAddr> {
+    use std::net::ToSocketAddrs;
+    let Ok(name) = std::env::var("COMPUTERNAME") else {
+        return Vec::new();
+    };
+    (name.as_str(), 0)
+        .to_socket_addrs()
+        .map(|it| it.map(|a| a.ip()).collect())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn share_entries() {
+        let e = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            share_path_of(&e(&["CSCFlags=0", "MaxUses=4294967295", r"Path=D:\Media", "Permissions=0"])),
+            Some(r"D:\Media".to_string())
+        );
+        assert_eq!(share_path_of(&e(&["Type=0"])), None);
+        assert_eq!(mapped_drive_target('?'), None);
+    }
 
     #[test]
     fn network_paths() {

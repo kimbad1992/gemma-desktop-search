@@ -54,6 +54,14 @@ impl GemmaApp {
                 (crate::cli::is_local(&base) && !self.cfg.service_token.trim().is_empty())
                     .then(|| self.cfg.service_token.trim().to_string())
             });
+        self.start_lending_to(ctx, base, token)
+    }
+
+    /// 이 주소·토큰의 소유 기기에 빌려주기를 시작한다 (설정의 빌려주기, 원격 라이브러리 인덱싱 동안의 자동 빌려주기)
+    pub fn start_lending_to(&mut self, ctx: &egui::Context, base: String, token: Option<String>) -> Result<(), String> {
+        if self.lend.is_some() {
+            return Err("이미 빌려주고 있습니다".to_string());
+        }
         let (flag, c1, c2) = (self.lend_want_server.clone(), ctx.clone(), ctx.clone());
         let log_server = self.server.clone();
         let hooks = LendHooks {
@@ -63,7 +71,28 @@ impl GemmaApp {
                 c1.request_repaint();
                 Ok(())
             }),
-            rest: Arc::new(|| crate::shell::user_busy().then(|| "전체 화면 앱을 쓰는 중".to_string())),
+            rest: {
+                let srv = self.server.clone();
+                let need = crate::sysinfo::lend_vram_need_mb(self.cfg.ubatch_size);
+                Arc::new(move || {
+                    if crate::shell::user_busy() {
+                        return Some("전체 화면 앱을 쓰는 중".to_string());
+                    }
+                    // 우리 llama-server를 켜기 전에만 본다(켠 뒤에는 우리 몫이 섞인다): 다른 프로그램(다른 LLM 서버, 게임 등)이
+                    // 그래픽 메모리를 잡고 있어 모자라면 켜지 않는다 (NVIDIA만. 모르면 막지 않는다)
+                    let st = srv.state();
+                    if !st.is_running() && !st.is_ready() {
+                        if let Some(free) = crate::sysinfo::nvidia_free_vram_mb().filter(|f| *f < need) {
+                            return Some(format!(
+                                "남은 그래픽 메모리 {:.1}GB (필요 약 {:.1}GB)",
+                                free as f64 / 1024.0,
+                                need as f64 / 1024.0
+                            ));
+                        }
+                    }
+                    None
+                })
+            },
             stop_server_when_idle: false,
             stop_server_at_end: false,
             log: Arc::new(move |m: &str| log_server.log(format!("[빌려주기] {m}"))),

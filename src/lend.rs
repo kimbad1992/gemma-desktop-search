@@ -327,14 +327,18 @@ struct Counters {
     failed: AtomicU64,
 }
 
-/// 이 기기의 이름: 컴퓨터 이름, 없으면 "이름 없는 기기"
+/// 이 기기의 이름: 컴퓨터 이름, 없으면 "이름 없는 기기".
+/// Linux는 지금 쓰는 호스트 이름(커널)을 `/etc/hostname`보다 먼저 본다. 둘이 다를 수 있고(`lee_ubuntu`처럼
+/// 호스트 이름에 쓸 수 없는 글자가 든 파일), 다른 기기는 지금 이름으로 이 기기를 부른다(`\\leeubuntu\…`).
 pub fn machine_name() -> String {
     let from_env = ["COMPUTERNAME", "HOSTNAME"].iter().find_map(|k| std::env::var(k).ok());
+    let from_kernel = || std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
     let from_file = || std::fs::read_to_string("/etc/hostname").ok();
-    from_env
-        .or_else(from_file)
+    [from_env, from_kernel(), from_file()]
+        .into_iter()
+        .flatten()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .find(|s| !s.is_empty())
         .unwrap_or_else(|| "이름 없는 기기".to_string())
 }
 

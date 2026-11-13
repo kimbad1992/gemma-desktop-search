@@ -65,13 +65,13 @@ impl GemmaApp {
         let (mut go_settings, mut start_server) = (false, false);
         if loading {
             // 요약 줄에 진행을 보인다
-        } else if files == 0 {
+        } else if files == 0 && self.cfg.remote_libraries.is_empty() {
             widgets::callout_ui(ui, Tone::Warn, "검색할 자료가 아직 없습니다", |ui| {
                 ui.label("설정에서 폴더를 추가하고 검색 준비(인덱싱)를 하면 여기서 찾을 수 있습니다.");
                 go_settings = widgets::button(ui, Btn::Secondary, "설정 열기").clicked();
             });
             ui.add_space(space::M);
-        } else if !server_state.is_running() && !self.cfg.server_on_demand {
+        } else if files > 0 && !server_state.is_running() && !self.cfg.server_on_demand {
             // 자동으로 켜는 설정이면 검색할 때 알아서 켜지므로 알릴 필요가 없다
             widgets::callout_ui(ui, Tone::Warn, "서버가 꺼져 있습니다", |ui| {
                 ui.label("검색하려면 서버를 켜야 합니다.");
@@ -309,6 +309,13 @@ impl GemmaApp {
                             format!("{shown}개 파일")
                         },
                     );
+                    // 원격 라이브러리: 닿지 않았거나 실패한 기기
+                    for n in &o.remote {
+                        if let Some(e) = &n.error {
+                            widgets::tone_label(ui, Tone::Warn, format!("{}: {e}", n.name))
+                                .on_hover_text("그 기기의 원격 라이브러리는 빼고 찾았습니다");
+                        }
+                    }
                     // 걸린 시간은 오른쪽 끝에. 자리가 모자라면(좁은 창) 뺀다.
                     let took = format!("{:.2}초 · 벡터 {}개 비교", o.elapsed.as_secs_f32(), fmt_num(o.searched_chunks as u64));
                     let font = egui::TextStyle::Small.resolve(ui.style());
@@ -319,11 +326,35 @@ impl GemmaApp {
                         });
                     }
                 }
-            } else if files > 0 {
-                widgets::caption(
-                    ui,
-                    &format!("파일 {}개 · 벡터 {}개에서 찾습니다", fmt_num(files as u64), fmt_num(chunks as u64)),
-                );
+            } else if files > 0 || !self.cfg.remote_libraries.is_empty() {
+                let remote = self.cfg.remote_libraries.iter().filter(|l| l.enabled).count();
+                let mut line = if files > 0 {
+                    format!("파일 {}개 · 벡터 {}개에서 찾습니다", fmt_num(files as u64), fmt_num(chunks as u64))
+                } else {
+                    String::new()
+                };
+                if remote > 0 {
+                    if !line.is_empty() {
+                        line += " · ";
+                    }
+                    line += &format!("원격 라이브러리 {remote}개도 함께");
+                }
+                widgets::caption(ui, &line);
+                // 원격 라이브러리를 소유 기기가 인덱싱하는 중이면 그 진행 (끝난 파일부터 검색된다)
+                for d in &self.cfg.mesh_devices {
+                    if !self.cfg.remote_libraries.iter().any(|l| l.enabled && l.device_id == d.id) {
+                        continue;
+                    }
+                    if let Some(st) = self.mesh.monitor.state(&d.id).filter(|s| s.reachable == Some(true) && s.indexing.busy()) {
+                        let i = &st.indexing;
+                        let text = if i.discovered > 0 {
+                            format!("{}에서 인덱싱 중 {} / {}", d.name, fmt_num(i.processed), fmt_num(i.discovered))
+                        } else {
+                            format!("{}에서 인덱싱 준비 중", d.name)
+                        };
+                        widgets::tone_label(ui, Tone::Info, text).on_hover_text("처리가 끝난 파일부터 검색됩니다");
+                    }
+                }
             }
         });
     }
@@ -430,7 +461,7 @@ impl GemmaApp {
         use crate::search::store::OTHER_FOLDER_KEY;
         let p = palette(ui.visuals());
         let folders = self.folders.lock().clone();
-        let has_folders = !(folders.list.is_empty() && folders.other == 0);
+        let has_folders = !(folders.list.is_empty() && folders.other == 0) || !self.cfg.remote_libraries.is_empty();
         let (mut folders_changed, mut reset) = (false, false);
 
         ui.horizontal_wrapped(|ui| {
@@ -454,8 +485,11 @@ impl GemmaApp {
             if has_folders {
                 let excluded = &self.cfg.search_excluded_folders;
                 let other_on = folders.other > 0 && !excluded.iter().any(|k| k == OTHER_FOLDER_KEY);
-                let n_total = folders.list.len() + usize::from(folders.other > 0);
-                let n_on = folders.list.iter().filter(|f| !excluded.contains(&f.key)).count() + usize::from(other_on);
+                let remote = &self.cfg.remote_libraries;
+                let n_total = folders.list.len() + usize::from(folders.other > 0) + remote.len();
+                let n_on = folders.list.iter().filter(|f| !excluded.contains(&f.key)).count()
+                    + usize::from(other_on)
+                    + remote.iter().filter(|l| l.enabled).count();
                 folders_filtered = n_on != n_total;
                 let summary = if folders_filtered { format!("폴더 {n_on}/{n_total}") } else { "폴더 전체".to_string() };
                 widgets::multi_dropdown(ui, "filter_folders", Icon::Folder, &summary, folders_filtered, |ui| {
@@ -563,6 +597,12 @@ impl GemmaApp {
                 self.cfg.search_excluded_folders.clear();
                 folders_changed = true;
             }
+            for l in &mut self.cfg.remote_libraries {
+                if !l.enabled {
+                    l.enabled = true;
+                    folders_changed = true;
+                }
+            }
         }
         if folders_changed {
             self.on_folder_selection_changed();
@@ -573,9 +613,11 @@ impl GemmaApp {
     fn folder_menu(&mut self, ui: &mut egui::Ui, folders: &FolderStats) -> bool {
         use crate::search::store::OTHER_FOLDER_KEY;
         let mut changed = false;
+        let remote_all = self.cfg.remote_libraries.iter().all(|l| l.enabled);
         let excluded = &mut self.cfg.search_excluded_folders;
         let all = folders.list.iter().all(|f| !excluded.contains(&f.key))
-            && (folders.other == 0 || !excluded.iter().any(|k| k == OTHER_FOLDER_KEY));
+            && (folders.other == 0 || !excluded.iter().any(|k| k == OTHER_FOLDER_KEY))
+            && remote_all;
         if ui.button(if all { "모두 해제" } else { "모두 선택" }).clicked() {
             excluded.clear();
             if all {
@@ -583,6 +625,9 @@ impl GemmaApp {
                 if folders.other > 0 {
                     excluded.push(OTHER_FOLDER_KEY.to_string());
                 }
+            }
+            for l in &mut self.cfg.remote_libraries {
+                l.enabled = !all;
             }
             changed = true;
         }
@@ -620,6 +665,30 @@ impl GemmaApp {
                     excluded.push(OTHER_FOLDER_KEY.to_string());
                 }
                 changed = true;
+            }
+        }
+        // 원격 라이브러리 (다른 기기가 인덱싱한 폴더)
+        if !self.cfg.remote_libraries.is_empty() {
+            ui.separator();
+            let names: Vec<(String, String)> = self
+                .cfg
+                .remote_libraries
+                .iter()
+                .map(|l| {
+                    let device = self.cfg.mesh_devices.iter().find(|d| d.id == l.device_id);
+                    let st = self.mesh.monitor.state(&l.device_id);
+                    let (_, status) = crate::ui::mesh::library_status(l, device, st.as_ref());
+                    (l.name(), status)
+                })
+                .collect();
+            for (l, (name, status)) in self.cfg.remote_libraries.iter_mut().zip(names) {
+                if ui
+                    .checkbox(&mut l.enabled, format!("{name} ({status})"))
+                    .on_hover_text(format!("{}\n원격 라이브러리: 그 기기가 인덱싱하고 이 PC는 검색만 합니다", l.local_folder))
+                    .changed()
+                {
+                    changed = true;
+                }
             }
         }
         changed
@@ -849,6 +918,10 @@ impl GemmaApp {
                         ui.label(RichText::new("검색어").small().color(Tone::Ok.fg(ui.visuals())))
                             .on_hover_text("파일 이름이나 폴더 이름에 검색어가 들어 있습니다");
                     }
+                    if let Some(r) = &hv.remote {
+                        ui.add(egui::Label::new(RichText::new(&r.device_name).small().color(Tone::Info.fg(ui.visuals()))).truncate())
+                            .on_hover_text("원격 라이브러리: 그 기기의 인덱스에서 찾았습니다");
+                    }
                 });
             });
         });
@@ -901,6 +974,7 @@ impl GemmaApp {
         divider: bool,
     ) -> bool {
         let is_sel = self.selected == Some((sec, hv.hit.file_id));
+        let show_source = self.mesh.show_source;
         // 줄 사이 구분선 (고른 줄의 위아래는 빼서 강조 테두리와 겹치지 않게)
         let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
         if divider && !is_sel {
@@ -919,8 +993,18 @@ impl GemmaApp {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     let loc = locator_label(hv);
                     let keyword = hv.keyword_match();
+                    // 원격 결과가 섞여 있으면 결과마다 출처 (이 PC, 홈서버 …)
+                    let source = source_label(hv, show_source);
                     // 어디가 맞았는지 알리는 꼬리표들
                     let tags = |ui: &mut egui::Ui| {
+                        if let Some(src) = &source {
+                            widgets::tone_tag(ui, if hv.remote.is_some() { Tone::Info } else { Tone::Muted }, src)
+                                .on_hover_text(if hv.remote.is_some() {
+                                    "원격 라이브러리: 그 기기의 인덱스에서 찾았습니다"
+                                } else {
+                                    "이 PC의 인덱스에서 찾았습니다"
+                                });
+                        }
                         if show_kind {
                             widgets::tone_tag(ui, Tone::Muted, sec.label());
                         }
@@ -934,6 +1018,7 @@ impl GemmaApp {
                     };
                     let mut tags_w = 0.0;
                     for (on, text) in [
+                        (source.is_some(), source.as_deref().unwrap_or_default()),
                         (show_kind, sec.label()),
                         (loc.is_some(), loc.as_deref().unwrap_or_default()),
                         (keyword, "검색어 포함"),
@@ -987,6 +1072,14 @@ impl GemmaApp {
         });
         self.after_hit_response(ctx, sec, hv, &resp);
         is_sel
+    }
+}
+
+/// 결과의 출처 꼬리표: 원격 결과는 소유 기기 이름, 원격 결과가 섞여 있을 때의 이 PC 결과는 "이 PC"
+fn source_label(hv: &HitView, show: bool) -> Option<String> {
+    match &hv.remote {
+        Some(r) => Some(r.device_name.clone()),
+        None => show.then(|| "이 PC".to_string()),
     }
 }
 

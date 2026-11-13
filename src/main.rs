@@ -16,6 +16,7 @@ mod headless;
 mod index;
 mod lend;
 mod location;
+mod mesh;
 #[cfg(feature = "gui")]
 mod open;
 mod paths;
@@ -97,6 +98,8 @@ fn command(args: &[String]) -> Option<i32> {
         #[cfg(feature = "gui")]
         "lend" if !rest.iter().any(|a| a == "--console") => return gui_lend(rest),
         "lend" => lend::lend(rest),
+        // 원격 라이브러리: 이 기기의 참여 코드 (다른 기기의 앱에 넣는다, service.rs)
+        "join-code" => service::join_code_cli(rest),
         // 데이터 위치 확인·옮기기 (location.rs)
         "data" => location::cli(rest),
         "help" | "--help" | "-h" => {
@@ -117,6 +120,11 @@ fn command(args: &[String]) -> Option<i32> {
         "--bench" => headless::bench(rest.first().map(String::as_str).unwrap_or("README.md")),
         "--bench-compare" => headless::bench_compare(rest),
         "--compare-queries" => headless::compare_queries(rest),
+        // 원격 라이브러리를 창 없이 시험 (mesh/cli.rs)
+        "--mesh-join" => mesh::cli::join(rest),
+        "--mesh-add" => mesh::cli::add(rest),
+        "--mesh-status" => mesh::cli::status(rest),
+        "--mesh-search" => mesh::cli::search(rest),
         _ => return None,
     })
 }

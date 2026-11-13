@@ -44,6 +44,7 @@ impl GemmaApp {
     pub fn settings_basic(&mut self, ui: &mut egui::Ui) {
         self.basic_status(ui);
         self.basic_folders(ui);
+        self.basic_mesh(ui);
         self.basic_kinds(ui);
         self.basic_performance(ui);
         self.basic_behavior(ui);
@@ -75,7 +76,14 @@ impl GemmaApp {
 
         widgets::section(ui, "지금 상태", None, |ui| {
             let limited = h.mmproj != Some(true) || !h.ffmpeg;
-            if !h.ready() {
+            if h.remote_only() {
+                widgets::callout(
+                    ui,
+                    Tone::Ok,
+                    "바로 검색할 수 있습니다",
+                    "내 다른 기기가 인덱싱한 원격 라이브러리에서 찾습니다. 이 PC의 폴더도 넣으려면 아래에서 추가하세요.",
+                );
+            } else if !h.ready() {
                 widgets::callout(ui, Tone::Warn, "검색하려면 아래 준비가 필요합니다", "");
             } else if h.indexed_files == 0 {
                 widgets::callout(
@@ -99,6 +107,7 @@ impl GemmaApp {
             // 필요한 파일: AI 모델과 그 모델을 돌리는 프로그램(llama.cpp)
             let (tone, text) = match (h.engine, h.model) {
                 (true, true) => (Tone::Ok, "AI 모델과 llama.cpp가 준비됐습니다"),
+                _ if h.remote_only() => (Tone::Muted, "없음 (원격 라이브러리만 검색할 때는 필요 없습니다)"),
                 (false, false) => (Tone::Danger, "AI 모델과 llama.cpp가 없습니다"),
                 (false, true) => (Tone::Danger, "llama.cpp(AI 모델을 돌리는 프로그램)가 없습니다"),
                 (true, false) => (Tone::Danger, "AI 모델이 없습니다"),
@@ -129,7 +138,10 @@ impl GemmaApp {
             }
 
             let folders_text;
-            let (tone, text) = if h.folders == 0 {
+            let (tone, text) = if h.remote_only() {
+                folders_text = format!("원격 라이브러리 {}개", h.remote);
+                (Tone::Ok, folders_text.as_str())
+            } else if h.folders == 0 {
                 (Tone::Danger, "아래에서 폴더를 추가하세요")
             } else if h.missing_folders > 0 {
                 folders_text = format!("{}개 중 {}개를 찾을 수 없습니다", h.folders, h.missing_folders);
@@ -145,6 +157,8 @@ impl GemmaApp {
             } else if h.indexed_files > 0 {
                 let text = format!("파일 {}개를 찾을 수 있습니다", crate::util::fmt_num(h.indexed_files as u64));
                 health_row(ui, "검색 자료", Tone::Ok, &text, |_| {});
+            } else if h.remote_only() {
+                health_row(ui, "검색 자료", Tone::Ok, "다른 기기의 인덱스에서 찾습니다", |_| {});
             } else {
                 health_row(ui, "검색 자료", Tone::Warn, "아직 없습니다", |ui| {
                     if widgets::button_enabled(ui, Btn::Secondary, h.ready(), "지금 만들기")
@@ -269,11 +283,18 @@ impl GemmaApp {
                         }
                     });
                 }
-                if self.cfg.roots.is_empty() {
+                // 다른 기기가 인덱싱하고 이 PC는 검색만 하는 폴더 (ui/mesh.rs)
+                self.remote_library_rows(ui);
+                if self.cfg.roots.is_empty() && self.cfg.remote_libraries.is_empty() {
                     widgets::help(ui, "사진·문서·영상이 들어 있는 폴더를 추가하세요.");
                 }
                 ui.add_space(space::XS);
-                add = widgets::button(ui, Btn::Secondary, "폴더 추가…").clicked();
+                add = widgets::button_enabled(ui, Btn::Secondary, self.mesh.can_add(), "폴더 추가…")
+                    .on_hover_text(
+                        "이 PC의 폴더나 네트워크 폴더를 고릅니다. Gemma Search가 도는 기기의 공유 폴더면 그 기기가 \
+                         인덱싱하고 이 PC에서 검색합니다 (처음 보는 기기면 참여 코드를 물어봅니다)",
+                    )
+                    .clicked();
 
                 if changed {
                     ui.add_space(space::XS);
@@ -292,7 +313,8 @@ impl GemmaApp {
         if add {
             if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                 let s = dir.display().to_string();
-                if !self.cfg.roots.contains(&s) {
+                // 내 다른 기기의 공유 폴더면 그 기기의 라이브러리로 붙인다 (아니면 지금처럼 이 PC가 인덱싱)
+                if !self.mesh_add_folder(&s) && !self.cfg.roots.contains(&s) {
                     self.cfg.roots.push(s);
                     self.invalidate_health();
                 }

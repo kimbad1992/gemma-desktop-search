@@ -113,6 +113,20 @@ pub struct Config {
     pub lend_server: String,
     /// 그 서비스의 접속 토큰 (그 기기 설정의 service_token)
     pub lend_token: String,
+    /// 놀 때 빌려주기(창 있는 앱): 내 다른 기기(`mesh_devices`)가 인덱싱하면 이 기기가 쉬고 있는 동안 계산을
+    /// 빌려준다. 기본 꺼짐 (설계 원칙 5). 꺼져 있어도 이 기기가 추가해 시작된 인덱싱은 돕는다.
+    pub lend_mesh_idle: bool,
+
+    // ── 메시: 원격 라이브러리 (`mesh/`) ──
+    /// 이 기기의 ID. 처음 쓸 때 만들고 바꾸지 않는다 (참여 코드와 라이브러리 ID에 들어간다).
+    pub device_id: String,
+    /// 서비스판: 다른 기기가 원격 라이브러리로 만든 폴더 (`roots`에도 들어 있다). `serve --root`로 폴더를 다시
+    /// 정해도 이 폴더들은 남긴다.
+    pub mesh_added_roots: Vec<String>,
+    /// 참여 코드로 넣은 메시 기기 (다른 기기의 서비스)
+    pub mesh_devices: Vec<crate::mesh::MeshDevice>,
+    /// 이 기기의 검색 대상에 넣은 원격 라이브러리
+    pub remote_libraries: Vec<crate::mesh::RemoteLibrary>,
 }
 
 impl Default for Config {
@@ -224,6 +238,11 @@ impl Default for Config {
             service_token: String::new(),
             lend_server: String::new(),
             lend_token: String::new(),
+            lend_mesh_idle: false,
+            device_id: String::new(),
+            mesh_added_roots: Vec::new(),
+            mesh_devices: Vec::new(),
+            remote_libraries: Vec::new(),
         }
     }
 }

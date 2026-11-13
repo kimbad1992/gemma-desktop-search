@@ -22,7 +22,8 @@ use crate::index::lend::{JobResult, LendHub, LenderInfo};
 use crate::index::progress::{Progress, RunState};
 use crate::search::keyword;
 use crate::search::query::{self, HitView, QueryKind};
-use crate::search::store::{Filter, Section, VectorStore};
+use crate::mesh::{library_id, within, AttachReply, AttachRequest, JoinCode, LibraryInfo, Plan, Sample};
+use crate::search::store::{folder_key, Filter, FolderFilter, Section, VectorStore};
 use crate::server::{ServerManager, ServerState};
 use crate::util::fmt_num;
 use crate::watch::{WatchKey, Watcher};
@@ -106,6 +107,13 @@ pub const USAGE: &str = "\
   서비스 쪽은 빌려주는 기기가 닿을 수 있게 열어 둔다(--bind 0.0.0.0:8787과 토큰, 또는 SSH 터널).
   같은 llama.cpp 빌드와 모델 파일로 띄운 서버끼리만 일감을 주고받는다.
 
+원격 라이브러리:
+  gemma-search join-code          이 기기의 참여 코드를 보여 준다. 다른 기기의 앱(설정 > 일반 > 내 다른 기기)에
+                                  넣고 그 기기에서 이 기기의 공유 폴더(\\\\서버\\공유\\…)를 검색 폴더로 추가하면,
+                                  이 기기가 인덱싱하고(그 기기는 계산을 빌려준다) 그 기기에서 검색된다.
+                                  다른 기기가 같은 폴더를 추가하면 다시 인덱싱하지 않는다.
+  서비스는 다른 기기가 닿게 열어 둔다(--bind 0.0.0.0:8787). 인증은 접속 토큰이라 집 LAN이나 Tailscale 안에서만 쓴다.
+
 업데이트:
   gemma-search update             새 버전이 있으면 받아서 실행 파일을 바꾼다 (관리자 권한 필요 없음)
       --check                     확인만 한다
@@ -118,14 +126,22 @@ const MAX_TEXT_BYTES: u64 = 8 * 1024 * 1024;
 struct Engine {
     data_dir: PathBuf,
     db_path: PathBuf,
-    cfg: Config,
+    /// 설정. 다른 기기가 원격 라이브러리를 만들면(`/api/libraries/attach`) 검색 폴더가 늘어난다.
+    cfg: RwLock<Config>,
     /// 비어 있으면 토큰 없이 받는다 (이 기기에서만 접속할 때)
     token: String,
     db: Arc<Mutex<Db>>,
     store: Arc<RwLock<VectorStore>>,
     server: ServerManager,
     progress: Arc<Mutex<Progress>>,
-    watcher: Option<Watcher>,
+    /// 폴더 감시. 검색 폴더가 바뀌면 메인 루프가 다시 띄운다.
+    watcher: Mutex<Option<Watcher>>,
+    /// 폴더 감시를 쓰는지 (`--no-watch`가 아니면)
+    watch_enabled: bool,
+    /// 검색 폴더가 바뀌었다 (원격 라이브러리를 만듦): 메인 루프가 감시를 새 폴더로 다시 띄운다
+    roots_changed: AtomicBool,
+    /// 라이브러리 붙이기는 한 번에 하나씩 (설정 저장이 겹치지 않게)
+    attach_lock: Mutex<()>,
     /// 마지막 검색·인덱싱 시각 (서버 자동 끄기)
     activity: Mutex<Instant>,
     /// 검색이 서버를 기다리는 중
@@ -183,7 +199,18 @@ pub fn serve(args: &[String]) -> i32 {
     let mut changed = !had_config;
     let roots = values("--root");
     if !roots.is_empty() {
-        cfg.roots = roots;
+        // 다른 기기가 원격 라이브러리로 만든 폴더는 남긴다 (서비스 단위 파일에 --root가 적혀 있어도)
+        let mut r = roots;
+        for m in &cfg.mesh_added_roots {
+            if !r.iter().any(|x| folder_key(x) == folder_key(m)) {
+                r.push(m.clone());
+            }
+        }
+        cfg.roots = r;
+        changed = true;
+    }
+    // 메시에서 이 기기를 알아보는 ID (참여 코드, 라이브러리 ID)
+    if crate::mesh::ensure_device_id(&mut cfg) {
         changed = true;
     }
     for (flag, field) in [
@@ -294,7 +321,8 @@ pub fn serve(args: &[String]) -> i32 {
     let server = ServerManager::default();
     server.set_log_path(&data_dir.join("logs").join("llama-server.log"));
     let indexer = Indexer::default();
-    let watching = !args.iter().any(|a| a == "--no-watch") && !cfg.roots.is_empty();
+    let watch_enabled = !args.iter().any(|a| a == "--no-watch");
+    let watching = watch_enabled && !cfg.roots.is_empty();
     let watcher = watching.then(|| {
         Watcher::start(
             WatchKey::new(&cfg.roots, &cfg.exclude_dirs, cfg.watch_rescan_hours),
@@ -310,7 +338,10 @@ pub fn serve(args: &[String]) -> i32 {
         store: Arc::new(RwLock::new(st)),
         server,
         progress: indexer.progress.clone(),
-        watcher,
+        watcher: Mutex::new(watcher),
+        watch_enabled,
+        roots_changed: AtomicBool::new(false),
+        attach_lock: Mutex::new(()),
         activity: Mutex::new(Instant::now()),
         want_server: AtomicBool::new(false),
         start_error: Mutex::new(None),
@@ -320,7 +351,7 @@ pub fn serve(args: &[String]) -> i32 {
         update_available: Mutex::new(None),
         lend: Arc::new(LendHub::default()),
         stop: stop.clone(),
-        cfg,
+        cfg: RwLock::new(cfg),
     });
     {
         let stop = stop.clone();
@@ -341,11 +372,11 @@ pub fn serve(args: &[String]) -> i32 {
     if !engine.token.is_empty() {
         println!("접속 토큰: {} (페이지를 처음 열 때 묻습니다. 설정 파일의 service_token)", engine.token);
     }
-    match &engine.watcher {
+    match &*engine.watcher.lock() {
         Some(w) => {
             let snap = w.snapshot();
             let network = snap.roots.iter().filter(|r| r.network).count();
-            let every = match engine.cfg.watch_rescan_hours {
+            let every = match engine.cfg.read().watch_rescan_hours {
                 0 => "켤 때 한 번 훑어 확인".to_string(),
                 h => format!("{h}시간마다 훑어 확인"),
             };
@@ -356,11 +387,19 @@ pub fn serve(args: &[String]) -> i32 {
         }
         None => println!("폴더 감시: 끔"),
     }
-    if engine.store.read().file_count() == 0 && !engine.cfg.roots.is_empty() {
+    if !bind_is_loopback(&bind) && !engine.token.is_empty() {
+        println!(
+            "참여 코드: 다른 기기의 앱(설정 > 일반 > 내 다른 기기)에 넣으면 이 기기의 공유 폴더를 원격 라이브러리로 씁니다.\n  \
+             접속 토큰이 들어 있으니 남에게 보이지 마세요. 다시 보려면 `{} join-code`\n  {}",
+            crate::prepare::me(),
+            join_code(&engine.cfg.read())
+        );
+    }
+    if engine.store.read().file_count() == 0 && !engine.cfg.read().roots.is_empty() {
         println!("인덱스가 비어 있어 처음 인덱싱을 시작합니다");
         *engine.index_request.lock() = Some(false);
     }
-    if engine.cfg.check_updates {
+    if engine.cfg.read().check_updates {
         println!("새 버전 확인: 하루 한 번 (알려만 줍니다. 끄려면 설정의 check_updates = false)");
         spawn_update_check(engine.clone());
     }
@@ -471,6 +510,7 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
     let mut our_server = false;
     let mut last_server = ServerState::Stopped;
     while !e.stop.load(Ordering::SeqCst) {
+        let cfg = e.cfg.read().clone();
         let state = e.server.state();
         if state != last_server {
             match &state {
@@ -519,16 +559,27 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
             }
             last_state = ps;
         }
-        // 감시: 훑을 때가 됐으면 훑고, 조용해진 변경을 꺼낸다
-        if let (Some(w), false) = (&e.watcher, active) {
-            if w.scan_due() {
-                w.start_scan(e.db_path.clone(), Arc::new(|| {}));
+        // 검색 폴더가 바뀌었으면(다른 기기가 원격 라이브러리를 만듦) 감시를 새 폴더로 다시 띄운다
+        if e.roots_changed.swap(false, Ordering::SeqCst) && e.watch_enabled {
+            let key = WatchKey::new(&cfg.roots, &cfg.exclude_dirs, cfg.watch_rescan_hours);
+            let mut w = e.watcher.lock();
+            if w.as_ref().is_none_or(|w| w.key() != &key) {
+                *w = Some(Watcher::start(key, &e.data_dir));
+                log(format!("검색 폴더가 바뀌어 폴더 감시를 다시 시작합니다 (폴더 {}개)", cfg.roots.len()));
             }
-            if batch.is_empty() {
-                let ready = w.take_ready();
-                if !ready.is_empty() {
-                    log(format!("바뀐 경로 {}개를 반영합니다", ready.len()));
-                    batch = ready;
+        }
+        // 감시: 훑을 때가 됐으면 훑고, 조용해진 변경을 꺼낸다
+        if !active {
+            if let Some(w) = &*e.watcher.lock() {
+                if w.scan_due() {
+                    w.start_scan(e.db_path.clone(), Arc::new(|| {}));
+                }
+                if batch.is_empty() {
+                    let ready = w.take_ready();
+                    if !ready.is_empty() {
+                        log(format!("바뀐 경로 {}개를 반영합니다", ready.len()));
+                        batch = ready;
+                    }
                 }
             }
         }
@@ -542,9 +593,9 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
             if last_start.is_none_or(|t| t.elapsed() > wait) {
                 last_start = Some(Instant::now());
                 retry = (retry * 2).min(RETRY_MAX);
-                let external = e.cfg.external_server().is_some();
+                let external = cfg.external_server().is_some();
                 log(if external { "외부 llama-server에 연결합니다" } else { "llama-server를 켭니다" });
-                match e.server.bring_up(&e.cfg) {
+                match e.server.bring_up(&cfg) {
                     // 외부 서버는 우리가 켠 것이 아니므로 쓰지 않을 때 끄지 않는다
                     Ok(()) => our_server = !external,
                     Err(err) => {
@@ -569,9 +620,9 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
                 };
                 if let Some((only, full_rebuild)) = job {
                     let started = indexer.start(IndexParams {
-                        cfg: e.cfg.clone(),
+                        cfg: cfg.clone(),
                         target: e.server.target(),
-                        server_sig: e.server.signature(&e.cfg),
+                        server_sig: e.server.signature(&cfg),
                         caps,
                         db_path: e.db_path.clone(),
                         data_dir: e.data_dir.clone(),
@@ -610,7 +661,7 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
                         }
                         Err(err) => {
                             log(format!("인덱싱을 시작하지 못했습니다: {err}"));
-                            if let (Some(w), Some(paths)) = (&e.watcher, only) {
+                            if let (Some(w), Some(paths)) = (&*e.watcher.lock(), only) {
                                 w.requeue(paths);
                             }
                         }
@@ -619,19 +670,19 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
             }
         }
         // 우리가 켠 서버는 한동안 쓰지 않으면 끈다
-        let idle = Duration::from_secs(e.cfg.idle_stop_minutes as u64 * 60);
+        let idle = Duration::from_secs(cfg.idle_stop_minutes as u64 * 60);
         if our_server
             && state.is_ready()
             && !active
             && !need_server
-            && e.cfg.idle_stop_minutes > 0
+            && cfg.idle_stop_minutes > 0
             && e.activity.lock().elapsed() > idle
         {
             e.server.stop();
             our_server = false;
             log(format!(
                 "{}분 동안 검색·인덱싱이 없어 llama-server를 껐습니다 (다음 검색 때 다시 켭니다)",
-                e.cfg.idle_stop_minutes
+                cfg.idle_stop_minutes
             ));
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -773,6 +824,11 @@ fn handle(e: &Engine, req: Request) {
     if from_another_site(&req) {
         return respond_error(req, 403, "다른 사이트에서 온 요청은 받지 않습니다");
     }
+    // 메시: 이 주소에 Gemma Search가 있는지 (다른 기기의 앱이 네트워크 폴더를 추가할 때 토큰 없이 묻는다).
+    // 이름·버전·기기 ID와 참여를 받는지만 알리고, 폴더나 토큰은 알리지 않는다.
+    if method == Method::Get && path == "/api/hello" {
+        return respond_json(req, 200, hello_json(&e.cfg.read(), !e.token.is_empty()));
+    }
     if e.token.is_empty() {
         // 토큰 없이 받을 때는 이 기기를 가리키는 주소로 온 요청만 받는다
         // (다른 사이트가 자기 도메인을 127.0.0.1로 돌려 읽어 가는 것을 막는다)
@@ -801,11 +857,18 @@ fn handle(e: &Engine, req: Request) {
             respond_json(req, 200, json!({ "ok": true, "runs": runs }));
         }
         Method::Post if path == "/api/rescan" => {
-            if let Some(w) = &e.watcher {
-                w.scan_now();
-            }
-            respond_json(req, 200, json!({ "ok": e.watcher.is_some() }));
+            let ok = match &*e.watcher.lock() {
+                Some(w) => {
+                    w.scan_now();
+                    true
+                }
+                None => false,
+            };
+            respond_json(req, 200, json!({ "ok": ok }));
         }
+        Method::Get if path == "/api/mesh/info" => respond_json(req, 200, mesh_info(e)),
+        Method::Get if path == "/api/libraries" => respond_json(req, 200, libraries(e)),
+        Method::Post if path == "/api/libraries/attach" => attach(e, req),
         Method::Post if path == "/api/lend/claim" => lend_claim(e, req),
         Method::Post if path == "/api/lend/result" => lend_result(e, req),
         Method::Get if path.starts_with("/api/thumb/") => match id_after("/api/thumb/") {
@@ -903,6 +966,254 @@ fn lend_result(e: &Engine, mut req: Request) {
     respond_json(req, 200, json!({ "accepted": accepted }))
 }
 
+// ── 원격 라이브러리 (다른 기기의 앱이 부른다, `MESH-DESIGN.md` 7.1·7.4) ──
+
+/// 접속을 받는 주소 (설정의 service_bind, 비었으면 기본)
+fn bind_of(cfg: &Config) -> String {
+    match cfg.service_bind.trim() {
+        "" => DEFAULT_BIND.to_string(),
+        b => b.to_string(),
+    }
+}
+
+/// 다른 기기에 알릴 포트와 주소들. 모든 주소로 열었으면(0.0.0.0) 이 기기의 IP와 컴퓨터 이름, 한 주소로 열었으면 그 주소.
+fn advertised(bind: &str) -> (u16, Vec<String>) {
+    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, "8787"));
+    let port = port.parse().unwrap_or(8787);
+    let host = host.trim_matches(['[', ']']);
+    let addrs = match host {
+        "0.0.0.0" | "::" | "" => crate::mesh::local_addrs(),
+        h => vec![h.to_string()],
+    };
+    (port, addrs)
+}
+
+/// 이 기기의 참여 코드 (주소들·포트·기기 ID·접속 토큰)
+pub(crate) fn join_code(cfg: &Config) -> String {
+    let (port, addrs) = advertised(&bind_of(cfg));
+    JoinCode {
+        id: cfg.device_id.clone(),
+        name: crate::lend::machine_name(),
+        port,
+        addrs,
+        token: cfg.service_token.trim().to_string(),
+    }
+    .encode()
+}
+
+/// `gemma-search join-code`: 참여 코드를 보여 준다 (서비스가 떠 있지 않아도 설정 파일로)
+pub fn join_code_cli(args: &[String]) -> i32 {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "gemma-search join-code\n  이 기기의 참여 코드를 보여 준다. 다른 기기의 앱(설정 > 일반 > 내 다른 기기)에 넣으면\n  \
+             이 기기의 공유 폴더(Samba·Windows 공유)를 그 기기에서 원격 라이브러리로 검색한다."
+        );
+        return 0;
+    }
+    let data_dir = crate::config::data_dir();
+    let mut cfg = Config::load(&data_dir);
+    let bind = bind_of(&cfg);
+    if bind_is_loopback(&bind) || cfg.service_token.trim().is_empty() {
+        eprintln!(
+            "이 기기의 서비스는 이 기기에서만 접속할 수 있게 열려 있습니다 ({bind}).\n\
+             다른 기기가 원격 라이브러리로 쓰려면 한 번 `{} serve --bind 0.0.0.0:8787`로 켜세요 (접속 토큰이 생깁니다).",
+            crate::prepare::me()
+        );
+        return 1;
+    }
+    if crate::mesh::ensure_device_id(&mut cfg) {
+        if let Err(e) = cfg.save(&data_dir) {
+            eprintln!("설정을 저장하지 못했습니다: {e}");
+            return 1;
+        }
+    }
+    let (port, addrs) = advertised(&bind);
+    println!("{}", join_code(&cfg));
+    eprintln!(
+        "\n위 한 줄을 다른 기기의 앱 설정 > 일반 > 내 다른 기기에 붙여 넣으세요. 접속 토큰이 들어 있으니 남에게 보이지 마세요.\n\
+         알리는 주소: {} (포트 {port})",
+        addrs.join(", ")
+    );
+    0
+}
+
+/// `GET /api/hello` (토큰 없이): 이 기기가 Gemma Search인지와 참여를 받는지. `join`은 접속 토큰이 있을 때
+/// (다른 기기가 닿게 열었을 때) true.
+fn hello_json(cfg: &Config, join: bool) -> Value {
+    json!({
+        "app": "gemma-search",
+        "version": env!("CARGO_PKG_VERSION"),
+        "id": cfg.device_id,
+        "name": crate::lend::machine_name(),
+        "join": join && !bind_is_loopback(&bind_of(cfg)),
+    })
+}
+
+/// `GET /api/mesh/info`: 기기 정보 (참여할 때 확인한다)
+fn mesh_info(e: &Engine) -> Value {
+    let cfg = e.cfg.read();
+    let (port, addrs) = advertised(&bind_of(&cfg));
+    json!({
+        "id": cfg.device_id,
+        "name": crate::lend::machine_name(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "port": port,
+        "addrs": addrs,
+    })
+}
+
+/// 라이브러리 하나: 폴더별 파일 수와, `samples`면 경로 대응용 표본 파일 몇 개 (인덱스에 든 파일에서)
+fn library_info(e: &Engine, device_id: &str, root: &str, samples: bool) -> LibraryInfo {
+    let key = folder_key(root);
+    let mut files = 0u64;
+    let mut picked: Vec<String> = Vec::new();
+    {
+        let st = e.store.read();
+        for f in st.files.values() {
+            if f.path_lower.starts_with(&key) {
+                files += 1;
+                if samples && picked.len() < 5 {
+                    picked.push(f.path.clone());
+                }
+            }
+        }
+    }
+    let samples = picked
+        .iter()
+        .filter_map(|p| {
+            let rel = within(p, root, cfg!(windows))?;
+            let meta = std::fs::metadata(p).ok()?;
+            let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+            Some(Sample { rel: rel.join("/"), size: meta.len(), mtime })
+        })
+        .collect();
+    LibraryInfo {
+        id: library_id(device_id, root),
+        name: crate::mesh::last_name(root).unwrap_or_else(|| root.to_string()),
+        path: root.to_string(),
+        files,
+        samples,
+    }
+}
+
+/// `GET /api/libraries`: 라이브러리(검색 폴더) 목록
+fn libraries(e: &Engine) -> Value {
+    let (device_id, roots) = {
+        let c = e.cfg.read();
+        (c.device_id.clone(), c.roots.clone())
+    };
+    let libs: Vec<LibraryInfo> = roots.iter().map(|r| library_info(e, &device_id, r, true)).collect();
+    json!({
+        "device": { "id": device_id, "name": crate::lend::machine_name() },
+        "libraries": libs,
+    })
+}
+
+/// 실제 위치 (링크를 푼 것). 없는 폴더면 그대로.
+fn real_path(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|r| crate::mesh::share::plain(r).display().to_string())
+        .unwrap_or_else(|_| p.trim().to_string())
+}
+
+/// `root` 아래 이름들(`rel`)을 이 기기의 구분자로 이은 경로
+fn join_rel(root: &str, rel: &[String]) -> String {
+    let mut s = root.trim_end_matches(crate::paths::is_sep).to_string();
+    for r in rel {
+        s.push(std::path::MAIN_SEPARATOR);
+        s.push_str(r);
+    }
+    s
+}
+
+/// `POST /api/libraries/attach`: 다른 기기가 이 기기의 공유 폴더를 원격 라이브러리로 추가한다 (설계 7.4의 2~4).
+/// 공유 이름을 이 기기 폴더로 바꾸고 표본으로 확인한 뒤, 이미 라이브러리(검색 폴더)이거나 그 안이면 그것을,
+/// 아니면 검색 폴더에 넣고 인덱싱을 시작한다. 공유하지 않은 폴더는 받지 않는다.
+fn attach(e: &Engine, mut req: Request) {
+    let body = match read_body(&mut req, 1024 * 1024) {
+        Ok(b) => b,
+        Err(m) => return respond_error(req, 400, &m),
+    };
+    let r: AttachRequest = match serde_json::from_str(&body) {
+        Ok(r) => r,
+        Err(err) => return respond_error(req, 400, &format!("요청을 읽지 못했습니다: {err}")),
+    };
+    let from = if r.from.trim().is_empty() { "다른 기기".to_string() } else { r.from.trim().to_string() };
+    let _one_at_a_time = e.attach_lock.lock();
+    let base = match crate::mesh::share::resolve(&r.share) {
+        Ok(p) => p,
+        Err(m) => {
+            log(format!("원격 라이브러리 거절 ({from}): 공유 '{}'을(를) 찾지 못했습니다: {m}", r.share));
+            return respond_error(req, 404, &m);
+        }
+    };
+    let folder = match crate::mesh::share::folder_under(&base, &r.sub) {
+        Ok(p) => p,
+        Err(m) => return respond_error(req, 404, &m),
+    };
+    let folder_s = folder.display().to_string();
+    let (matched, checked) = crate::mesh::verify_samples(&folder, &r.samples);
+    if !crate::mesh::samples_ok(matched, checked) {
+        log(format!("원격 라이브러리 거절 ({from}): 표본 {checked}개 중 {matched}개만 {folder_s}에 있습니다"));
+        return respond_error(
+            req,
+            409,
+            &format!(
+                "표본 파일 {checked}개 가운데 {matched}개만 그 기기의 {folder_s}에 같은 크기·수정 시각으로 있습니다. \
+                 같은 폴더가 아니거나 그사이 많이 바뀌었을 수 있습니다"
+            ),
+        );
+    }
+    let ignore_case = cfg!(windows);
+    let (device_id, roots) = {
+        let c = e.cfg.read();
+        (c.device_id.clone(), c.roots.clone())
+    };
+    // 판정은 실제 위치로 (검색 폴더가 링크를 거친 경로여도). 인덱스의 경로는 검색 폴더를 적은 그대로이므로,
+    // 기존 라이브러리 안이면 접속 기기의 폴더도 그 모양으로 바꿔 알려 준다 (검색 거르기와 경로 대응에 쓴다).
+    let real_roots: Vec<String> = roots.iter().map(|r| real_path(r)).collect();
+    let (root, owner_folder, created) = match crate::mesh::plan_attach(&real_roots, &folder_s, ignore_case) {
+        Plan::Existing(real_root) => {
+            let i = real_roots.iter().position(|r| *r == real_root).unwrap_or(0);
+            let rel = within(&folder_s, &real_root, ignore_case).unwrap_or_default();
+            (roots[i].clone(), join_rel(&roots[i], &rel), false)
+        }
+        Plan::New => {
+            let mut c = e.cfg.write();
+            c.roots.push(folder_s.clone());
+            if !c.mesh_added_roots.iter().any(|m| folder_key(m) == folder_key(&folder_s)) {
+                c.mesh_added_roots.push(folder_s.clone());
+            }
+            if let Err(err) = c.save(&e.data_dir) {
+                log(format!("설정을 저장하지 못했습니다 (다시 켜면 이 라이브러리가 빠집니다): {err}"));
+            }
+            drop(c);
+            e.roots_changed.store(true, Ordering::SeqCst);
+            {
+                // 재구축 요청이 기다리는 중이면 그대로 둔다
+                let mut q = e.index_request.lock();
+                *q = Some(*q == Some(true));
+            }
+            (folder_s.clone(), folder_s.clone(), true)
+        }
+    };
+    if created {
+        log(format!("원격 라이브러리 추가 ({from}): {folder_s} · 새 라이브러리로 인덱싱을 시작합니다 (표본 {matched}/{checked})"));
+    } else {
+        log(format!("원격 라이브러리 구독 ({from}): 라이브러리 {root} · 폴더 {owner_folder} · 다시 인덱싱하지 않습니다"));
+    }
+    let indexing = created || e.progress.lock().state.is_active() || e.index_request.lock().is_some();
+    let reply = AttachReply {
+        library: library_info(e, &device_id, &root, true),
+        folder: owner_folder,
+        created,
+        indexing,
+        matched,
+        checked,
+    };
+    respond_json(req, 200, serde_json::to_value(reply).unwrap_or(Value::Null))
+}
+
 fn section_key(s: Section) -> &'static str {
     match s {
         Section::Docs => "docs",
@@ -937,6 +1248,7 @@ fn run_key(s: RunState) -> &'static str {
 }
 
 fn status(e: &Engine) -> Value {
+    let cfg = e.cfg.read().clone();
     let state = e.server.state();
     let (files, vectors) = {
         let st = e.store.read();
@@ -948,7 +1260,7 @@ fn status(e: &Engine) -> Value {
     let p = e.progress.lock().clone();
     let runs = e.index_runs.load(Ordering::SeqCst);
     let start_error = e.index_error.lock().clone();
-    let watch = match &e.watcher {
+    let watch = match &*e.watcher.lock() {
         None => json!({ "enabled": false }),
         Some(w) => {
             let s = w.snapshot();
@@ -960,7 +1272,7 @@ fn status(e: &Engine) -> Value {
                 "next_scan_secs": s.next_scan.map(|t| t.saturating_duration_since(now).as_secs()),
                 "last_scan": s.last_scan.map(|(at, n)| json!({ "ago_secs": at.elapsed().as_secs(), "found": n })),
                 "note": s.scan_note,
-                "rescan_hours": e.cfg.watch_rescan_hours,
+                "rescan_hours": cfg.watch_rescan_hours,
                 "roots": s.roots.iter().map(|r| json!({
                     "path": r.path, "network": r.network, "error": r.error, "registering": r.registering,
                 })).collect::<Vec<_>>(),
@@ -971,7 +1283,7 @@ fn status(e: &Engine) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         // 하루 한 번 확인한 새 버전 (없거나 확인을 껐으면 null)
         "update": e.update_available.lock().as_ref().map(|(tag, page)| json!({ "tag": tag, "page": page })),
-        "problems": problems(&e.cfg),
+        "problems": problems(&cfg),
         "server": {
             "key": match &state {
                 ServerState::Stopped => "stopped",
@@ -983,7 +1295,7 @@ fn status(e: &Engine) -> Value {
             "ready": state.is_ready(),
             "error": match &state { ServerState::Failed(m) => Some(m.clone()), _ => None },
             // 다른 곳의 llama-server를 쓰면 그 주소 (이 기기에서 켜면 null)
-            "external": e.cfg.external_server().and_then(|t| t.ok()).map(|t| t.to_string()),
+            "external": cfg.external_server().and_then(|t| t.ok()).map(|t| t.to_string()),
             // 서버를 마지막으로 켜지 못한 까닭 (경로가 틀려 아예 띄우지 못하면 상태는 "중지됨"으로 남는다)
             "start_error": e.start_error.lock().as_ref().map(|(at, why)| json!({
                 "message": why,
@@ -1012,8 +1324,8 @@ fn status(e: &Engine) -> Value {
             "start_error": start_error,
         },
         "watch": watch,
-        "roots": e.cfg.roots,
-        "min_relevance": rounded(e.cfg.min_relevance, 1),
+        "roots": cfg.roots,
+        "min_relevance": rounded(cfg.min_relevance, 1),
         // 계산 빌려주기: 처리 몫(이 기기·빌려주는 기기), 빌려주는 기기들
         "lend": e.lend.status(),
     })
@@ -1029,18 +1341,25 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
         return Err("검색할 자료가 아직 없습니다. 폴더를 지정하고 인덱싱이 끝나기를 기다리세요.".to_string());
     }
     *e.activity.lock() = Instant::now();
+    let cfg = e.cfg.read().clone();
     let waited = wait_for_server(e);
     e.want_server.store(false, Ordering::SeqCst);
     waited?;
     let min = param(params, "min")
         .and_then(|v| v.parse::<f32>().ok())
-        .unwrap_or(e.cfg.min_relevance);
+        .unwrap_or(cfg.min_relevance);
     let mut sections = [true; 5];
     if let Some(kinds) = param(params, "kinds").filter(|k| !k.is_empty()) {
         for s in Section::ALL {
             sections[s as usize] = kinds.split(',').any(|k| k == section_key(s));
         }
     }
+    // 원격 라이브러리: 접속 기기가 추가한 폴더(라이브러리 폴더이거나 그 아래) 안에서만 (`under`, 여러 번 줄 수 있다)
+    let under: Vec<String> = params
+        .iter()
+        .filter(|(k, v)| k == "under" && !v.trim().is_empty())
+        .map(|(_, v)| folder_key(v))
+        .collect();
     let filter = Filter {
         sections,
         path_terms: param(params, "path")
@@ -1048,7 +1367,7 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
             .split_whitespace()
             .map(|s| s.to_lowercase())
             .collect(),
-        folders: None,
+        folders: (!under.is_empty()).then(|| FolderFilter { selected: under, known: Vec::new(), include_other: false }),
     };
     let o = query::run(
         &e.server.target(),
@@ -1056,9 +1375,9 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
         &e.db,
         QueryKind::Text(q.clone()),
         filter,
-        e.cfg.top_k.max(1),
+        cfg.top_k.max(1),
         min,
-        e.cfg.ffmpeg(),
+        cfg.ffmpeg(),
     );
     *e.activity.lock() = Instant::now();
     if let Some(err) = &o.error {
@@ -1073,7 +1392,10 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
     // "고양이 영상"처럼 종류를 말한 질의는 그 섹션을 먼저
     visible.sort_by_key(|(s, _)| o.kind_hints.iter().position(|k| k == s).unwrap_or(usize::MAX));
     let all = query::unified(&visible, &o.kind_hints);
+    let libs: Vec<(String, String)> = cfg.roots.iter().map(|r| (r.clone(), library_id(&cfg.device_id, r))).collect();
+    let hit_json = |s: Section, hv: &HitView| hit_json(s, hv, &libs);
     Ok(json!({
+        "device": { "id": cfg.device_id, "name": crate::lend::machine_name() },
         "query": q,
         "min": rounded(min, 1),
         "elapsed_ms": o.elapsed.as_millis() as u64,
@@ -1129,8 +1451,23 @@ fn highlight_parts(text: &str) -> Vec<Value> {
         .collect()
 }
 
-fn hit_json(sec: Section, hv: &HitView) -> Value {
+fn modality_key(m: Modality) -> &'static str {
+    match m {
+        Modality::Name => "name",
+        Modality::Text => "text",
+        Modality::Image => "image",
+        Modality::Audio => "audio",
+        Modality::Video => "video",
+    }
+}
+
+/// 결과 하나. `libs`: (라이브러리 폴더, ID) — 결과가 든 라이브러리와 그 안의 상대경로를 함께 싣는다 (설계 7.1).
+fn hit_json(sec: Section, hv: &HitView, libs: &[(String, String)]) -> Value {
     let h = &hv.hit;
+    let lib = libs
+        .iter()
+        .filter_map(|(root, id)| within(&h.path, root, cfg!(windows)).map(|rel| (root.len(), id, rel)))
+        .max_by_key(|(n, _, _)| *n);
     // 브라우저가 그 자리에서 열게 하는 주소 꼬리: 영상·소리는 시점, PDF는 페이지
     let place = match (h.modality, h.kind) {
         (Modality::Video | Modality::Audio, _) | (Modality::Image, Kind::Video) => {
@@ -1150,6 +1487,11 @@ fn hit_json(sec: Section, hv: &HitView) -> Value {
         "name": hv.file_name,
         "path": h.path,
         "kind": kind_key(h.kind),
+        "modality": modality_key(h.modality),
+        "loc": h.locator,
+        "coverage": rounded(h.coverage, 3),
+        "library": lib.as_ref().map(|(_, id, _)| id.as_str()),
+        "rel": lib.as_ref().map(|(_, _, rel)| rel.join("/")),
         "score": rounded(h.score, 1),
         "meaning": rounded(h.meaning, 1),
         "cosine": rounded(h.cosine, 3),
@@ -1332,6 +1674,21 @@ mod tests {
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
         assert!(same_token(&a, &a) && !same_token(&a, &b) && !same_token(&a[..31], &a));
+    }
+
+    #[test]
+    fn hello_tells_only_who_it_is() {
+        let mut cfg = Config::default();
+        cfg.device_id = "dev1".into();
+        cfg.service_token = "secret-token".into();
+        cfg.service_bind = "0.0.0.0:8787".into();
+        let v = hello_json(&cfg, true);
+        assert_eq!((v["app"].as_str(), v["id"].as_str(), v["join"].as_bool()), (Some("gemma-search"), Some("dev1"), Some(true)));
+        assert!(!v.to_string().contains("secret-token"), "토큰은 알리지 않는다");
+        assert!(v.get("roots").is_none() && v.get("token").is_none());
+        // 이 기기에서만 열려 있으면 참여를 받지 않는다
+        cfg.service_bind = "127.0.0.1:8787".into();
+        assert_eq!(hello_json(&cfg, true)["join"].as_bool(), Some(false));
     }
 
     #[test]

@@ -107,6 +107,39 @@ fn nvidia_smi() -> Vec<(String, u64, String)> {
         .collect()
 }
 
+/// 빌려주기 llama-server가 그래픽 메모리를 얼마나 쓰는지 (MB, Q8 + mmproj 실측, 설계 8.3): `-ub 8192` 약 3.6GB,
+/// `-ub 4096` 약 2.1GB, `-ub 2048` 약 1.7GB
+pub fn lend_vram_need_mb(ubatch: u32) -> u64 {
+    match ubatch {
+        u if u >= 8192 => 3700,
+        u if u >= 4096 => 2200,
+        _ => 1800,
+    }
+}
+
+/// NVIDIA 그래픽 카드의 남은 메모리 (MB, 여러 장이면 가장 넉넉한 것). nvidia-smi가 없으면 None (모름).
+/// 몇 초 사이에 여러 번 부르면 마지막 값을 쓴다 (빌려주기의 쉬는 조건이 자주 묻는다).
+pub fn nvidia_free_vram_mb() -> Option<u64> {
+    use parking_lot::Mutex;
+    use std::time::Instant;
+    static CACHE: Mutex<Option<(Instant, Option<u64>)>> = Mutex::new(None);
+    if let Some((at, v)) = *CACHE.lock() {
+        if at.elapsed() < Duration::from_secs(10) {
+            return v;
+        }
+    }
+    let mut cmd = hidden_command("nvidia-smi");
+    cmd.args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"]);
+    let v = run_capture(cmd, Duration::from_secs(10)).ok().and_then(|out| {
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .max()
+    });
+    *CACHE.lock() = Some((Instant::now(), v));
+    v
+}
+
 pub fn probe(app_dir: &Path, ffmpeg: bool) -> SysInfo {
     let info = crate::platform::os_and_adapters();
     let mut gpus: Vec<Gpu> = info
