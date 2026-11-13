@@ -88,7 +88,11 @@ pub fn add(args: &[String]) -> i32 {
             4
         }
         Ok(AddOutcome::NoService { server }) => {
-            println!("{server}에서 Gemma Search를 찾지 못했습니다 (포트 {}). 이 기기가 직접 인덱싱할 폴더입니다", client::DEFAULT_PORT);
+            println!(
+                "{server}에서 Gemma Search를 찾지 못했습니다 (포트 {}, {}). 이 기기가 직접 인덱싱할 폴더입니다",
+                client::DEFAULT_PORT,
+                crate::config::LEGACY_SERVICE_PORT
+            );
             3
         }
         Ok(AddOutcome::Attached { device, library, reply }) => {

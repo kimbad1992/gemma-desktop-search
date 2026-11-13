@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// 시험 명령의 서버 인자: 이 기기의 포트(`8090`)나 주소(`http://host:8090`)
+/// 시험 명령의 서버 인자: 이 기기의 포트(`21871`)나 주소(`http://host:21871`)
 fn target_arg(arg: Option<&String>) -> Option<crate::embed::client::EmbedTarget> {
     let arg = arg?;
     match crate::embed::client::EmbedTarget::parse(arg, "") {

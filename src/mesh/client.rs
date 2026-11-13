@@ -163,8 +163,10 @@ pub fn join(code: &JoinCode) -> Result<MeshDevice, String> {
     })
 }
 
-/// 서비스판의 기본 포트 (`serve --bind 0.0.0.0:8787`). 모르는 서버에 Gemma Search가 있는지 이 포트로 물어본다.
-pub const DEFAULT_PORT: u16 = 8787;
+/// 서비스판의 기본 포트 (`serve --bind 0.0.0.0:21870`). 모르는 서버에 Gemma Search가 있는지 이 포트로 물어본다.
+pub const DEFAULT_PORT: u16 = crate::config::DEFAULT_SERVICE_PORT;
+/// 모르는 서버에 물어볼 포트들: 지금 기본 포트, 그다음 v0.10.0의 기본 포트(8787로 연 예전 서비스)
+const PROBE_PORTS: [u16; 2] = [DEFAULT_PORT, crate::config::LEGACY_SERVICE_PORT];
 
 /// 그 주소에서 도는 Gemma Search 서비스 (`GET /api/hello`, 토큰 없이 답한다)
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -191,12 +193,15 @@ pub fn hello_from(v: Value, base: &str) -> Option<Hello> {
     })
 }
 
-/// 서버(`leeubuntu`, `100.90.136.114`)의 기본 포트에 Gemma Search가 있는지 묻는다 (닿지 않거나 아니면 None)
+/// 서버(`leeubuntu`, `100.90.136.114`)의 기본 포트에 Gemma Search가 있는지 묻는다 (닿지 않거나 아니면 None).
+/// 그 포트에 다른 프로그램이 답하면 Gemma Search가 아니므로 다음 포트로.
 pub fn probe(host: &str) -> Option<Hello> {
-    let base = super::base_of(host, DEFAULT_PORT);
-    let owner = Owner::with_bases(vec![base.clone()], "", Duration::from_secs(5));
-    let (_, v) = owner.json("GET", "/api/hello", None).ok()?;
-    hello_from(v, &base)
+    PROBE_PORTS.into_iter().find_map(|port| {
+        let base = super::base_of(host, port);
+        let owner = Owner::with_bases(vec![base.clone()], "", Duration::from_secs(5));
+        let (_, v) = owner.json("GET", "/api/hello", None).ok()?;
+        hello_from(v, &base)
+    })
 }
 
 /// 네트워크 폴더를 추가한 결과
@@ -482,7 +487,7 @@ mod tests {
     fn remote_answers_become_local_results() {
         let q = RemoteQuery {
             index: 0,
-            device: MeshDevice { id: "d1".into(), name: "leeubuntu".into(), port: 8787, addrs: vec![], token: String::new() },
+            device: MeshDevice { id: "d1".into(), name: "leeubuntu".into(), port: 21870, addrs: vec![], token: String::new() },
             base: None,
             libraries: vec![RemoteLibrary {
                 device_id: "d1".into(),
@@ -521,8 +526,8 @@ mod tests {
         assert!(doc.keyword_match(), "예전 서비스의 keyword 표시로 단어 일치를 안다");
         assert_eq!(doc.highlight.as_deref(), Some("\u{1}바다\u{2} 사진"));
         // 서비스가 토큰 없이 알리는 정보: Gemma Search일 때만 받는다
-        let h = hello_from(json!({"app": "gemma-search", "version": "0.9.1", "id": "abc", "name": "leeubuntu", "join": true}), "http://x:8787").unwrap();
-        assert_eq!((h.name.as_str(), h.join, h.base.as_str()), ("leeubuntu", true, "http://x:8787"));
+        let h = hello_from(json!({"app": "gemma-search", "version": "0.9.1", "id": "abc", "name": "leeubuntu", "join": true}), "http://x:21870").unwrap();
+        assert_eq!((h.name.as_str(), h.join, h.base.as_str()), ("leeubuntu", true, "http://x:21870"));
         assert!(hello_from(json!({"app": "something-else"}), "b").is_none());
         assert!(hello_from(json!("not an object"), "b").is_none());
         // 기기마다 번호가 겹치지 않는다

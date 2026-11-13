@@ -65,7 +65,7 @@ impl MeshDevice {
     }
 }
 
-/// `100.90.136.114`, 8787 → `http://100.90.136.114:8787` (IPv6는 대괄호로 감싼다)
+/// `100.90.136.114`, 21870 → `http://100.90.136.114:21870` (IPv6는 대괄호로 감싼다)
 pub fn base_of(addr: &str, port: u16) -> String {
     let a = addr.trim().trim_matches(['[', ']']);
     if a.contains(':') {
@@ -517,7 +517,7 @@ mod tests {
         MeshDevice {
             id: "dev1".into(),
             name: name.into(),
-            port: 8787,
+            port: 21870,
             addrs: addrs.iter().map(|s| s.to_string()).collect(),
             token: "t".into(),
         }
@@ -528,7 +528,7 @@ mod tests {
         let c = JoinCode {
             id: "0123456789abcdef".into(),
             name: "leeubuntu".into(),
-            port: 8787,
+            port: 21870,
             addrs: vec!["100.90.136.114".into(), "192.168.0.100".into(), "leeubuntu".into()],
             token: "secret".into(),
         };
@@ -573,9 +573,9 @@ mod tests {
         assert!(host_matches("desktop-4090", &w, &[]));
         assert_eq!(find_owner("100.90.136.114", &[w.clone(), d.clone()]), Some(1));
         assert_eq!(find_owner("192.168.0.99", &[w, d]), Some(0));
-        assert_eq!(base_of("fd7a:115c::1", 8787), "http://[fd7a:115c::1]:8787");
+        assert_eq!(base_of("fd7a:115c::1", 21870), "http://[fd7a:115c::1]:21870");
         let d2 = device("x", &["10.0.0.1", "x"]);
-        assert_eq!(d2.bases(Some("http://x:8787")), vec!["http://x:8787", "http://10.0.0.1:8787"]);
+        assert_eq!(d2.bases(Some("http://x:21870")), vec!["http://x:21870", "http://10.0.0.1:21870"]);
     }
 
     #[test]

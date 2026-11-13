@@ -19,7 +19,7 @@ impl EmbedTarget {
         Self { base: format!("http://127.0.0.1:{port}"), key: None }
     }
 
-    /// 사용자가 준 주소를 읽는다. `8090`(이 기기의 포트), `192.168.0.10:8090`, `http://host:8090`,
+    /// 사용자가 준 주소를 읽는다. `21871`(이 기기의 포트), `192.168.0.10:21871`, `http://host:21871`,
     /// `https://host/llama` 같은 모양을 받는다. 키가 비어 있으면 키 없이 접속한다.
     pub fn parse(addr: &str, key: &str) -> Result<Self, String> {
         let addr = addr.trim();
@@ -82,32 +82,32 @@ mod tests {
     #[test]
     fn reads_the_usual_shapes() {
         let t = |s: &str| EmbedTarget::parse(s, "").map(|t| t.base);
-        assert_eq!(t("8090").unwrap(), "http://127.0.0.1:8090");
-        assert_eq!(t(" 192.168.0.10:8090 ").unwrap(), "http://192.168.0.10:8090");
-        assert_eq!(t("http://desk.tailnet.ts.net:8090/").unwrap(), "http://desk.tailnet.ts.net:8090");
+        assert_eq!(t("21871").unwrap(), "http://127.0.0.1:21871");
+        assert_eq!(t(" 192.168.0.10:21871 ").unwrap(), "http://192.168.0.10:21871");
+        assert_eq!(t("http://desk.tailnet.ts.net:21871/").unwrap(), "http://desk.tailnet.ts.net:21871");
         assert_eq!(t("https://example.com/llama/").unwrap(), "https://example.com/llama");
-        assert_eq!(t("[::1]:8090").unwrap(), "http://[::1]:8090");
+        assert_eq!(t("[::1]:21871").unwrap(), "http://[::1]:21871");
         assert!(t("").is_err());
         assert!(t("0").is_err());
         assert!(t("99999").is_err());
         assert!(t("ftp://host:21").is_err());
-        assert!(t("http://:8090").is_err());
-        assert!(t("http://host:8090/?a=1").is_err());
+        assert!(t("http://:21871").is_err());
+        assert!(t("http://host:21871/?a=1").is_err());
     }
 
     #[test]
     fn key_is_kept_but_never_shown() {
-        let t = EmbedTarget::parse("host:8090", " secret ").unwrap();
+        let t = EmbedTarget::parse("host:21871", " secret ").unwrap();
         assert_eq!(t.key.as_deref(), Some("secret"));
         assert!(!format!("{t} {t:?}").contains("secret"));
-        assert_eq!(EmbedTarget::parse("host:8090", "  ").unwrap().key, None);
+        assert_eq!(EmbedTarget::parse("host:21871", "  ").unwrap().key, None);
     }
 
     #[test]
     fn loopback_or_not() {
-        assert!(EmbedTarget::local(8090).is_loopback());
+        assert!(EmbedTarget::local(21871).is_loopback());
         assert!(EmbedTarget::parse("localhost:1", "").unwrap().is_loopback());
         assert!(EmbedTarget::parse("[::1]:1", "").unwrap().is_loopback());
-        assert!(!EmbedTarget::parse("192.168.0.10:8090", "").unwrap().is_loopback());
+        assert!(!EmbedTarget::parse("192.168.0.10:21871", "").unwrap().is_loopback());
     }
 }

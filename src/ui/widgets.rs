@@ -1299,7 +1299,7 @@ pub fn gallery(ui: &mut egui::Ui) {
             });
             let mut view = 0;
             segmented(ui, &mut view, &[(0, "일반"), (1, "고급")]);
-            field(ui, "포트", Some("바꾸면 서버를 다시 시작해야 적용됩니다"), |ui| ui.label("8090"));
+            field(ui, "포트", Some("바꾸면 서버를 다시 시작해야 적용됩니다"), |ui| ui.label("21871"));
             subheading(ui, "카드 안의 작은 제목");
             caption(ui, "덧붙이는 작은 글");
         });

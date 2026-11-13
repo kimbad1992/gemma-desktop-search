@@ -223,7 +223,7 @@ impl ServerManager {
         self.shared.lock().target.clone()
     }
 
-    /// 화면에 보여 줄 서버 위치: "포트 8090" 또는 "외부 서버 http://…"
+    /// 화면에 보여 줄 서버 위치: "포트 21871" 또는 "외부 서버 http://…"
     pub fn place(&self) -> String {
         let s = self.shared.lock();
         if s.state == ServerState::External {
@@ -752,7 +752,7 @@ mod tests {
         let a = build_args(&cfg, false);
         assert!(a.contains(&"--embeddings".to_string()));
         assert!(a.windows(2).any(|w| w[0] == "--pooling" && w[1] == "mean"));
-        assert!(a.windows(2).any(|w| w[0] == "--port" && w[1] == "8090"));
+        assert!(a.windows(2).any(|w| w[0] == "--port" && w[1] == "21871"));
         assert!(a.windows(2).any(|w| w[0] == "-fa" && w[1] == "off"), "FA 기본 off");
         let s = build_args(&cfg, true);
         assert_eq!(s[0], "serve");

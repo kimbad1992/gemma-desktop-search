@@ -2,14 +2,14 @@
 //! 화면이 없는 Linux 서버나 NAS에서 쓰고, 검색은 명령줄(`cli.rs`: search·status·index·rescan)이나
 //! 웹 페이지(다른 PC의 브라우저)로 한다.
 //!
-//!   gemma-search serve [--bind 127.0.0.1:8787] [--token <토큰>] [--no-watch]
+//!   gemma-search serve [--bind 127.0.0.1:21870] [--token <토큰>] [--no-watch]
 //!                      [--root <폴더>]… [--llama <경로>] [--model <gguf>] [--mmproj <gguf>]
 //!                      [--embed-server <주소> [--embed-key <키>]]
 //!
 //! - 설정과 인덱스는 창이 있는 앱과 같은 데이터 폴더(`config.toml`, `index.db`)를 쓴다.
 //! - llama-server는 필요할 때(검색, 인덱싱) 켜고 한동안 쓰지 않으면 끈다 (설정의 `idle_stop_minutes`).
 //!   `--embed-server`로 다른 곳에서 떠 있는 llama-server를 정하면 켜지 않고 그 서버에 연결해서 쓴다.
-//! - 기본은 이 기기에서만 접속할 수 있다(127.0.0.1). 다른 PC에서 접속하게 하려면 `--bind 0.0.0.0:8787`로 열고,
+//! - 기본은 이 기기에서만 접속할 수 있다(127.0.0.1). 다른 PC에서 접속하게 하려면 `--bind 0.0.0.0:21870`으로 열고,
 //!   그때는 토큰이 있어야 한다: 검색 결과로 파일 내용까지 내려받을 수 있기 때문이다.
 //! - 서버를 켜고 끄는 일과 인덱싱 시작은 메인 루프 한 스레드에서만 한다 (Linux에서 자식 프로세스는 자기를 만든
 //!   스레드가 끝나면 같이 끝나게 해 두었다).
@@ -38,7 +38,7 @@ use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 /// 검색 페이지 (한 파일: HTML + CSS + JS)
 const PAGE: &str = include_str!("../assets/web/index.html");
-pub(crate) const DEFAULT_BIND: &str = "127.0.0.1:8787";
+pub(crate) const DEFAULT_BIND: &str = crate::config::DEFAULT_SERVICE_BIND;
 /// 검색이 서버가 준비되기를 기다리는 최대 시간
 pub(crate) const SERVER_WAIT: Duration = Duration::from_secs(120);
 /// 요청을 받는 스레드 수. 영상을 보내는 동안과, 빌려주는 기기가 일감을 기다리는 동안(`/api/lend/claim`)에는
@@ -60,12 +60,12 @@ pub const USAGE: &str = "\
   gemma-search serve --root <검색할 폴더>
 
 서비스:
-  gemma-search serve [옵션]       폴더를 감시하며 검색 요청을 받는다 (검색 페이지: http://127.0.0.1:8787/)
+  gemma-search serve [옵션]       폴더를 감시하며 검색 요청을 받는다 (검색 페이지: http://127.0.0.1:21870/)
       --root <폴더>               검색할 폴더 (여러 번 쓸 수 있다)
       --llama <폴더>              llama.cpp가 있는 폴더 (llama-server)
       --model <gguf>              모델 파일
       --mmproj <gguf>             이미지·영상·소리용 mmproj 파일
-      --bind <주소:포트>          접속을 받을 주소. 다른 기기에서 접속하게 하려면 0.0.0.0:8787
+      --bind <주소:포트>          접속을 받을 주소. 다른 기기에서 접속하게 하려면 0.0.0.0:21870
                                   (그때는 접속 토큰이 생기고, 페이지를 처음 열 때 묻는다)
       --token <토큰>              접속 토큰을 직접 정한다
       --no-watch                  폴더를 감시하지 않는다 (검색만)
@@ -104,7 +104,7 @@ pub const USAGE: &str = "\
                                   이 기기는 나가는 접속만 한다(포트를 열지 않는다). Ctrl+C로 끝낸다
       --token <토큰>              그 서비스의 접속 토큰 (환경 변수 GEMMA_SEARCH_TOKEN)
       --name <이름>               그 서비스의 status에 보일 이 기기의 이름 (기본: 컴퓨터 이름)
-  서비스 쪽은 빌려주는 기기가 닿을 수 있게 열어 둔다(--bind 0.0.0.0:8787과 토큰, 또는 SSH 터널).
+  서비스 쪽은 빌려주는 기기가 닿을 수 있게 열어 둔다(--bind 0.0.0.0:21870과 토큰, 또는 SSH 터널).
   같은 llama.cpp 빌드와 모델 파일로 띄운 서버끼리만 일감을 주고받는다.
 
 원격 라이브러리:
@@ -112,7 +112,7 @@ pub const USAGE: &str = "\
                                   넣고 그 기기에서 이 기기의 공유 폴더(\\\\서버\\공유\\…)를 검색 폴더로 추가하면,
                                   이 기기가 인덱싱하고(그 기기는 계산을 빌려준다) 그 기기에서 검색된다.
                                   다른 기기가 같은 폴더를 추가하면 다시 인덱싱하지 않는다.
-  서비스는 다른 기기가 닿게 열어 둔다(--bind 0.0.0.0:8787). 인증은 접속 토큰이라 집 LAN이나 Tailscale 안에서만 쓴다.
+  서비스는 다른 기기가 닿게 열어 둔다(--bind 0.0.0.0:21870). 인증은 접속 토큰이라 집 LAN이나 Tailscale 안에서만 쓴다.
 
 업데이트:
   gemma-search update             새 버전이 있으면 받아서 실행 파일을 바꾼다 (관리자 권한 필요 없음)
@@ -978,8 +978,8 @@ fn bind_of(cfg: &Config) -> String {
 
 /// 다른 기기에 알릴 포트와 주소들. 모든 주소로 열었으면(0.0.0.0) 이 기기의 IP와 컴퓨터 이름, 한 주소로 열었으면 그 주소.
 fn advertised(bind: &str) -> (u16, Vec<String>) {
-    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, "8787"));
-    let port = port.parse().unwrap_or(8787);
+    let (host, port) = bind.rsplit_once(':').unwrap_or((bind, ""));
+    let port = port.parse().unwrap_or(crate::config::DEFAULT_SERVICE_PORT);
     let host = host.trim_matches(['[', ']']);
     let addrs = match host {
         "0.0.0.0" | "::" | "" => crate::mesh::local_addrs(),
@@ -1016,7 +1016,7 @@ pub fn join_code_cli(args: &[String]) -> i32 {
     if bind_is_loopback(&bind) || cfg.service_token.trim().is_empty() {
         eprintln!(
             "이 기기의 서비스는 이 기기에서만 접속할 수 있게 열려 있습니다 ({bind}).\n\
-             다른 기기가 원격 라이브러리로 쓰려면 한 번 `{} serve --bind 0.0.0.0:8787`로 켜세요 (접속 토큰이 생깁니다).",
+             다른 기기가 원격 라이브러리로 쓰려면 한 번 `{} serve --bind 0.0.0.0:21870`으로 켜세요 (접속 토큰이 생깁니다).",
             crate::prepare::me()
         );
         return 1;
@@ -1663,13 +1663,13 @@ mod tests {
 
     #[test]
     fn only_loopback_binds_skip_the_token() {
-        assert!(bind_is_loopback("127.0.0.1:8787"));
-        assert!(bind_is_loopback("localhost:8787"));
-        assert!(bind_is_loopback("[::1]:8787"));
-        assert!(!bind_is_loopback("0.0.0.0:8787"));
-        assert!(!bind_is_loopback("192.168.0.10:8787"));
-        assert_eq!(shown_addr("0.0.0.0:8787"), "127.0.0.1:8787");
-        assert_eq!(shown_addr("192.168.0.10:8787"), "192.168.0.10:8787");
+        assert!(bind_is_loopback("127.0.0.1:21870"));
+        assert!(bind_is_loopback("localhost:21870"));
+        assert!(bind_is_loopback("[::1]:21870"));
+        assert!(!bind_is_loopback("0.0.0.0:21870"));
+        assert!(!bind_is_loopback("192.168.0.10:21870"));
+        assert_eq!(shown_addr("0.0.0.0:21870"), "127.0.0.1:21870");
+        assert_eq!(shown_addr("192.168.0.10:21870"), "192.168.0.10:21870");
         let (a, b) = (new_token(), new_token());
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
@@ -1681,13 +1681,13 @@ mod tests {
         let mut cfg = Config::default();
         cfg.device_id = "dev1".into();
         cfg.service_token = "secret-token".into();
-        cfg.service_bind = "0.0.0.0:8787".into();
+        cfg.service_bind = "0.0.0.0:21870".into();
         let v = hello_json(&cfg, true);
         assert_eq!((v["app"].as_str(), v["id"].as_str(), v["join"].as_bool()), (Some("gemma-search"), Some("dev1"), Some(true)));
         assert!(!v.to_string().contains("secret-token"), "토큰은 알리지 않는다");
         assert!(v.get("roots").is_none() && v.get("token").is_none());
         // 이 기기에서만 열려 있으면 참여를 받지 않는다
-        cfg.service_bind = "127.0.0.1:8787".into();
+        cfg.service_bind = "127.0.0.1:21870".into();
         assert_eq!(hello_json(&cfg, true)["join"].as_bool(), Some(false));
     }
 

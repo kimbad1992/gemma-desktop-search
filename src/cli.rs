@@ -169,7 +169,7 @@ pub(crate) fn base_url(given: &str) -> String {
     }
 }
 
-/// 주소가 이 기기를 가리키는지 ("http://127.0.0.1:8787", "localhost:8787" 등)
+/// 주소가 이 기기를 가리키는지 ("http://127.0.0.1:21870", "localhost:21870" 등)
 pub(crate) fn is_local(base: &str) -> bool {
     let rest = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
     bind_is_loopback(rest.split('/').next().unwrap_or(rest))
@@ -737,8 +737,8 @@ mod tests {
         assert_eq!(a.value("--kinds"), Some("docs,images"));
         assert!(a.flag("--json"));
         // 공통 옵션은 어느 명령에서나 받는다
-        let a = parse(&s(&["--url", "nas:8787", "--token=abc"]), &[], &[], false).unwrap();
-        assert_eq!((a.value("--url"), a.value("--token")), (Some("nas:8787"), Some("abc")));
+        let a = parse(&s(&["--url", "nas:21870", "--token=abc"]), &[], &[], false).unwrap();
+        assert_eq!((a.value("--url"), a.value("--token")), (Some("nas:21870"), Some("abc")));
         // 여러 번 준 값
         let a = parse(&s(&["q", "--path", "보관", "--path", "2024"]), &["--path"], &[], true).unwrap();
         assert_eq!(a.all("--path"), vec!["보관", "2024"]);
@@ -768,13 +768,13 @@ mod tests {
 
     #[test]
     fn config_token_goes_only_to_this_machine() {
-        assert_eq!(base_url("nas:8787/"), "http://nas:8787");
-        assert_eq!(base_url("https://nas.local:8787"), "https://nas.local:8787");
-        assert!(is_local("http://127.0.0.1:8787"));
-        assert!(is_local("http://localhost:8787/"));
-        assert!(is_local("http://[::1]:8787"));
-        assert!(!is_local("http://192.168.0.10:8787"));
-        assert!(!is_local("http://nas:8787"));
+        assert_eq!(base_url("nas:21870/"), "http://nas:21870");
+        assert_eq!(base_url("https://nas.local:21870"), "https://nas.local:21870");
+        assert!(is_local("http://127.0.0.1:21870"));
+        assert!(is_local("http://localhost:21870/"));
+        assert!(is_local("http://[::1]:21870"));
+        assert!(!is_local("http://192.168.0.10:21870"));
+        assert!(!is_local("http://nas:21870"));
         // --token > 환경 변수 > 설정 파일(이 기기일 때만)
         assert_eq!(pick_token(Some("a"), Some("b"), "c", true).as_deref(), Some("a"));
         assert_eq!(pick_token(None, Some("b"), "c", true).as_deref(), Some("b"));

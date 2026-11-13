@@ -207,7 +207,7 @@ impl GemmaApp {
                     ui.add_enabled(
                         !running,
                         egui::TextEdit::singleline(&mut c.lend_server)
-                            .hint_text("http://192.168.0.100:8787")
+                            .hint_text("http://192.168.0.100:21870")
                             .desired_width(320.0),
                     );
                     ui.end_row();
@@ -290,7 +290,7 @@ impl GemmaApp {
 pub fn demo_status() -> LendStatus {
     LendStatus {
         phase: Phase::Working,
-        owner: "http://192.168.0.100:8787".into(),
+        owner: "http://192.168.0.100:21870".into(),
         name: "DESKTOP-4090".into(),
         signature: "llama:b12201-a2b301831|embeddinggemma-2-q8_0.gguf".into(),
         slots: 8,

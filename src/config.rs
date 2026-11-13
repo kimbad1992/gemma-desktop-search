@@ -5,7 +5,23 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 설정 파일 형식 버전. 기본값을 바꿀 때 예전 기본값 그대로인 설정만 옮긴다.
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
+
+// 기본 포트. 다른 프로그램과 OS가 잡기 쉬운 곳을 피해 IANA에 등록되지 않은 21850~21999 안에서 골랐다.
+// - Windows의 임시(동적) 포트: 기본 49152~65535. 1024~15000처럼 낮춘 PC도 있고, Hyper-V·WSL은 그 안에서
+//   덩어리로 예약해 둔다 (예전 기본값 8090이 예약 8011~8110에 걸려 켜지지 않던 PC가 있었다).
+// - Linux의 임시 포트 32768~60999, Kubernetes NodePort 30000~32767.
+// - 8787(RStudio Server 등), 8080·8090 같은 흔한 웹 포트.
+/// 서비스판(`gemma-search serve`)의 기본 포트. 모르는 서버에 Gemma Search가 있는지도 이 포트로 묻는다.
+pub const DEFAULT_SERVICE_PORT: u16 = 21870;
+/// 서비스판의 기본 접속 주소 (이 기기에서만)
+pub const DEFAULT_SERVICE_BIND: &str = "127.0.0.1:21870";
+/// 이 기기에서 켜는 llama-server의 기본 포트
+pub const DEFAULT_LLAMA_PORT: u16 = 21871;
+/// v0.10.0까지의 기본 포트 (설정 옮기기와 예전 서비스 찾기)
+pub const LEGACY_SERVICE_PORT: u16 = 8787;
+const LEGACY_SERVICE_BIND: &str = "127.0.0.1:8787";
+const LEGACY_LLAMA_PORT: u16 = 8090;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -22,7 +38,7 @@ pub struct Config {
     /// CUDA DLL 등이 llama 폴더에 없을 때 PATH 앞에 붙일 폴더
     pub extra_dll_dir: String,
     pub port: u16,
-    /// 다른 곳에서 떠 있는 llama-server를 쓴다 (예: `http://127.0.0.1:18080`, `192.168.0.10:8090`).
+    /// 다른 곳에서 떠 있는 llama-server를 쓴다 (예: `http://127.0.0.1:18080`, `192.168.0.10:21871`).
     /// 비워 두면 이 기기에서 llama-server를 켠다. 같은 모델 파일과 llama.cpp 빌드로 띄운 서버여야 한다.
     pub embed_server: String,
     /// 그 서버를 `--api-key`로 켰을 때의 키
@@ -105,11 +121,11 @@ pub struct Config {
     /// 폴더를 훑어 인덱스와 비교하는 주기(시간). 변경 알림이 오지 않는 네트워크 폴더와 놓친 알림을 찾는다.
     /// 0 = 켤 때 한 번만
     pub watch_rescan_hours: u32,
-    /// 서비스판(`gemma-search serve`)이 접속을 받는 주소. 다른 기기에서 접속하게 하려면 `0.0.0.0:8787`.
+    /// 서비스판(`gemma-search serve`)이 접속을 받는 주소. 다른 기기에서 접속하게 하려면 `0.0.0.0:21870`.
     pub service_bind: String,
     /// 서비스판의 접속 토큰. 다른 기기에서 접속하게 열면 있어야 하고, 비어 있으면 그때 만든다.
     pub service_token: String,
-    /// 계산 빌려주기(창 있는 앱): 일감을 가져올 소유 기기 서비스의 주소 (예: `http://192.168.0.100:8787`)
+    /// 계산 빌려주기(창 있는 앱): 일감을 가져올 소유 기기 서비스의 주소 (예: `http://192.168.0.100:21870`)
     pub lend_server: String,
     /// 그 서비스의 접속 토큰 (그 기기 설정의 service_token)
     pub lend_token: String,
@@ -152,7 +168,7 @@ impl Default for Config {
                 PathBuf::from(r"F:\Tools\models\embeddinggemma-2\mmproj-embeddinggemma-2-Q8_0.gguf"),
             ]),
             extra_dll_dir: String::new(),
-            port: 8090,
+            port: DEFAULT_LLAMA_PORT,
             embed_server: String::new(),
             embed_server_key: String::new(),
             n_gpu_layers: 99,
@@ -234,7 +250,7 @@ impl Default for Config {
             index_overlay: true,
             watch_folders: false,
             watch_rescan_hours: 6,
-            service_bind: "127.0.0.1:8787".into(),
+            service_bind: DEFAULT_SERVICE_BIND.into(),
             service_token: String::new(),
             lend_server: String::new(),
             lend_token: String::new(),
@@ -300,6 +316,16 @@ impl Config {
                 if !self.exclude_dirs.iter().any(|x| x.eq_ignore_ascii_case(d)) {
                     self.exclude_dirs.push(d.to_string());
                 }
+            }
+        }
+        if self.config_version < 4 {
+            // 기본 포트 변경 (8090·8787 → 21871·21870). 다른 기기가 닿게 직접 연 주소(0.0.0.0:8787 등)는
+            // 그 기기를 내 다른 기기로 넣은 PC들이 그 포트로 찾으므로 그대로 둔다.
+            if self.port == LEGACY_LLAMA_PORT {
+                self.port = DEFAULT_LLAMA_PORT;
+            }
+            if self.service_bind.trim() == LEGACY_SERVICE_BIND {
+                self.service_bind = DEFAULT_SERVICE_BIND.into();
             }
         }
         self.config_version = CONFIG_VERSION;
@@ -442,6 +468,44 @@ mod tests {
         assert_eq!((c.video_max_segments, c.audio_max_segments), (240, 50), "예전 기본값만 상향");
         assert!(c.exclude_dirs.iter().any(|d| d == ".ssh"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migrates_old_default_ports_only() {
+        let dir = std::env::temp_dir().join(format!("gs-cfg-port-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let load = |body: &str| {
+            std::fs::write(dir.join("config.toml"), body).unwrap();
+            let c = Config::load(&dir);
+            (c.port, c.service_bind)
+        };
+        assert_eq!(
+            load("config_version = 3\nport = 8090\nservice_bind = \"127.0.0.1:8787\"\n"),
+            (DEFAULT_LLAMA_PORT, DEFAULT_SERVICE_BIND.to_string()),
+            "예전 기본값은 새 기본값으로"
+        );
+        assert_eq!(
+            load("config_version = 3\nport = 18090\nservice_bind = \"0.0.0.0:8787\"\n"),
+            (18090, "0.0.0.0:8787".to_string()),
+            "직접 정한 포트, 다른 기기에 연 주소는 그대로"
+        );
+        assert_eq!(
+            load("config_version = 4\nport = 8090\nservice_bind = \"127.0.0.1:8787\"\n"),
+            (8090, "127.0.0.1:8787".to_string()),
+            "새 버전에서 고른 값은 손대지 않음"
+        );
+        assert_eq!(load("").0, DEFAULT_LLAMA_PORT, "새 설정");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn default_ports_stay_clear_of_ephemeral_ranges() {
+        assert_eq!(DEFAULT_SERVICE_BIND, format!("127.0.0.1:{DEFAULT_SERVICE_PORT}"));
+        for p in [DEFAULT_SERVICE_PORT, DEFAULT_LLAMA_PORT] {
+            // Windows 동적 포트를 낮춘 PC(~15000)와 Linux 임시 포트(32768~), Kubernetes NodePort(30000~) 사이
+            assert!((15001..30000).contains(&p), "{p}");
+        }
+        assert_ne!(DEFAULT_SERVICE_PORT, DEFAULT_LLAMA_PORT);
     }
 
     #[test]
