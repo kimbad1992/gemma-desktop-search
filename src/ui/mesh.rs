@@ -13,7 +13,8 @@
 
 use crate::app::GemmaApp;
 use crate::mesh::client::{AddOutcome, Hello, RemoteQuery};
-use crate::mesh::monitor::{DeviceState, Monitor};
+pub use crate::mesh::monitor::{known_offline, owner_done, owner_needs_help};
+use crate::mesh::monitor::{DeviceState, Monitor, Presence};
 use crate::mesh::{AttachReply, JoinCode, MeshDevice, RemoteLibrary};
 use crate::search::query::{Outcome, RemoteNote};
 use crate::ui::theme::{space, Tone};
@@ -97,21 +98,6 @@ impl MeshUi {
     pub fn can_add(&self) -> bool {
         self.add_rx.is_none() && self.pending.is_none()
     }
-}
-
-/// 그 기기가 닿지 않는 것으로 알려졌는지 (아직 모르면 false: 물어본다)
-pub fn known_offline(st: Option<&DeviceState>) -> bool {
-    st.is_some_and(|s| s.reachable == Some(false))
-}
-
-/// 그 기기가 지금 인덱싱 중(또는 곧 시작)이라 계산을 빌려줄 만한지
-pub fn owner_needs_help(st: Option<&DeviceState>) -> bool {
-    st.is_some_and(|s| s.reachable == Some(true) && s.indexing.busy())
-}
-
-/// 그 기기의 인덱싱이 끝나고 `after` 넘게 조용했는지 (자동 빌려주기를 끝낸다)
-pub fn owner_done(st: Option<&DeviceState>, after: Duration) -> bool {
-    st.is_some_and(|s| s.reachable == Some(true) && !s.indexing.busy() && s.idle_since.is_some_and(|t| t.elapsed() > after))
 }
 
 /// 원격 라이브러리 한 줄의 상태 글과 색
@@ -206,6 +192,19 @@ impl GemmaApp {
     /// 매 프레임 (app.poll): 상태 확인 스레드에 기기 목록 주기, 참여·붙이기 결과, 원격 썸네일, 자동 빌려주기
     pub fn mesh_logic(&mut self, ctx: &egui::Context) {
         self.mesh.monitor.set_devices(&self.cfg.mesh_devices);
+        // 상태를 물을 때 이 PC가 누구이고 지금 무엇을 하는지 함께 알린다 (그 기기의 status에 보인다)
+        if !self.cfg.mesh_devices.is_empty() {
+            if crate::mesh::ensure_device_id(&mut self.cfg) {
+                self.save_mesh();
+            }
+            let note = match self.lend.as_ref().map(|l| l.status()) {
+                Some(s) if s.note.is_empty() => s.phase.label().to_string(),
+                Some(s) => format!("{}: {}", s.phase.label(), s.note),
+                None if self.cfg.lend_mesh_idle => "쉬는 중 (계산 나누기 켜짐)".to_string(),
+                None => "계산 나누기 꺼짐".to_string(),
+            };
+            self.mesh.monitor.set_me(Presence { id: self.cfg.device_id.clone(), name: crate::lend::machine_name(), note });
+        }
         // 참여 코드 결과 (내 다른 기기 칸)
         if let Some(r) = self.mesh.join_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.mesh.join_rx = None;
@@ -655,9 +654,10 @@ impl GemmaApp {
                 idle_changed = widgets::toggle_row(
                     ui,
                     &mut self.cfg.lend_mesh_idle,
-                    "놀 때 계산 빌려주기",
-                    "내 다른 기기가 인덱싱하면, 이 PC가 쉬고 있는 동안 그래픽으로 임베딩을 돕습니다. 전체 화면 앱을 쓰거나 \
-                     그래픽 메모리가 모자라면(다른 LLM 서버 등) 돕지 않습니다. 꺼 두어도 이 PC가 추가해 시작된 인덱싱은 돕습니다.",
+                    "메시 기기와 계산 나누기",
+                    "내 다른 기기가 인덱싱하면, 이 PC가 쉬고 있는 동안 그래픽으로 임베딩을 돕습니다(기본으로 켜져 있습니다). \
+                     전체 화면 앱을 쓰거나 그래픽 메모리가 모자라면(다른 LLM 서버 등) 돕지 않습니다. 꺼 두어도 이 PC가 추가해 \
+                     시작된 인덱싱은 돕습니다.",
                 )
                 .changed();
                 widgets::help(

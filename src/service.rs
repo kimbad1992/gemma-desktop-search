@@ -158,6 +158,14 @@ struct Engine {
     update_available: Mutex<Option<(String, String)>>,
     /// 계산 빌려주기: 인덱싱하는 동안 빌려주는 기기에 일감을 맡긴다 (`/api/lend/*`)
     lend: Arc<LendHub>,
+    /// 메시: 내 다른 기기들의 상태를 주기적으로 묻는다 (서로의 헬스체크, 계산 나누기의 판단)
+    monitor: crate::mesh::monitor::Monitor,
+    /// 메시: 다른 기기에 계산을 나눠 주는 중인 것과 돕지 못한 기기
+    mesh: Mutex<MeshState>,
+    /// 이 기기를 확인하는 다른 기기들 (그 기기의 Monitor가 상태를 물을 때 알린다)
+    peers: Mutex<std::collections::HashMap<String, Peer>>,
+    /// 계산 나누기가 llama-server를 쓰는 중 (메인 루프가 켜 두고, 쓰지 않는다고 끄지 않는다)
+    lend_want_server: AtomicBool,
     stop: Arc<AtomicBool>,
 }
 
@@ -350,6 +358,10 @@ pub fn serve(args: &[String]) -> i32 {
         index_error: Mutex::new(None),
         update_available: Mutex::new(None),
         lend: Arc::new(LendHub::default()),
+        monitor: crate::mesh::monitor::Monitor::start(Arc::new(|| {})),
+        mesh: Mutex::new(MeshState::default()),
+        peers: Mutex::new(std::collections::HashMap::new()),
+        lend_want_server: AtomicBool::new(false),
         stop: stop.clone(),
         cfg: RwLock::new(cfg),
     });
@@ -403,11 +415,249 @@ pub fn serve(args: &[String]) -> i32 {
         println!("새 버전 확인: 하루 한 번 (알려만 줍니다. 끄려면 설정의 check_updates = false)");
         spawn_update_check(engine.clone());
     }
+    {
+        let c = engine.cfg.read();
+        let others: Vec<&str> = c.mesh_devices.iter().filter(|d| d.id != c.device_id).map(|d| d.name.as_str()).collect();
+        if !others.is_empty() {
+            println!(
+                "메시: {} · 계산 나누기 {}",
+                others.join(", "),
+                if c.lend_mesh_idle { "켜짐 (그 기기가 인덱싱하면 쉬는 동안 돕습니다)" } else { "꺼짐" }
+            );
+        }
+    }
+    spawn_mesh(engine.clone());
     println!("끝내려면 Ctrl+C");
 
     main_loop(&engine, indexer);
     log("끝냅니다");
     0
+}
+
+// ── 메시: 서로 상태 확인, 계산 나누기 (설계 8장) ──
+//
+// 메시에 참여한 기기(설정의 mesh_devices)는 따로 켜지 않아도 서로 돕는다: 그 기기가 인덱싱하면 이 기기가 쉬고 있는
+// 동안 일감을 가져가 처리하고(`lend::LendSession`, 이 기기의 llama-server를 같이 쓴다), 그 기기의 인덱싱이 끝나고
+// 조용해지면 멈춘다. 상태를 물을 때(`Monitor`) 이 기기가 누구이고 지금 무엇을 하는지 함께 알려, 서로의 status에 보인다.
+
+/// 그 기기의 인덱싱이 끝나고 이만큼 조용하면 계산 나누기를 끝낸다 (인덱싱 사이의 짧은 틈에 끊지 않게)
+const SHARE_DONE_AFTER: Duration = Duration::from_secs(60);
+/// 돕지 못한 기기(서명이 다름, 준비물 없음)는 이만큼 뒤에 다시 해 본다
+const SHARE_RETRY: Duration = Duration::from_secs(30 * 60);
+/// 이 기기를 확인하는 기기를 status에 보이는 시간 / 기록을 지우는 시간
+const PEER_SHOWN: Duration = Duration::from_secs(10 * 60);
+const PEER_FORGET: Duration = Duration::from_secs(24 * 3600);
+
+/// 이 기기를 확인하는 다른 기기
+struct Peer {
+    name: String,
+    note: String,
+    seen: Instant,
+}
+
+/// 다른 메시 기기에 계산을 나눠 주는 중인 것
+struct Sharing {
+    device_id: String,
+    device_name: String,
+    session: crate::lend::LendSession,
+}
+
+#[derive(Default)]
+struct MeshState {
+    sharing: Option<Sharing>,
+    /// 돕지 못한 기기: (그때, 까닭)
+    skip: std::collections::HashMap<String, (Instant, String)>,
+}
+
+fn spawn_mesh(e: Arc<Engine>) {
+    let _ = std::thread::Builder::new().name("mesh-share".into()).spawn(move || {
+        while !e.stop.load(Ordering::SeqCst) {
+            mesh_tick(&e);
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        if let Some(s) = e.mesh.lock().sharing.take() {
+            s.session.stop();
+        }
+        e.lend_want_server.store(false, Ordering::SeqCst);
+    });
+}
+
+fn mesh_tick(e: &Arc<Engine>) {
+    use crate::mesh::monitor::{owner_done, owner_needs_help, Presence};
+    let cfg = e.cfg.read().clone();
+    let devices: Vec<crate::mesh::MeshDevice> = cfg.mesh_devices.iter().filter(|d| d.id != cfg.device_id).cloned().collect();
+    e.monitor.set_devices(&devices);
+    let self_indexing = e.progress.lock().state.is_active();
+    let mut m = e.mesh.lock();
+    let finished = m.sharing.as_ref().is_some_and(|s| s.session.is_finished());
+    if finished {
+        if let Some(s) = m.sharing.take() {
+            let st = s.session.status();
+            if st.phase == crate::lend::Phase::Failed {
+                log(format!("[계산 나누기] {}을(를) 돕지 못했습니다: {} ({}분 뒤 다시 해 봅니다)", s.device_name, st.note, SHARE_RETRY.as_secs() / 60));
+                m.skip.insert(s.device_id, (Instant::now(), st.note));
+            } else {
+                log(format!("[계산 나누기] {}의 인덱싱이 끝나 마쳤습니다 (일감 {}개, 입력 {}개)", s.device_name, st.jobs, st.inputs));
+            }
+            e.lend_want_server.store(false, Ordering::SeqCst);
+        }
+    }
+    if let Some(s) = &m.sharing {
+        if s.session.status().phase.is_busy() {
+            // 일감을 처리하는 동안은 쓰는 중이다 (서버 자동 끄기)
+            *e.activity.lock() = Instant::now();
+        }
+        let gone = !devices.iter().any(|d| d.id == s.device_id);
+        if gone || !cfg.lend_mesh_idle || owner_done(e.monitor.state(&s.device_id).as_ref(), SHARE_DONE_AFTER) {
+            // 받은 일감을 마저 처리하고 끝난다
+            s.session.stop();
+        }
+    } else if cfg.lend_mesh_idle && !self_indexing {
+        m.skip.retain(|_, (t, _)| t.elapsed() < SHARE_RETRY);
+        let target = devices
+            .iter()
+            .find(|d| !m.skip.contains_key(&d.id) && owner_needs_help(e.monitor.state(&d.id).as_ref()))
+            .cloned();
+        if let Some(d) = target {
+            let ready = crate::server::resolve_binary(&cfg.llama_path).is_ok() && Path::new(cfg.model_path.trim()).is_file();
+            if !ready {
+                let why = "이 기기에 llama.cpp나 모델이 없습니다 (`gemma-search download`)".to_string();
+                log(format!("[계산 나누기] {}이(가) 인덱싱 중이지만 돕지 못합니다: {why}", d.name));
+                m.skip.insert(d.id.clone(), (Instant::now(), why));
+            } else {
+                log(format!("[계산 나누기] {}이(가) 인덱싱 중이라 쉬는 동안 돕습니다", d.name));
+                let session = start_sharing(e, &cfg, &d);
+                m.sharing = Some(Sharing { device_id: d.id.clone(), device_name: d.name.clone(), session });
+            }
+        }
+    }
+    let note = presence_note(e, &cfg, &m, self_indexing);
+    drop(m);
+    if !cfg.device_id.is_empty() {
+        e.monitor.set_me(Presence { id: cfg.device_id.clone(), name: crate::lend::machine_name(), note });
+    }
+}
+
+/// 다른 기기에 알릴 이 기기의 지금 상태 (그 기기의 status에 보인다)
+fn presence_note(e: &Engine, cfg: &Config, m: &MeshState, self_indexing: bool) -> String {
+    if let Some(s) = &m.sharing {
+        let st = s.session.status();
+        let head = format!("{}에 {}", s.device_name, st.phase.label());
+        return if st.note.is_empty() { head } else { format!("{head}: {}", st.note) };
+    }
+    if !cfg.lend_mesh_idle {
+        return "계산 나누기 꺼짐".to_string();
+    }
+    if self_indexing {
+        return "이 기기가 인덱싱하는 중".to_string();
+    }
+    // 지금 도울 수 없는 까닭이 있으면 미리 알린다 (다른 프로그램이 그래픽 메모리를 잡고 있는 등)
+    let st = e.server.state();
+    if !st.is_running() && !st.is_ready() {
+        let need = crate::sysinfo::lend_vram_need_mb(cfg.ubatch_size);
+        if let Some(free) = crate::sysinfo::nvidia_free_vram_mb().filter(|f| *f < need) {
+            return format!("대기 · 지금은 도울 수 없음: 남은 그래픽 메모리 {:.1}GB (필요 약 {:.1}GB)", free as f64 / 1024.0, need as f64 / 1024.0);
+        }
+    }
+    "대기 (다른 기기가 인덱싱하면 돕습니다)".to_string()
+}
+
+/// 그 기기에 계산 나누기를 시작한다. 이 기기의 llama-server를 같이 쓰고(메인 루프가 켠다), 쉬는 조건에서는 일감을 받지 않는다.
+fn start_sharing(e: &Arc<Engine>, cfg: &Config, d: &crate::mesh::MeshDevice) -> crate::lend::LendSession {
+    use crate::lend::{LendHooks, LendParams, LendSession};
+    let base = e.monitor.base(&d.id).unwrap_or_else(|| d.bases(None).first().cloned().unwrap_or_default());
+    let token = Some(d.token.clone()).filter(|t| !t.trim().is_empty());
+    let need = crate::sysinfo::lend_vram_need_mb(cfg.ubatch_size);
+    let (w1, w2) = (Arc::downgrade(e), Arc::downgrade(e));
+    let hooks = LendHooks {
+        want_server: Arc::new(move || {
+            if let Some(e) = w1.upgrade() {
+                e.lend_want_server.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+        rest: Arc::new(move || {
+            let e = w2.upgrade()?;
+            if e.progress.lock().state.is_active() {
+                return Some("이 기기가 인덱싱하는 중".to_string());
+            }
+            // 우리 llama-server를 켜기 전에만 본다(켠 뒤에는 우리 몫이 섞인다): 다른 프로그램(다른 LLM 서버 등)이
+            // 그래픽 메모리를 잡고 있어 모자라면 켜지 않는다 (NVIDIA만. 모르면 막지 않는다)
+            let st = e.server.state();
+            if !st.is_running() && !st.is_ready() {
+                if let Some(free) = crate::sysinfo::nvidia_free_vram_mb().filter(|f| *f < need) {
+                    return Some(format!(
+                        "남은 그래픽 메모리 {:.1}GB (필요 약 {:.1}GB)",
+                        free as f64 / 1024.0,
+                        need as f64 / 1024.0
+                    ));
+                }
+            }
+            None
+        }),
+        stop_server_when_idle: false,
+        stop_server_at_end: false,
+        log: Arc::new(|m: &str| log(format!("[계산 나누기] {m}"))),
+        changed: Arc::new(|| {}),
+    };
+    let params = LendParams { base, token, name: crate::lend::machine_name(), cfg: cfg.clone() };
+    LendSession::start(params, e.server.clone(), hooks)
+}
+
+/// status의 메시 부분
+fn mesh_json(e: &Engine) -> Value {
+    let share = e.cfg.read().lend_mesh_idle;
+    let devices: Vec<Value> = e
+        .monitor
+        .states()
+        .into_iter()
+        .map(|(d, st)| {
+            json!({
+                "id": d.id,
+                "name": d.name,
+                "reachable": st.as_ref().and_then(|s| s.reachable),
+                "indexing": st.as_ref().is_some_and(|s| s.indexing.busy()),
+                "version": st.as_ref().map(|s| s.version.clone()).filter(|v| !v.is_empty()),
+                "checked_secs": st.as_ref().and_then(|s| s.checked).map(|t| t.elapsed().as_secs()),
+                "error": st.as_ref().map(|s| s.error.clone()).filter(|x| !x.is_empty()),
+            })
+        })
+        .collect();
+    let mut peers: Vec<(String, Value, u64)> = e
+        .peers
+        .lock()
+        .iter()
+        .filter(|(_, p)| p.seen.elapsed() < PEER_SHOWN)
+        .map(|(id, p)| {
+            let ago = p.seen.elapsed().as_secs();
+            (p.name.clone(), json!({ "id": id, "name": p.name, "note": p.note, "ago_secs": ago }), ago)
+        })
+        .collect();
+    peers.sort_by(|a, b| a.0.cmp(&b.0));
+    let m = e.mesh.lock();
+    let sharing = m.sharing.as_ref().map(|s| {
+        let st = s.session.status();
+        json!({ "device": s.device_name, "phase": st.phase.label(), "note": st.note, "jobs": st.jobs, "inputs": st.inputs, "rate": st.rate })
+    });
+    let names = e.cfg.read().mesh_devices.iter().map(|d| (d.id.clone(), d.name.clone())).collect::<std::collections::HashMap<_, _>>();
+    let skipped: Vec<Value> = m
+        .skip
+        .iter()
+        .map(|(id, (t, why))| {
+            json!({
+                "device": names.get(id).cloned().unwrap_or_else(|| id.clone()),
+                "why": why,
+                "retry_secs": SHARE_RETRY.saturating_sub(t.elapsed()).as_secs(),
+            })
+        })
+        .collect();
+    json!({
+        "share": share,
+        "devices": devices,
+        "peers": peers.into_iter().map(|(_, v, _)| v).collect::<Vec<_>>(),
+        "sharing": sharing,
+        "skipped": skipped,
+    })
 }
 
 /// 새 버전 확인: 켠 지 1분 뒤에 한 번, 그 뒤 하루마다. 알려만 주고 바꾸지는 않는다 (`gemma-search update`가 바꾼다).
@@ -585,7 +835,10 @@ fn main_loop(e: &Arc<Engine>, mut indexer: Indexer) {
             }
         }
         let index_request = *e.index_request.lock();
-        let need_server = e.want_server.load(Ordering::SeqCst) || !batch.is_empty() || index_request.is_some();
+        let need_server = e.want_server.load(Ordering::SeqCst)
+            || e.lend_want_server.load(Ordering::SeqCst)
+            || !batch.is_empty()
+            || index_request.is_some();
         if state.is_ready() {
             retry = RETRY_MIN;
         } else if need_server && !state.is_running() {
@@ -841,7 +1094,18 @@ fn handle(e: &Engine, req: Request) {
     }
     let id_after = |prefix: &str| path.strip_prefix(prefix).and_then(|s| s.parse::<i64>().ok());
     match method {
-        Method::Get if path == "/api/status" => respond_json(req, 200, status(e)),
+        Method::Get if path == "/api/status" => {
+            // 다른 메시 기기의 상태 확인이면 그 기기를 기록한다 (이 기기의 status에 "이 기기를 확인하는 기기"로)
+            if let Some(id) = param(&params, "from").map(str::trim).filter(|s| !s.is_empty()) {
+                let clip = |k: &str, n: usize| param(&params, k).unwrap_or("").chars().take(n).collect::<String>();
+                let mut peers = e.peers.lock();
+                peers.retain(|_, p| p.seen.elapsed() < PEER_FORGET);
+                if peers.len() < 64 || peers.contains_key(id) {
+                    peers.insert(id.chars().take(64).collect(), Peer { name: clip("name", 64), note: clip("note", 200), seen: Instant::now() });
+                }
+            }
+            respond_json(req, 200, status(e))
+        }
         Method::Get if path == "/api/search" => match search(e, &params) {
             Ok(v) => respond_json(req, 200, v),
             Err(m) => respond_error(req, 503, &m),
@@ -1329,6 +1593,8 @@ fn status(e: &Engine) -> Value {
         "min_relevance": rounded(cfg.min_relevance, 1),
         // 계산 빌려주기: 처리 몫(이 기기·빌려주는 기기), 빌려주는 기기들
         "lend": e.lend.status(),
+        // 메시: 내 다른 기기들의 상태, 이 기기를 확인하는 기기들, 계산 나누기
+        "mesh": mesh_json(e),
     })
 }
 

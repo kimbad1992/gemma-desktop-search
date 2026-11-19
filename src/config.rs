@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// 설정 파일 형식 버전. 기본값을 바꿀 때 예전 기본값 그대로인 설정만 옮긴다.
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 
 // 기본 포트. 다른 프로그램과 OS가 잡기 쉬운 곳을 피해 IANA에 등록되지 않은 21850~21999 안에서 골랐다.
 // - Windows의 임시(동적) 포트: 기본 49152~65535. 1024~15000처럼 낮춘 PC도 있고, Hyper-V·WSL은 그 안에서
@@ -129,8 +129,9 @@ pub struct Config {
     pub lend_server: String,
     /// 그 서비스의 접속 토큰 (그 기기 설정의 service_token)
     pub lend_token: String,
-    /// 놀 때 빌려주기(창 있는 앱): 내 다른 기기(`mesh_devices`)가 인덱싱하면 이 기기가 쉬고 있는 동안 계산을
-    /// 빌려준다. 기본 꺼짐 (설계 원칙 5). 꺼져 있어도 이 기기가 추가해 시작된 인덱싱은 돕는다.
+    /// 메시 기기와 계산 나누기(앱·서비스): 내 다른 기기(`mesh_devices`)가 인덱싱하면 이 기기가 쉬고 있는 동안
+    /// 일감을 가져가 돕는다. 기본 켜짐 (v0.11.0부터, 메시에 참여하면 따로 켜지 않아도 서로 돕는다).
+    /// 쉬는 조건(전체 화면 앱, 그래픽 메모리 부족 등)에서는 돕지 않는다. 꺼져 있어도 이 기기가 추가해 시작된 인덱싱은 돕는다.
     pub lend_mesh_idle: bool,
 
     // ── 메시: 원격 라이브러리 (`mesh/`) ──
@@ -254,7 +255,7 @@ impl Default for Config {
             service_token: String::new(),
             lend_server: String::new(),
             lend_token: String::new(),
-            lend_mesh_idle: false,
+            lend_mesh_idle: true,
             device_id: String::new(),
             mesh_added_roots: Vec::new(),
             mesh_devices: Vec::new(),
@@ -327,6 +328,10 @@ impl Config {
             if self.service_bind.trim() == LEGACY_SERVICE_BIND {
                 self.service_bind = DEFAULT_SERVICE_BIND.into();
             }
+        }
+        if self.config_version < 5 {
+            // 메시 기기끼리는 따로 켜지 않아도 계산을 나눈다 (예전 기본값은 꺼짐이었다)
+            self.lend_mesh_idle = true;
         }
         self.config_version = CONFIG_VERSION;
     }
@@ -495,6 +500,20 @@ mod tests {
             "새 버전에서 고른 값은 손대지 않음"
         );
         assert_eq!(load("").0, DEFAULT_LLAMA_PORT, "새 설정");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mesh_sharing_is_on_by_default() {
+        let dir = std::env::temp_dir().join(format!("gs-cfg-mesh-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let load = |body: &str| {
+            std::fs::write(dir.join("config.toml"), body).unwrap();
+            Config::load(&dir).lend_mesh_idle
+        };
+        assert!(load(""), "새 설정");
+        assert!(load("config_version = 4\nlend_mesh_idle = false\n"), "예전 기본값(꺼짐)은 켠다");
+        assert!(!load("config_version = 5\nlend_mesh_idle = false\n"), "새 버전에서 끈 것은 그대로");
         let _ = std::fs::remove_dir_all(dir);
     }
 

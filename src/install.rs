@@ -7,6 +7,9 @@
 //!    로그아웃한 뒤에도 돌려면 linger가 켜져 있어야 한다. 켜지 못하면 할 일을 알려만 준다.
 //! 4. 서비스가 답하는지 확인하고, 이 기기의 공유 폴더와 참여 코드, 다른 PC에서 할 일을 보여 준다.
 //!
+//! `--join <참여 코드>`를 주면 그 기기를 메시 기기로 넣는다(2단계). 메시 기기끼리는 서로 상태를 확인하고, 그 기기가
+//! 인덱싱하면 이 기기가 쉬는 동안 계산을 나눈다(따로 켜지 않아도 된다, `service.rs`의 메시 부분).
+//!
 //! 여러 번 실행해도 된다(서비스 파일을 고쳐 쓰고 다시 띄운다). `install --remove`는 서비스만 내리고 지운다.
 
 use std::path::Path;
@@ -18,6 +21,8 @@ pub const USAGE: &str = "\
   gemma-search install            이 기기를 다른 PC가 쓰는 서버로 만든다. 준비물을 받고, 다른 기기가 닿게 열고,
                                   systemd 사용자 서비스로 늘 띄운 뒤 참여 코드를 보여 준다 (관리자 권한 필요 없음).
                                   여러 번 실행해도 된다
+      --join <참여 코드>          그 기기의 메시에 참여한다 (그 기기에서 gemma-search join-code).
+                                  메시 기기끼리는 서로 상태를 확인하고, 인덱싱하는 기기를 쉬는 동안 돕는다
       --bind <주소:포트>          접속을 받을 주소 (기본 0.0.0.0:21870)
       --llama <판>                llama.cpp 판을 직접 고른다: cpu, vulkan, cuda13, cuda12
       -y, --yes                   받을 것을 묻지 않고 받는다
@@ -32,7 +37,7 @@ pub fn install(args: &[String]) -> i32 {
         println!("{USAGE}");
         return 0;
     }
-    let a = match parse_args(args, &["--bind", "--llama"], &["--yes", "--remove"], false) {
+    let a = match parse_args(args, &["--bind", "--llama", "--join"], &["--yes", "--remove"], false) {
         Ok(a) => a,
         Err(e) => return usage_error(&e),
     };
@@ -41,7 +46,7 @@ pub fn install(args: &[String]) -> i32 {
         if a.flag("--remove") {
             return linux::remove();
         }
-        linux::install(a.value("--bind"), a.value("--llama"), a.flag("--yes"))
+        linux::install(a.value("--bind"), a.value("--llama"), a.value("--join"), a.flag("--yes"))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -112,7 +117,16 @@ mod linux {
     /// 서비스가 답하기를 기다리는 시간 (처음 켤 때 인덱스를 여는 시간을 넉넉히)
     const WAIT: Duration = Duration::from_secs(40);
 
-    pub fn install(bind: Option<&str>, llama: Option<&str>, yes: bool) -> i32 {
+    pub fn install(bind: Option<&str>, llama: Option<&str>, join: Option<&str>, yes: bool) -> i32 {
+        // 참여 코드는 받기 전에 먼저 읽어 본다 (잘못 붙여 넣었으면 받기 전에 알린다)
+        let join_code = match join.map(crate::mesh::JoinCode::decode) {
+            None => None,
+            Some(Ok(c)) => Some(c),
+            Some(Err(e)) => {
+                eprintln!("참여 코드를 읽지 못했습니다: {e}");
+                return 2;
+            }
+        };
         let exe = match std::env::current_exe().and_then(|p| p.canonicalize()) {
             Ok(p) => p,
             Err(e) => {
@@ -193,6 +207,29 @@ mod linux {
             "  {bind}로 엽니다. {}",
             if had_token { "있던 접속 토큰을 그대로 씁니다." } else { "접속 토큰을 만들었습니다." }
         );
+        // 메시 참여: 그 기기에 닿는지, 참여 코드가 맞는지 확인하고 넣는다
+        if let Some(jc) = &join_code {
+            if jc.id == cfg.device_id {
+                println!("  참여 코드가 이 기기 것입니다. 메시에는 다른 기기의 코드를 넣습니다.");
+            } else {
+                match crate::mesh::client::join(jc) {
+                    Ok(d) => {
+                        println!("  메시에 참여했습니다: {} ({})", d.name, d.addrs.join(", "));
+                        cfg.mesh_devices.retain(|x| x.id != d.id);
+                        cfg.mesh_devices.push(d);
+                        if let Err(e) = cfg.save(&data) {
+                            eprintln!("설정을 저장하지 못했습니다: {e}");
+                            return 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  메시에 참여하지 못했습니다: {e}");
+                        eprintln!("  그 기기의 서비스가 떠 있는지 확인하고 다시 실행하세요.");
+                        return 1;
+                    }
+                }
+            }
+        }
 
         // ── 3. 늘 띄우기 ──
         println!("\n[3/4] 늘 띄우기 (systemd 사용자 서비스)");
@@ -330,6 +367,14 @@ mod linux {
             println!("설정을 마쳤습니다. 서비스는 직접 띄워야 합니다 (아래 참고).");
         }
         println!("  접속 주소  {} (포트 {port})", addrs.join(", "));
+        let others: Vec<&str> = cfg.mesh_devices.iter().filter(|d| d.id != cfg.device_id).map(|d| d.name.as_str()).collect();
+        if !others.is_empty() {
+            println!(
+                "  메시       {} · 계산 나누기 {}",
+                others.join(", "),
+                if cfg.lend_mesh_idle { "켜짐 (그 기기가 인덱싱하면 이 기기가 쉬는 동안 돕습니다)" } else { "꺼짐" }
+            );
+        }
         if shares.is_empty() {
             println!("  공유 폴더  없음");
             println!("             다른 PC는 이 기기가 네트워크에 공유한 폴더(Samba) 아래만 추가할 수 있습니다.");

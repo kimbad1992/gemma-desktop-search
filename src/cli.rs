@@ -248,6 +248,68 @@ impl Client {
 }
 
 /// 계산 빌려주기: 처리 몫과 빌려주는 기기 (빌려주는 기기를 쓴 적이 없으면 아무것도 없다)
+/// 메시: 내 다른 기기들(이 기기가 확인하는 기기), 이 기기를 확인하는 기기들, 계산 나누기
+fn mesh_lines(m: &Value) -> Vec<String> {
+    let devices = m["devices"].as_array().cloned().unwrap_or_default();
+    let peers = m["peers"].as_array().cloned().unwrap_or_default();
+    if devices.is_empty() && peers.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![format!("메시: 계산 나누기 {}", if m["share"] == false { "꺼짐" } else { "켜짐" })];
+    for d in &devices {
+        let mut s = format!("  {}: ", d["name"].as_str().unwrap_or("?"));
+        s += match d["reachable"].as_bool() {
+            None => "확인하는 중",
+            Some(true) if d["indexing"] == true => "닿음 · 인덱싱 중",
+            Some(true) => "닿음",
+            Some(false) => "닿지 않음",
+        };
+        if let Some(v) = d["version"].as_str() {
+            s += &format!(" · v{v}");
+        }
+        if let Some(e) = d["error"].as_str().filter(|_| d["reachable"] == false) {
+            s += &format!(" ({e})");
+        }
+        if let Some(secs) = d["checked_secs"].as_u64() {
+            s += &format!(" · {} 전 확인", human_secs(secs));
+        }
+        out.push(s);
+    }
+    if let Some(sh) = m["sharing"].as_object() {
+        let mut s = format!(
+            "  계산 나누기: {}에 {} · 일감 {}개 · 입력 {}개",
+            sh.get("device").and_then(|x| x.as_str()).unwrap_or("?"),
+            sh.get("phase").and_then(|x| x.as_str()).unwrap_or(""),
+            num(&sh["jobs"]),
+            num(&sh["inputs"])
+        );
+        if let Some(n) = sh.get("note").and_then(|x| x.as_str()).filter(|n| !n.is_empty()) {
+            s += &format!(" ({n})");
+        }
+        out.push(s);
+    }
+    for k in m["skipped"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "  {}을(를) 돕지 못함: {} ({} 뒤 다시)",
+            k["device"].as_str().unwrap_or("?"),
+            k["why"].as_str().unwrap_or(""),
+            human_secs(k["retry_secs"].as_u64().unwrap_or(0))
+        ));
+    }
+    if !peers.is_empty() {
+        out.push("  이 기기를 확인하는 기기:".to_string());
+        for p in &peers {
+            out.push(format!(
+                "    {} · {} · {} 전",
+                p["name"].as_str().unwrap_or("?"),
+                p["note"].as_str().filter(|n| !n.is_empty()).unwrap_or("상태 모름"),
+                human_secs(p["ago_secs"].as_u64().unwrap_or(0))
+            ));
+        }
+    }
+    out
+}
+
 fn lend_lines(l: &Value) -> Vec<String> {
     let lenders = l["lenders"].as_array().cloned().unwrap_or_default();
     let share = l["share"].as_array().cloned().unwrap_or_default();
@@ -535,6 +597,9 @@ fn status_text(base: &str, v: &Value) -> String {
     for l in lend_lines(&v["lend"]) {
         line(l);
     }
+    for l in mesh_lines(&v["mesh"]) {
+        line(l);
+    }
     let w = &v["watch"];
     if w["enabled"] == true {
         let mut s = format!("폴더 감시: 켜짐 · 반영 기다리는 변경 {}개", num(&w["pending"]));
@@ -804,5 +869,27 @@ mod tests {
             "마지막 실행 완료: 처리 2 · 변경 없음 11 · 옮김 1 · 삭제 2 · 오류 0 · 요청받은 전체 재구축: 검색 서버가 준비되면 시작"
         );
         assert_eq!(indexing_line(&json!({ "key": "idle", "pending": null })), "대기");
+    }
+
+    #[test]
+    fn mesh_lines_show_both_directions() {
+        let v = serde_json::json!({
+            "share": true,
+            "devices": [
+                { "name": "leeubuntu", "reachable": true, "indexing": true, "version": "0.11.0", "checked_secs": 2 },
+                { "name": "nas", "reachable": false, "error": "연결 안 됨", "checked_secs": 30 }
+            ],
+            "sharing": { "device": "leeubuntu", "phase": "계산 빌려주는 중", "note": "", "jobs": 12, "inputs": 40 },
+            "skipped": [],
+            "peers": [{ "name": "LEE-PHN16", "note": "대기 (다른 기기가 인덱싱하면 돕습니다)", "ago_secs": 20 }]
+        });
+        let l = mesh_lines(&v);
+        assert_eq!(l[0], "메시: 계산 나누기 켜짐");
+        assert!(l[1].starts_with("  leeubuntu: 닿음 · 인덱싱 중 · v0.11.0"));
+        assert!(l[2].contains("nas: 닿지 않음") && l[2].contains("연결 안 됨"));
+        assert!(l[3].contains("계산 나누기: leeubuntu에 계산 빌려주는 중 · 일감 12개"));
+        assert_eq!(l[4], "  이 기기를 확인하는 기기:");
+        assert!(l[5].starts_with("    LEE-PHN16 · 대기"));
+        assert!(mesh_lines(&serde_json::json!({ "devices": [], "peers": [] })).is_empty(), "메시가 없으면 아무것도");
     }
 }

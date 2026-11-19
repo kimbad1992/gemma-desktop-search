@@ -17,6 +17,30 @@ const SLOW: Duration = Duration::from_secs(30);
 /// 라이브러리 목록은 이만큼마다만 다시 묻는다
 const LIBRARIES_EVERY: Duration = Duration::from_secs(60);
 
+/// 그 기기가 닿지 않는 것으로 알려졌는지 (아직 모르면 false: 물어본다)
+pub fn known_offline(st: Option<&DeviceState>) -> bool {
+    st.is_some_and(|s| s.reachable == Some(false))
+}
+
+/// 그 기기가 지금 인덱싱 중(또는 곧 시작)이라 계산을 빌려줄 만한지
+pub fn owner_needs_help(st: Option<&DeviceState>) -> bool {
+    st.is_some_and(|s| s.reachable == Some(true) && s.indexing.busy())
+}
+
+/// 그 기기의 인덱싱이 끝나고 `after` 넘게 조용했는지 (자동 빌려주기를 끝낸다)
+pub fn owner_done(st: Option<&DeviceState>, after: Duration) -> bool {
+    st.is_some_and(|s| s.reachable == Some(true) && !s.indexing.busy() && s.idle_since.is_some_and(|t| t.elapsed() > after))
+}
+
+/// 상태를 물을 때 함께 알리는 이 기기 (그 기기의 status에 "이 기기를 확인하는 기기"로 보인다)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Presence {
+    pub id: String,
+    pub name: String,
+    /// 지금 하는 일 (예: "쉬는 중", "leeubuntu에 계산 빌려주는 중", "쉼: 남은 그래픽 메모리 1.5GB")
+    pub note: String,
+}
+
 /// 소유 기기의 인덱싱 진행 (`/api/status`의 `indexing`)
 #[derive(Clone, Debug, Default)]
 pub struct Indexing {
@@ -55,6 +79,8 @@ pub struct DeviceState {
 
 struct Shared {
     devices: Mutex<Vec<MeshDevice>>,
+    /// 물을 때 함께 알리는 이 기기 (없으면 알리지 않는다)
+    me: Mutex<Option<Presence>>,
     states: Mutex<HashMap<String, DeviceState>>,
     /// 이때까지는 자주 묻는다 (방금 붙였을 때)
     fast_until: Mutex<Option<Instant>>,
@@ -78,6 +104,7 @@ impl Monitor {
     pub fn start(changed: crate::util::Waker) -> Self {
         let shared = Arc::new(Shared {
             devices: Mutex::new(Vec::new()),
+            me: Mutex::new(None),
             states: Mutex::new(HashMap::new()),
             fast_until: Mutex::new(None),
             poke: AtomicBool::new(false),
@@ -102,6 +129,21 @@ impl Monitor {
     pub fn poke(&self, for_secs: u64) {
         *self.shared.fast_until.lock() = Some(Instant::now() + Duration::from_secs(for_secs));
         self.shared.poke.store(true, Ordering::SeqCst);
+    }
+
+    /// 물을 때 함께 알릴 이 기기와 지금 하는 일 (바뀌면 다음 확인 때 알린다)
+    pub fn set_me(&self, me: Presence) {
+        *self.shared.me.lock() = Some(me);
+    }
+
+    /// 모든 기기의 상태 (서비스의 status에 보인다)
+    pub fn states(&self) -> Vec<(MeshDevice, Option<DeviceState>)> {
+        let devices = self.shared.devices.lock().clone();
+        let st = self.shared.states.lock();
+        devices.into_iter().map(|d| {
+            let s = st.get(&d.id).cloned();
+            (d, s)
+        }).collect()
     }
 
     pub fn state(&self, device_id: &str) -> Option<DeviceState> {
@@ -153,7 +195,16 @@ fn run(s: Arc<Shared>, changed: crate::util::Waker) {
             let owner = Owner::new(d, prev.base.as_deref(), Duration::from_secs(8));
             let mut st = prev.clone();
             st.checked = Some(Instant::now());
-            match owner.json("GET", "/api/status", None) {
+            // 묻는 김에 이 기기가 누구이고 지금 무엇을 하는지 알린다 (그 기기의 status에 보인다: 서로의 헬스체크)
+            let me = s.me.lock().clone();
+            let path = match me {
+                Some(m) if !m.id.is_empty() => {
+                    let enc = crate::service::url_encode;
+                    format!("/api/status?from={}&name={}&note={}", enc(&m.id), enc(&m.name), enc(&m.note))
+                }
+                _ => "/api/status".to_string(),
+            };
+            match owner.json("GET", &path, None) {
                 Ok((base, v)) => {
                     st.reachable = Some(true);
                     st.base = Some(base);
