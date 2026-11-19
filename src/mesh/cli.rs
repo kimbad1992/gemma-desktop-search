@@ -5,7 +5,9 @@
 //!                                              원격 라이브러리로 붙인다 (설정의 remote_libraries). 모르는 서버면
 //!                                              Gemma Search가 있는지 알려 주고, 참여 코드를 주면 참여하고 붙인다
 //!   gemma-search --mesh-status                  메시 기기 상태와 원격 라이브러리
-//!   gemma-search --mesh-search <질의…>          원격 라이브러리만 검색해 이 기기에서 여는 경로와 함께 보인다
+//!   gemma-search --mesh-search [--local] <질의…>
+//!                                              원격 라이브러리만 검색해 이 기기에서 여는 경로와 함께 보인다.
+//!                                              --local이면 이 기기 인덱스의 관련도 기준으로 다시 매긴 점수도 (앱과 같다)
 //!
 //! 쓰고 있는 설정과 섞이지 않게 `GEMMA_SEARCH_DATA`로 시험용 데이터 폴더를 준다.
 
@@ -160,13 +162,31 @@ pub fn status(_args: &[String]) -> i32 {
 }
 
 pub fn search(args: &[String]) -> i32 {
-    let q = args.join(" ");
+    use crate::search::query::{Outcome, QueryKind};
+    let local = args.iter().any(|a| a == "--local");
+    let q = args.iter().filter(|a| *a != "--local").cloned().collect::<Vec<_>>().join(" ");
     if q.trim().is_empty() {
         eprintln!("질의를 주세요");
         return 2;
     }
-    let (_, cfg) = load();
+    let (dir, cfg) = load();
+    // --local: 이 기기 인덱스로 같은 질의의 관련도 기준만 잡는다 (결과는 원격 것만 보인다)
+    let mut o = if local {
+        match local_baseline(&dir, &cfg, &q) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("이 기기 인덱스로 검색하지 못했습니다: {e}");
+                return 1;
+            }
+        }
+    } else {
+        Outcome::empty(&QueryKind::Text(q.clone()))
+    };
+    if let Some(b) = o.baseline {
+        println!("이 기기 기준: 중앙값 {:.4} · 폭 {:.4} · 벡터 {}개", b.median, b.scale, b.chunks);
+    }
     let mut code = 0;
+    let mut answers = Vec::new();
     for (index, d) in cfg.mesh_devices.iter().enumerate() {
         let libraries: Vec<_> = cfg.remote_libraries.iter().filter(|l| l.enabled && l.device_id == d.id).cloned().collect();
         if libraries.is_empty() {
@@ -179,19 +199,62 @@ pub fn search(args: &[String]) -> i32 {
             code = 1;
             continue;
         }
-        println!("{}: 결과 {}개 (벡터 {}개 비교)", a.device_name, a.hits.len(), a.searched);
-        let mut hits = a.hits;
-        hits.sort_by(|x, y| y.1.hit.score.total_cmp(&x.1.hit.score));
-        for (sec, hv) in hits.iter().take(10) {
-            let exists = std::path::Path::new(&hv.hit.path).exists();
-            println!(
-                "  {:>5.1} {:<8} {} [{}]",
-                hv.hit.score,
-                sec.label(),
-                hv.hit.path,
-                if exists { "열 수 있음" } else { "이 기기에서 안 보임" }
-            );
-        }
+        let base = a
+            .baseline
+            .map(|b| format!(" · 기준: 중앙값 {:.4} · 폭 {:.4} · 벡터 {}개", b.median, b.scale, b.chunks))
+            .unwrap_or_else(|| " · 기준 없음(예전 서비스)".to_string());
+        println!("{}: 결과 {}개 (벡터 {}개 비교){base}", a.device_name, a.hits.len(), a.searched);
+        answers.push(a);
+    }
+    // 원래 점수 (다시 매긴 것과 나란히 보인다)
+    let before: std::collections::HashMap<i64, f32> =
+        answers.iter().flat_map(|a| a.hits.iter().map(|(_, h)| (h.hit.chunk_id, h.hit.score))).collect();
+    client::merge_into(&mut o, answers);
+    let mut hits: Vec<_> = o.sections.iter().flat_map(|(s, v)| v.iter().map(move |h| (*s, h))).filter(|(_, h)| h.remote.is_some()).collect();
+    hits.sort_by(|x, y| y.1.hit.score.total_cmp(&x.1.hit.score));
+    for (sec, hv) in hits.iter().take(10) {
+        let exists = std::path::Path::new(&hv.hit.path).exists();
+        let was = before.get(&hv.hit.chunk_id).copied().unwrap_or(hv.hit.score);
+        let score = if (was - hv.hit.score).abs() > 0.05 {
+            format!("{was:>5.1} → {:>5.1}", hv.hit.score)
+        } else {
+            format!("{:>5.1}", hv.hit.score)
+        };
+        println!(
+            "  {score} {:<8} {} [{}]",
+            sec.label(),
+            hv.hit.path,
+            if exists { "열 수 있음" } else { "이 기기에서 안 보임" }
+        );
     }
     code
+}
+
+/// 이 기기의 llama-server를 켜고 인덱스를 읽어 같은 질의를 검색한다 (결과는 버리고 관련도 기준만 쓴다)
+fn local_baseline(dir: &std::path::Path, cfg: &Config, q: &str) -> Result<crate::search::query::Outcome, String> {
+    use crate::search::query::{self, QueryKind};
+    use crate::search::store::{Filter, VectorStore};
+    use parking_lot::{Mutex, RwLock};
+    use std::sync::Arc;
+    let server = crate::server::ServerManager::default();
+    server.bring_up(cfg).map_err(|e| e.to_string())?;
+    let t0 = std::time::Instant::now();
+    while server.capabilities().is_none() {
+        if t0.elapsed() > Duration::from_secs(180) {
+            return Err("llama-server가 준비되지 않았습니다".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let db = crate::index::db::Db::open(&dir.join("index.db")).map_err(|e| e.to_string())?;
+    let mut st = VectorStore::new(cfg.search_dim);
+    st.fill_from_db(&db).map_err(|e| e.to_string())?;
+    st.loaded = true;
+    let (db, store) = (Arc::new(Mutex::new(db)), Arc::new(RwLock::new(st)));
+    let filter = Filter { sections: [false; 5], ..Default::default() };
+    let o = query::run(&server.target(), &store, &db, QueryKind::Text(q.to_string()), filter, cfg.top_k, cfg.min_relevance, cfg.ffmpeg());
+    server.stop();
+    match o.error {
+        Some(e) => Err(e),
+        None => Ok(o),
+    }
 }

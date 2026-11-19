@@ -316,6 +316,10 @@ pub struct RemoteAnswer {
     pub error: Option<String>,
     /// 닿지 않았다 (`error`가 "연결 안 됨")
     pub unreachable: bool,
+    /// 그 기기에서 관련도를 매긴 기준 (v0.10.3 이상 서비스). 없으면 그 기기의 관련도를 그대로 쓴다
+    pub baseline: Option<crate::search::store::Baseline>,
+    /// 그 검색의 의미 관련도 가중치 (기준을 바꿔 다시 매길 때 쓴다)
+    pub meaning_weight: f32,
 }
 
 /// 원격 결과의 번호: 이 기기 인덱스의 번호(양수)와 겹치지 않게 음수로, 기기마다 다르게
@@ -397,8 +401,9 @@ fn hit_from_json(q: &RemoteQuery, sec: Section, h: &Value) -> Option<HitView> {
     let hit = Hit {
         file_id: synthetic_id(q.index, file_id),
         chunk_id: synthetic_id(q.index, chunk_id),
-        score: f("score"),
-        meaning: f("meaning"),
+        // 반올림하지 않은 값이 있으면 그것 (다시 매길 때 오차가 쌓이지 않게)
+        score: h["score_exact"].as_f64().map(|x| x as f32).unwrap_or_else(|| f("score")),
+        meaning: h["meaning_exact"].as_f64().map(|x| x as f32).unwrap_or_else(|| f("meaning")),
         cosine: f("cosine"),
         // 예전 서비스는 일치 비율을 주지 않는다: 단어로 걸린 결과("keyword")면 보이게
         coverage: h["coverage"]
@@ -464,6 +469,8 @@ pub fn search(q: &RemoteQuery, text: &str, sections: &[bool; 5], path: &str) -> 
         Ok((_, v)) => {
             answer.searched = v["searched"].as_u64().unwrap_or(0) as usize;
             answer.hits = hits_from_answer(q, &v);
+            answer.baseline = baseline_from(&v);
+            answer.meaning_weight = v["meaning_weight"].as_f64().unwrap_or(1.0) as f32;
         }
         Err(e) => {
             answer.unreachable = matches!(e, CallError::Unreachable(_));
@@ -471,6 +478,40 @@ pub fn search(q: &RemoteQuery, text: &str, sections: &[bool; 5], path: &str) -> 
         }
     }
     answer
+}
+
+/// 원격 기기들의 답을 이 기기의 결과에 합친다. 관련도는 인덱스마다 "그 안에서 얼마나 두드러지나"라서,
+/// 작거나 한 주제인 원격 라이브러리(예: 여행 사진 200장)의 결과는 그 안에서 다 비슷해 낮게 나온다.
+/// 그래서 합치기 전에 모두 가장 큰 인덱스의 기준으로 다시 매긴다 (설계 7.5). 기준이 없는 답(예전 서비스)은 그대로.
+pub fn merge_into(o: &mut crate::search::query::Outcome, mut answers: Vec<RemoteAnswer>) {
+    use crate::search::query;
+    let bases = std::iter::once(o.baseline).chain(answers.iter().map(|a| a.baseline));
+    if let Some(to) = query::widest(bases) {
+        if let Some(from) = o.baseline {
+            let w = o.meaning_weight;
+            query::rebase(o.sections.iter_mut().flat_map(|(_, v)| v.iter_mut()), &from, &to, w);
+        }
+        for a in &mut answers {
+            if let Some(from) = a.baseline {
+                query::rebase(a.hits.iter_mut().map(|(_, h)| h), &from, &to, a.meaning_weight);
+            }
+        }
+    }
+    for a in answers {
+        let note = query::RemoteNote { name: a.device_name.clone(), error: a.error.clone() };
+        o.merge_remote(note, a.hits, a.searched);
+    }
+}
+
+/// 검색 답의 관련도 기준 (예전 서비스는 주지 않는다)
+pub fn baseline_from(v: &Value) -> Option<crate::search::store::Baseline> {
+    let b = &v["baseline"];
+    let scale = b["scale"].as_f64()? as f32;
+    (scale > 0.0).then_some(crate::search::store::Baseline {
+        median: b["median"].as_f64()? as f32,
+        scale,
+        chunks: b["chunks"].as_u64()? as usize,
+    })
 }
 
 /// 원격 결과의 썸네일 (JPEG)
@@ -533,5 +574,36 @@ mod tests {
         // 기기마다 번호가 겹치지 않는다
         assert_ne!(synthetic_id(0, 7), synthetic_id(1, 7));
         assert!(synthetic_id(3, i64::MAX) < 0);
+    }
+
+    #[test]
+    fn answers_carry_baseline_and_exact_scores() {
+        let q = RemoteQuery {
+            index: 0,
+            device: MeshDevice { id: "d1".into(), name: "leeubuntu".into(), port: 21870, addrs: vec![], token: String::new() },
+            base: None,
+            libraries: vec![RemoteLibrary {
+                device_id: "d1".into(),
+                owner_folder: "/mnt/storage/사진".into(),
+                local_folder: r"\\leeubuntu\storage\사진".into(),
+                ..Default::default()
+            }],
+        };
+        let v = json!({
+            "baseline": { "median": 0.0881, "scale": 0.02, "chunks": 400 },
+            "meaning_weight": 1.0,
+            "sections": [{ "key": "images", "hits": [
+                { "file_id": 1, "chunk_id": 10, "path": "/mnt/storage/사진/a.jpg", "kind": "image", "modality": "image",
+                  "score": 3.0, "meaning": 3.0, "score_exact": 2.9876, "meaning_exact": 2.9876 }
+            ]}]
+        });
+        let b = baseline_from(&v).unwrap();
+        assert_eq!(b.chunks, 400);
+        assert!((b.median - 0.0881).abs() < 1e-6 && (b.scale - 0.02).abs() < 1e-6);
+        let hits = hits_from_answer(&q, &v);
+        assert!((hits[0].1.hit.meaning - 2.9876).abs() < 1e-5, "반올림하지 않은 값을 쓴다");
+        // 예전 서비스: 기준이 없으면 None (관련도를 그대로 쓴다)
+        assert!(baseline_from(&json!({ "sections": [] })).is_none());
+        assert!(baseline_from(&json!({ "baseline": { "median": 0.1, "scale": 0.0, "chunks": 5 } })).is_none());
     }
 }

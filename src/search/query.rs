@@ -1,7 +1,7 @@
 //! 질의 실행 (백그라운드 스레드): 질의 임베딩 + 키워드 검색 → 저장소 검색 → 스니펫/썸네일 정보
 
 use super::keyword::{self, KeywordResult};
-use super::store::{Boost, Filter, Hit, Section, VectorStore, KEYWORD_SHOW};
+use super::store::{Baseline, Boost, Filter, Hit, Section, VectorStore, KEYWORD_SHOW};
 use crate::embed::client::{EmbedClient, EmbedInput, EmbedTarget};
 use crate::embed::prompt;
 use crate::extract::{Kind, Modality};
@@ -79,6 +79,10 @@ pub struct Outcome {
     pub expr: Option<String>,
     /// 함께 물은 원격 기기들 (원격 라이브러리가 없으면 빈 것)
     pub remote: Vec<RemoteNote>,
+    /// 이 기기 인덱스에서 관련도를 매긴 기준 (원격 결과와 기준을 맞출 때 쓴다). 허브 보정 전이면 None
+    pub baseline: Option<Baseline>,
+    /// 의미 관련도의 가중치 (번호·코드 조회형 질의는 절반). 관련도 = 가중치 × 의미 관련도 + 검색어 가산점
+    pub meaning_weight: f32,
 }
 
 impl Outcome {
@@ -106,6 +110,8 @@ impl Outcome {
             },
             expr: None,
             remote: Vec::new(),
+            baseline: None,
+            meaning_weight: 1.0,
         }
     }
 
@@ -132,6 +138,25 @@ impl Outcome {
     }
 }
 
+/// 여러 인덱스의 관련도 기준 가운데 벡터가 가장 많은 것. 벡터가 많을수록 "보통 파일"의 점수대를 믿을 만하게 잡는다.
+/// 원격 라이브러리가 작거나 한 주제(예: 여행 사진 200장)면 그 안에서는 다 비슷해 관련도가 낮게 나오므로,
+/// 결과를 합치기 전에 모두 이 기준으로 다시 매긴다 (설계 7.5).
+pub fn widest(bases: impl IntoIterator<Item = Option<Baseline>>) -> Option<Baseline> {
+    bases.into_iter().flatten().max_by_key(|b| b.chunks)
+}
+
+/// 기준 `from`으로 매긴 결과들의 관련도를 기준 `to`로 다시 매긴다. 검색어 가산점은 그대로 둔다.
+pub fn rebase<'a>(hits: impl IntoIterator<Item = &'a mut HitView>, from: &Baseline, to: &Baseline, meaning_weight: f32) {
+    if from == to {
+        return;
+    }
+    for hv in hits {
+        let z = to.rescale(from, hv.hit.meaning);
+        hv.hit.score += meaning_weight * (z - hv.hit.meaning);
+        hv.hit.meaning = z;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     target: &EmbedTarget,
@@ -153,6 +178,8 @@ pub fn run(
         kind_hints: Vec::new(),
         expr: None,
         remote: Vec::new(),
+        baseline: None,
+        meaning_weight: 1.0,
     };
     let client = EmbedClient::new(target);
     let (label, input, text) = match &q {
@@ -193,9 +220,9 @@ pub fn run(
         weight: if kw.lookup { LOOKUP_WEIGHT } else { WORD_WEIGHT },
         meaning_weight: if kw.lookup { LOOKUP_MEANING } else { 1.0 },
     };
-    let (sections, searched) = {
+    let ((sections, baseline), searched) = {
         let st = store.read();
-        (st.search(&qv, &filter, top_k, Some(&boost)), st.live_chunks())
+        (st.search_with_baseline(&qv, &filter, top_k, Some(&boost)), st.live_chunks())
     };
     let db = db.lock();
     let expr = kw.expr.as_deref();
@@ -252,6 +279,8 @@ pub fn run(
         kind_hints: text.as_deref().map(keyword::kind_hints).unwrap_or_default(),
         expr: kw.expr.clone(),
         remote: Vec::new(),
+        baseline,
+        meaning_weight: boost.meaning_weight,
     }
 }
 
@@ -304,4 +333,54 @@ pub fn unified<'a>(visible: &[(Section, Vec<&'a HitView>)], hints: &[Section]) -
     }
     kept.truncate(UNIFIED_LIMIT);
     kept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(score: f32, meaning: f32) -> HitView {
+        HitView {
+            hit: Hit {
+                file_id: 1,
+                chunk_id: 1,
+                score,
+                meaning,
+                cosine: 0.0,
+                coverage: 0.0,
+                modality: Modality::Image,
+                locator: 0,
+                path: String::new(),
+                kind: Kind::Image,
+            },
+            file_name: String::new(),
+            snippet: String::new(),
+            highlight: None,
+            thumb_chunk: None,
+            remote: None,
+        }
+    }
+
+    #[test]
+    fn small_library_is_rescored_on_the_widest_baseline() {
+        // 실측(2026-11-19): 제주 사진 200장 라이브러리에서 "바다가 보이는 사진"의 최고 관련도 3.0이
+        // 노트북 인덱스(34만 벡터)의 기준으로는 7.9
+        let small = Baseline { median: 0.0881, scale: 0.0200, chunks: 400 };
+        let big = Baseline { median: -0.0105, scale: 0.0200, chunks: 342_307 };
+        assert_eq!(widest([Some(small), None, Some(big)]), Some(big));
+        assert_eq!(widest([None, None]), None);
+        // 의미 관련도 3.0, 검색어 가산점 0.5 (관련도 3.5)
+        let mut hits = vec![view(3.5, 3.0)];
+        rebase(hits.iter_mut(), &small, &big, 1.0);
+        let z = (3.0 * 0.02 + 0.0881 + 0.0105) / 0.02;
+        assert!((hits[0].hit.meaning - z).abs() < 1e-3 && z > 7.8);
+        assert!((hits[0].hit.score - (z + 0.5)).abs() < 1e-3, "가산점은 그대로");
+        // 같은 기준이면 그대로, 의미 가중치가 절반이면 바뀐 만큼의 절반만
+        let mut same = vec![view(3.5, 3.0)];
+        rebase(same.iter_mut(), &big, &big, 1.0);
+        assert_eq!((same[0].hit.score, same[0].hit.meaning), (3.5, 3.0));
+        let mut half = vec![view(2.0, 3.0)];
+        rebase(half.iter_mut(), &small, &big, 0.5);
+        assert!((half[0].hit.score - (2.0 + 0.5 * (z - 3.0))).abs() < 1e-3);
+    }
 }

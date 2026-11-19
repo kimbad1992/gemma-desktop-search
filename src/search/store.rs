@@ -184,6 +184,23 @@ impl Boost {
     }
 }
 
+/// 한 인덱스에서 이 질의의 관련도를 매긴 기준: 허브 보정한 유사도의 중앙값과 폭, 그 인덱스의 벡터 수.
+/// 허브 보정한 유사도는 같은 모델이면 기기와 상관없이 같은 눈금이다(기준 질의 벡터가 기기마다 같다).
+/// 그래서 원격 라이브러리의 결과를 다른 인덱스의 기준으로 다시 매길 수 있다 (`rescale`, 설계 7.5).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Baseline {
+    pub median: f32,
+    pub scale: f32,
+    pub chunks: usize,
+}
+
+impl Baseline {
+    /// 기준 `from`으로 매긴 의미 관련도 `z`를 이 기준으로
+    pub fn rescale(&self, from: &Baseline, z: f32) -> f32 {
+        (z * from.scale + from.median - self.median) / self.scale
+    }
+}
+
 /// 이 질의에 대한 (보정한) 점수 전체의 중심과 폭: (중앙값, 1.4826 × MAD). 관련도 = (점수 − 중앙값) / 폭.
 /// 폭이 너무 작으면(벡터가 몇 개 없을 때) 0.02로 (DigUp과 같은 하한).
 fn score_stats(scores: &[f32], entries: &[Entry], alive: &[bool], offsets: &[f32; 5]) -> (f32, f32) {
@@ -434,10 +451,22 @@ impl VectorStore {
         top_k: usize,
         boost: Option<&Boost>,
     ) -> Vec<(Section, Vec<Hit>)> {
+        self.search_with_baseline(query, filter, top_k, boost).0
+    }
+
+    /// `search`와 같고, 관련도를 매긴 기준도 돌려준다. 허브 보정을 하지 않았으면(기준 질의가 아직 없으면) 기준은 None
+    /// (종류별 평균만 맞춘 점수는 다른 기기의 것과 눈금이 다르다).
+    pub fn search_with_baseline(
+        &self,
+        query: &[f32],
+        filter: &Filter,
+        top_k: usize,
+        boost: Option<&Boost>,
+    ) -> (Vec<(Section, Vec<Hit>)>, Option<Baseline>) {
         let dim = self.dim;
         let q = truncate_normalized(query, dim);
         if q.len() != dim || self.entries.is_empty() {
-            return Section::ALL.iter().map(|s| (*s, Vec::new())).collect();
+            return (Section::ALL.iter().map(|s| (*s, Vec::new())).collect(), None);
         }
         let raw: Vec<f32> = self.data.par_chunks(dim).map(|row| dot(row, &q)).collect();
         // 허브 보정: 항목마다 "아무 질의에나 걸리는 정도"를 뺀다 (종류별 점수대 차이도 함께 사라짐).
@@ -450,6 +479,7 @@ impl VectorStore {
         };
         let offsets = if use_hub { [0.0; 5] } else { modality_offsets(&scores, &self.entries, &self.alive) };
         let (mean, sd) = score_stats(&scores, &self.entries, &self.alive, &offsets);
+        let baseline = use_hub.then(|| Baseline { median: mean, scale: sd, chunks: self.live_chunks() });
         let none = Boost::default();
         let boost = boost.unwrap_or(&none);
 
@@ -493,7 +523,7 @@ impl VectorStore {
             }
         }
 
-        Section::ALL
+        let sections = Section::ALL
             .iter()
             .map(|&sec| {
                 // (관련도, 의미 관련도, 포함 비율, 청크 위치)
@@ -536,7 +566,8 @@ impl VectorStore {
                     .collect();
                 (sec, hits)
             })
-            .collect()
+            .collect();
+        (sections, baseline)
     }
 }
 

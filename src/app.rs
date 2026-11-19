@@ -1895,12 +1895,8 @@ impl GemmaApp {
             } else {
                 Outcome::empty(&q)
             };
-            for a in asks {
-                if let Ok(a) = a.join() {
-                    let note = query::RemoteNote { name: a.device_name.clone(), error: a.error.clone() };
-                    o.merge_remote(note, a.hits, a.searched);
-                }
-            }
+            let answers: Vec<_> = asks.into_iter().filter_map(|a| a.join().ok()).collect();
+            crate::mesh::client::merge_into(&mut o, answers);
             for note in offline {
                 o.merge_remote(note, Vec::new(), 0);
             }

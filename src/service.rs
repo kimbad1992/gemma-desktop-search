@@ -1401,6 +1401,9 @@ fn search(e: &Engine, params: &[(String, String)]) -> Result<Value, String> {
         "min": rounded(min, 1),
         "elapsed_ms": o.elapsed.as_millis() as u64,
         "searched": o.searched_chunks,
+        // 접속 기기가 관련도를 자기(더 큰) 인덱스의 기준으로 다시 매기게 (설계 7.5): 허브 보정한 유사도 = 의미 관련도 × 폭 + 중앙값
+        "baseline": o.baseline.map(|b| json!({ "median": b.median, "scale": b.scale, "chunks": b.chunks })),
+        "meaning_weight": o.meaning_weight,
         "all": all.iter().map(|(s, hv)| hit_json(*s, hv)).collect::<Vec<_>>(),
         "sections": visible.iter().map(|(s, hits)| json!({
             "key": section_key(*s),
@@ -1496,6 +1499,9 @@ fn hit_json(sec: Section, hv: &HitView, libs: &[(String, String)]) -> Value {
         "score": rounded(h.score, 1),
         "meaning": rounded(h.meaning, 1),
         "cosine": rounded(h.cosine, 3),
+        // 다시 매길 때 쓰는 반올림하지 않은 값 (위의 score·meaning은 보여 주기용으로 반올림)
+        "score_exact": h.score,
+        "meaning_exact": h.meaning,
         "keyword": hv.keyword_match(),
         "locator": query::locator_label(hv),
         "snippet": if text && hv.highlight.is_none() { hv.snippet.as_str() } else { "" },
