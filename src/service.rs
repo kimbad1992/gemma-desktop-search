@@ -464,7 +464,8 @@ fn problems(cfg: &Config) -> Vec<String> {
             cfg.mmproj_path
         ));
     }
-    if cfg.roots.is_empty() {
+    // 다른 기기가 닿게 열었으면 폴더가 없어도 괜찮다: 다른 기기가 원격 라이브러리로 추가하면 생긴다
+    if cfg.roots.is_empty() && bind_is_loopback(&bind_of(cfg)) {
         out.push("검색할 폴더가 없습니다. --root <폴더>로 지정하세요 (여러 번 쓸 수 있습니다).".to_string());
     }
     if cfg.ffmpeg().is_none() {
@@ -488,7 +489,7 @@ pub(crate) fn shown_addr(bind: &str) -> String {
 }
 
 /// 접속 토큰을 새로 만든다. 표준 라이브러리의 해시 키가 OS의 난수로 정해지는 것을 쓴다.
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     (0..3)
         .map(|i| {
@@ -969,7 +970,7 @@ fn lend_result(e: &Engine, mut req: Request) {
 // ── 원격 라이브러리 (다른 기기의 앱이 부른다, `MESH-DESIGN.md` 7.1·7.4) ──
 
 /// 접속을 받는 주소 (설정의 service_bind, 비었으면 기본)
-fn bind_of(cfg: &Config) -> String {
+pub(crate) fn bind_of(cfg: &Config) -> String {
     match cfg.service_bind.trim() {
         "" => DEFAULT_BIND.to_string(),
         b => b.to_string(),
@@ -977,7 +978,7 @@ fn bind_of(cfg: &Config) -> String {
 }
 
 /// 다른 기기에 알릴 포트와 주소들. 모든 주소로 열었으면(0.0.0.0) 이 기기의 IP와 컴퓨터 이름, 한 주소로 열었으면 그 주소.
-fn advertised(bind: &str) -> (u16, Vec<String>) {
+pub(crate) fn advertised(bind: &str) -> (u16, Vec<String>) {
     let (host, port) = bind.rsplit_once(':').unwrap_or((bind, ""));
     let port = port.parse().unwrap_or(crate::config::DEFAULT_SERVICE_PORT);
     let host = host.trim_matches(['[', ']']);

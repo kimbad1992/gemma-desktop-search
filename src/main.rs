@@ -14,6 +14,7 @@ mod embed;
 mod extract;
 mod headless;
 mod index;
+mod install;
 mod lend;
 mod location;
 mod mesh;
@@ -59,8 +60,9 @@ fn main() {
     {
         let _ = move_job;
         eprintln!(
-            "Gemma Search v{} (창 없는 서비스판)\n\n{}\n\n{}\n\n{}",
+            "Gemma Search v{} (창 없는 서비스판)\n\n{}\n\n{}\n\n{}\n\n{}",
             env!("CARGO_PKG_VERSION"),
+            install::USAGE,
             service::USAGE,
             location::USAGE,
             USAGE
@@ -87,6 +89,8 @@ fn command(args: &[String]) -> Option<i32> {
         "serve" | "--serve" => service::serve(rest),
         // 준비물(llama.cpp, 모델) 받기 (prepare.rs)
         "download" => prepare::download(rest),
+        // 서버로 쓰기: 준비물 받기, 다른 기기가 닿게 열기, systemd 사용자 서비스로 늘 띄우기 (install.rs)
+        "install" => install::install(rest),
         // 떠 있는 서비스에 묻는 명령 (cli.rs)
         "search" | "--search" => cli::search(rest),
         "status" => cli::status(rest),
@@ -103,7 +107,13 @@ fn command(args: &[String]) -> Option<i32> {
         // 데이터 위치 확인·옮기기 (location.rs)
         "data" => location::cli(rest),
         "help" | "--help" | "-h" => {
-            println!("Gemma Search v{}\n\n{}\n\n{}", env!("CARGO_PKG_VERSION"), service::USAGE, location::USAGE);
+            println!(
+                "Gemma Search v{}\n\n{}\n\n{}\n\n{}",
+                env!("CARGO_PKG_VERSION"),
+                install::USAGE,
+                service::USAGE,
+                location::USAGE
+            );
             #[cfg(not(feature = "gui"))]
             println!("\n{USAGE}");
             0

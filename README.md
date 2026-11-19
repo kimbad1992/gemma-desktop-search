@@ -102,8 +102,11 @@ PC에 있는 문서·사진·영상·소리를 뜻으로 찾는 Windows 프로�
 
 홈서버처럼 파일이 붙어 있는 PC가 인덱싱하고, 다른 PC는 그 인덱스로 검색합니다. 같은 폴더를 PC마다 따로 인덱싱하지 않습니다.
 
-1. 파일이 있는 PC에서 서비스를 네트워크에 엽니다: `gemma-search serve --bind 0.0.0.0:21870`.
-2. 검색할 PC의 앱에서 그 PC의 공유 폴더(`\\홈서버\공유\사진`, 그 공유에 연결한 드라이브 문자)를 검색할 폴더로 추가합니다. 처음 보는 PC면 그 PC의 Gemma Search를 찾아 참여 코드를 묻습니다. 코드는 그 PC에서 `gemma-search join-code`로 봅니다.
+1. 파일이 있는 PC(Linux 홈서버)에서 한 줄로 설치합니다. 끝에 참여 코드가 나옵니다 ([아래](#linux-서버에서-쓰기)).
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/kimbad1992/gemma-desktop-search/main/install.sh | sh
+   ```
+2. 검색할 PC의 앱에서 그 PC의 공유 폴더(`\\홈서버\공유\사진`, 그 공유에 연결한 드라이브 문자)를 검색할 폴더로 추가합니다. 처음 보는 PC면 그 PC의 Gemma Search를 찾아 참여 코드를 묻습니다. 1에서 나온 코드를 붙여 넣습니다(그 PC에서 `gemma-search join-code`로 다시 봅니다).
 3. 그 PC가 인덱싱을 시작하고, 그동안 이 PC도 그래픽으로 계산을 돕습니다. 끝난 파일부터 검색되고, 결과는 이 PC에서 공유 경로로 바로 엽니다.
 
 - 다른 PC가 같은 폴더를 어떤 주소(컴퓨터 이름, Tailscale 주소, 드라이브 문자)로 추가해도 다시 인덱싱하지 않고 바로 검색합니다.
@@ -147,15 +150,29 @@ PC에 있는 문서·사진·영상·소리를 뜻으로 찾는 Windows 프로�
 화면 없는 서버나 NAS에서 폴더를 감시하고 인덱싱합니다. Linux x64, glibc 2.34 이상(Ubuntu 22.04 이상)에서 돌고, 관리자 권한(sudo) 없이 한 계정 안에서 설치합니다.
 
 ```bash
-mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz -C ~/gemma-search && cd ~/gemma-search
-./gemma-search download                              # 이 기기에 맞는 llama.cpp와 모델 받기
-./gemma-search serve --root ~/문서 --root /mnt/nas/사진
+curl -fsSL https://raw.githubusercontent.com/kimbad1992/gemma-desktop-search/main/install.sh | sh
 ```
 
-`serve`에 준 값은 설정에 저장되므로 다음부터는 `./gemma-search serve`만 쓰면 됩니다. 다른 터미널에서 상태를 보고 검색합니다.
+이 한 줄이 다 합니다.
+
+1. 최신 버전을 `~/gemma-search`에 받습니다(체크섬 확인).
+2. 이 기기에 맞는 llama.cpp와 모델을 받습니다. 받을 것과 크기를 먼저 보여 주고 묻습니다.
+3. 다른 PC가 닿게 `0.0.0.0:21870`으로 열고 systemd 사용자 서비스로 등록합니다. 기기를 다시 켜도 뜹니다.
+4. 이 기기의 공유 폴더와 **참여 코드**를 보여 줍니다. 다른 PC의 앱에서 이 기기의 공유 폴더를 추가할 때 붙여 넣습니다.
+
+다시 실행하면 새 버전으로 바꾸고 서비스를 다시 띄웁니다. 묻지 않고 받으려면 `| sh -s -- --yes`, 다른 포트는 `| sh -s -- --bind 0.0.0.0:<포트>`를 붙입니다. 내려받은 실행 파일로는 `./gemma-search install`이 같은 일을 하고, `install --remove`는 서비스를 내립니다.
+
+이 기기의 폴더를 직접 넣어 검색하려면 `serve --root`를 씁니다. 준 값은 설정에 저장되므로 다음부터는 `serve`만 쓰면 됩니다.
+
+```bash
+~/gemma-search/gemma-search serve --root ~/문서 --root /mnt/nas/사진
+```
+
+다른 터미널에서 상태를 보고 검색합니다.
 
 | 명령 | 하는 일 |
 |---|---|
+| `install [--remove]` | 서버로 쓰기: 준비물 받기, 네트워크에 열기, 늘 띄우기, 참여 코드 보기 |
 | `status` | 서버·인덱스·인덱싱 진행·폴더 감시 상태 |
 | `search <질의…>` | 검색. `--kinds docs,images`, `--path <글자>`, `--min <관련도>`, `--json` |
 | `index [--rebuild] [--wait]` | 바뀐 파일을 지금 인덱싱. `--rebuild`는 처음부터 |
@@ -169,25 +186,7 @@ mkdir -p ~/gemma-search && tar -xzf gemma-desktop-search-vX.Y.Z-linux-x64.tar.gz
 - `--bind 0.0.0.0:21870`으로 네트워크에 열면 접속 토큰을 확인합니다. HTTPS가 아니므로 믿을 수 있는 내부망에서만 엽니다.
 - `download`는 NVIDIA면 CUDA판, Vulkan을 쓸 수 있으면 Vulkan판, 아니면 CPU판을 고릅니다. 내장 그래픽이라도 Vulkan판이 CPU판보다 5배쯤 빠릅니다.
 
-계속 띄워 두려면 systemd 사용자 서비스로 등록합니다(sudo 없이). `~/.config/systemd/user/gemma-search.service`:
-
-```ini
-[Unit]
-Description=Gemma Search
-
-[Service]
-ExecStart=%h/gemma-search/gemma-search serve
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-systemctl --user enable --now gemma-search
-```
-
-로그아웃한 뒤에도 돌게 하려면 `loginctl enable-linger`를 한 번 실행합니다.
+`install`이 등록하는 서비스는 `~/.config/systemd/user/gemma-search.service`이고, 로그는 `journalctl --user -u gemma-search -f`로 봅니다. 로그아웃한 뒤에도 돌려면 이 계정의 linger가 켜져 있어야 합니다. `install`이 관리자 권한 없이 켜 보고, 안 되면 `sudo loginctl enable-linger <계정>`을 한 번 실행하라고 알려 줍니다.
 
 ## 빌드
 

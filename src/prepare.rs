@@ -37,6 +37,16 @@ struct Choice {
 }
 
 pub fn download(args: &[String]) -> i32 {
+    fetch(args, true)
+}
+
+/// `gemma-search install`의 첫 단계: `download`와 같고, 끝의 "다음에 할 일"(serve 띄우기)만 보여 주지 않는다
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn download_for_install(args: &[String]) -> i32 {
+    fetch(args, false)
+}
+
+fn fetch(args: &[String], next_steps: bool) -> i32 {
     if wants_help(args) {
         println!("{}", crate::service::USAGE);
         return 0;
@@ -121,7 +131,7 @@ pub fn download(args: &[String]) -> i32 {
     }
     if todo.is_empty() {
         println!("받을 것이 없습니다. 모두 받아 두었습니다.");
-        return finish(&root, want_llama, want_model, &[]);
+        return finish(&root, want_llama, want_model, &[], next_steps);
     }
     let total: u64 = todo.iter().map(|p| p.total_size()).sum();
     println!("  받을 크기  {}", size(total));
@@ -191,11 +201,11 @@ pub fn download(args: &[String]) -> i32 {
     }
     drop(lock);
     let _ = std::fs::remove_file(root.join(LOCK_FILE));
-    finish(&root, want_llama, want_model, &after)
+    finish(&root, want_llama, want_model, &after, next_steps)
 }
 
-/// 받은 위치를 설정에 적고, 다음에 할 일을 알려 준다
-fn finish(root: &Path, llama: bool, model: bool, notes: &[String]) -> i32 {
+/// 받은 위치를 설정에 적고, 다음에 할 일을 알려 준다 (`next_steps`가 false면 다음에 할 일은 빼고)
+fn finish(root: &Path, llama: bool, model: bool, notes: &[String], next_steps: bool) -> i32 {
     let data = config::data_dir();
     let mut cfg = Config::load(&data);
     let before = (cfg.llama_path.clone(), cfg.model_path.clone(), cfg.mmproj_path.clone());
@@ -219,6 +229,9 @@ fn finish(root: &Path, llama: bool, model: bool, notes: &[String]) -> i32 {
     }
     for n in notes {
         println!("참고: {n}");
+    }
+    if !next_steps {
+        return 0;
     }
     // 서비스나 앱이 이 데이터 폴더로 떠 있으면 다시 띄워야 새 것을 쓴다 (데이터 폴더가 아직 없으면 떠 있을 리 없다)
     if data.is_dir() {

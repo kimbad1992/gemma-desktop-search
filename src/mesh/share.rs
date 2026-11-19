@@ -114,15 +114,10 @@ fn smb_conf_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/etc/samba/smb.conf"))
 }
 
+/// smb.conf와 `include`로 이은 파일(깊이 4까지, 변수가 든 이름은 건너뛴다)을 읽는다. 설정을 읽지 못하면 None.
 #[cfg(unix)]
-fn samba_share(name: &str) -> Result<PathBuf, String> {
-    let main = smb_conf_path();
-    let Ok(text) = std::fs::read_to_string(&main) else {
-        return usershare(name).ok_or_else(|| {
-            format!("Samba 설정({})을 읽지 못했고 '{name}' 공유도 찾지 못했습니다", main.display())
-        });
-    };
-    // include로 이은 파일까지 (깊이 4까지, 변수가 든 이름은 건너뛴다)
+fn load_samba() -> Option<SmbConf> {
+    let text = std::fs::read_to_string(smb_conf_path()).ok()?;
     let mut conf = parse_smb_conf(&text);
     let mut todo: Vec<(String, usize)> = conf.includes.drain(..).map(|i| (i, 1)).collect();
     while let Some((file, depth)) = todo.pop() {
@@ -138,6 +133,44 @@ fn samba_share(name: &str) -> Result<PathBuf, String> {
             }
         }
     }
+    Some(conf)
+}
+
+/// 이 기기가 내놓은 공유: (공유 이름, 폴더). 안내(`gemma-search install`)에 보여 준다.
+/// Samba 설정의 공유와 `net usershare`로 만든 공유. `[homes]`는 사용자마다 달라 빼고, Windows에서는 비어 있다.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn list() -> Vec<(String, PathBuf)> {
+    #[cfg(unix)]
+    {
+        let mut out: Vec<(String, PathBuf)> = load_samba()
+            .map(|c| c.shares.iter().map(|(n, p)| (n.clone(), PathBuf::from(substitute(p, n)))).collect())
+            .unwrap_or_default();
+        if let Ok(rd) = std::fs::read_dir("/var/lib/samba/usershares") {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                    if let Some(p) = usershare(&name) {
+                        out.push((name, p));
+                    }
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn samba_share(name: &str) -> Result<PathBuf, String> {
+    let main = smb_conf_path();
+    let Some(conf) = load_samba() else {
+        return usershare(name).ok_or_else(|| {
+            format!("Samba 설정({})을 읽지 못했고 '{name}' 공유도 찾지 못했습니다", main.display())
+        });
+    };
     if let Some((n, path)) = conf.shares.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Ok(PathBuf::from(substitute(path, n)));
     }

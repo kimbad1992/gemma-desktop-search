@@ -551,7 +551,7 @@ fn status_text(base: &str, v: &Value) -> String {
             line(format!("  {note}"));
         }
     } else {
-        line("폴더 감시: 꺼짐 (serve --no-watch로 띄웠거나 검색할 폴더가 없습니다)".to_string());
+        line("폴더 감시: 꺼짐 (검색할 폴더가 없거나 serve --no-watch로 띄웠습니다)".to_string());
     }
     // 폴더 목록: 감시 중이면 감시 상태(네트워크·오류)와 함께
     let roots: Vec<String> = match w["roots"].as_array() {
@@ -577,7 +577,7 @@ fn status_text(base: &str, v: &Value) -> String {
             .unwrap_or_default(),
     };
     if roots.is_empty() {
-        line("검색할 폴더: 없음 (serve --root <폴더>로 정합니다)".to_string());
+        line("검색할 폴더: 없음 (이 기기 폴더는 serve --root로 넣고, 다른 기기가 원격 라이브러리로 추가하면 생깁니다)".to_string());
     } else {
         line(format!("검색할 폴더 {}개:", roots.len()));
         for r in roots {
